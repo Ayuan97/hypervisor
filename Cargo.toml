@@ -8,6 +8,6 @@ panic = "abort"
 debug-assertions = false
 
 [profile.dev]
-lto = true
+lto = false
 panic = "abort"
 debug-assertions = false

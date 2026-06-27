@@ -6,19 +6,28 @@ edition = "2021"
 [features]
 default = []
 secondary-ept = []
+shellcode-hook = []
 
 [dependencies]
-x86 = "0.52.0"
-x86_64 = "0.15.1"
-bitfield = "0.17.0"
-bitflags = "2.6.0"
-static_assertions = "1.1.0"
-wdk-sys = "0.2.0"
+wdk = "0.2.0"
 wdk-alloc = "0.2.0"
+wdk-panic = "0.2.0"
+wdk-sys = "0.2.0"
+x86 = "0.52.0"
+x86_64 = "0.14.11"
+thiserror-no-std = "2.0.2"
+bitfield = "0.14.0"
+bit_field = "0.10.2"
+bitflags = "2.4.1"
+elain = "0.3.0"
+lazy_static = { version = "1.4.0", features = ["spin_no_std"] }
+obfstr = "0.4.3"
+static_assertions = "1.1.0"
 log = "0.4.20"
 kernel-log = "0.1.2"
 com_logger = "0.1.1"
-iced-x86 = { version = "1.21.0", default-features = false, features = [
-    "no_std", "decoder", "intel",
-    "op_code_info", "instr_info",
-] }
+iced-x86 = { version = "1.20.0", default-features = false, features = ["no_std", "decoder", "block_encoder", "instr_info", "no_d3now", "no_evex", "no_vex", "no_xop"] }
+bstr = { version = "1.9.0", default-features = false }
+
+[build-dependencies]
+wdk-build = "0.2.0"
