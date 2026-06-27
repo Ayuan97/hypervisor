@@ -1,4 +1,7 @@
-use crate::{intel::vmexit::ExitType, utils::capture::GuestRegisters};
+use {
+    crate::{intel::{support::vmread, vmexit::ExitType}, utils::capture::GuestRegisters},
+    x86::vmx::vmcs::guest,
+};
 
 pub const VMCALL_MAGIC: u64 = 0x4879_7065_7256_4D00;
 
@@ -6,12 +9,9 @@ pub const CMD_PING: u64 = 0x01;
 pub const CMD_READ_PHYS: u64 = 0x10;
 pub const CMD_WRITE_PHYS: u64 = 0x11;
 pub const CMD_TRANSLATE_VA: u64 = 0x12;
+pub const CMD_GET_GUEST_CR3: u64 = 0x13;
 pub const CMD_DEVIRTUALIZE: u64 = 0xFF;
 
-/// Handle VMCALL from guest.
-///
-/// If RAX matches our magic, dispatch by command in RCX.
-/// Otherwise return None to let the caller inject #UD.
 pub fn handle_vmcall(guest_registers: &mut GuestRegisters) -> Option<ExitType> {
     if guest_registers.rax != VMCALL_MAGIC {
         return None;
@@ -29,37 +29,30 @@ pub fn handle_vmcall(guest_registers: &mut GuestRegisters) -> Option<ExitType> {
         }
         CMD_READ_PHYS => {
             let pa = arg1;
-            let len = arg2 as usize;
-            let out_buf = arg3 as *mut u8;
-
-            if len == 0 || len > 0x10000 || out_buf.is_null() {
-                guest_registers.rax = 1; // error
+            let size = arg2 as usize;
+            if size == 0 || size > 8 {
+                guest_registers.rax = 0;
                 return Some(ExitType::IncrementRIP);
             }
-
             unsafe {
-                let src = pa as *const u8;
-                core::ptr::copy_nonoverlapping(src, out_buf, len);
+                let mut buf = [0u8; 8];
+                core::ptr::copy_nonoverlapping(pa as *const u8, buf.as_mut_ptr(), size);
+                guest_registers.rax = u64::from_le_bytes(buf);
             }
-
-            guest_registers.rax = 0;
             Some(ExitType::IncrementRIP)
         }
         CMD_WRITE_PHYS => {
             let pa = arg1;
-            let len = arg2 as usize;
-            let in_buf = arg3 as *const u8;
-
-            if len == 0 || len > 0x10000 || in_buf.is_null() {
+            let value = arg2;
+            let size = arg3 as usize;
+            if size == 0 || size > 8 {
                 guest_registers.rax = 1;
                 return Some(ExitType::IncrementRIP);
             }
-
             unsafe {
-                let dst = pa as *mut u8;
-                core::ptr::copy_nonoverlapping(in_buf, dst, len);
+                let bytes = value.to_le_bytes();
+                core::ptr::copy_nonoverlapping(bytes.as_ptr(), pa as *mut u8, size);
             }
-
             guest_registers.rax = 0;
             Some(ExitType::IncrementRIP)
         }
@@ -70,6 +63,10 @@ pub fn handle_vmcall(guest_registers: &mut GuestRegisters) -> Option<ExitType> {
                 Some(pa) => guest_registers.rax = pa,
                 None => guest_registers.rax = 0,
             }
+            Some(ExitType::IncrementRIP)
+        }
+        CMD_GET_GUEST_CR3 => {
+            guest_registers.rax = vmread(guest::CR3);
             Some(ExitType::IncrementRIP)
         }
         CMD_DEVIRTUALIZE => {
@@ -83,7 +80,6 @@ pub fn handle_vmcall(guest_registers: &mut GuestRegisters) -> Option<ExitType> {
     }
 }
 
-/// Walk the guest page tables to translate VA → PA.
 fn translate_va_to_pa(cr3: u64, va: u64) -> Option<u64> {
     let pml4_base = cr3 & 0x000F_FFFF_FFFF_F000;
 
@@ -104,7 +100,6 @@ fn translate_va_to_pa(cr3: u64, va: u64) -> Option<u64> {
         if pdpte & 1 == 0 {
             return None;
         }
-        // 1GB page
         if pdpte & 0x80 != 0 {
             let pa = (pdpte & 0x000F_FFFF_C000_0000) | (va & 0x3FFF_FFFF);
             return Some(pa);
@@ -115,7 +110,6 @@ fn translate_va_to_pa(cr3: u64, va: u64) -> Option<u64> {
         if pde & 1 == 0 {
             return None;
         }
-        // 2MB page
         if pde & 0x80 != 0 {
             let pa = (pde & 0x000F_FFFF_FFE0_0000) | (va & 0x1F_FFFF);
             return Some(pa);

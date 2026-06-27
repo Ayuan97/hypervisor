@@ -91,19 +91,18 @@ impl SharedData {
     pub fn new(
         primary_ept: Box<Ept, PhysicalAllocator>,
         hook_manager: Box<HookManager>,
-    ) -> Result<Option<Box<Self>>, HypervisorError> {
+    ) -> Result<Box<Self>, HypervisorError> {
         log::trace!("Initializing shared data");
 
         let primary_eptp = primary_ept.create_eptp_with_wb_and_4lvl_walk()?;
 
         let bitmap = MsrBitmap::new();
-        //bitmap.hook_msr(IA32_EFER);
 
-        Ok(Some(Box::new(Self {
+        Ok(Box::new(Self {
             msr_bitmap: { bitmap },
             primary_ept,
             primary_eptp,
             hook_manager,
-        })))
+        }))
     }
 }

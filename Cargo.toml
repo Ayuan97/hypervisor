@@ -3,7 +3,7 @@ resolver = "2"
 members = ["driver", "hypervisor"]
 
 [profile.release]
-lto = true
+lto = "thin"
 panic = "abort"
 debug-assertions = false
 

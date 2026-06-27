@@ -43,7 +43,10 @@ pub unsafe extern "system" fn driver_entry(
 
     log::info!("Hypervisor driver loading...");
 
-    driver.DriverUnload = Some(driver_unload);
+    // wdk-sys 0.2.0 generates DRIVER_OBJECT as opaque; set DriverUnload at offset 0x68 (x64)
+    let unload_ptr = (driver as *mut DRIVER_OBJECT as *mut u8).add(0x68)
+        as *mut Option<unsafe extern "C" fn(*mut DRIVER_OBJECT)>;
+    *unload_ptr = Some(driver_unload);
 
     with_expanded_stack(|| {
         match virtualize_system() {
@@ -70,20 +73,13 @@ fn virtualize_system() -> Result<(), HypervisorError> {
     let mut primary_ept: Box<Ept, PhysicalAllocator> =
         unsafe { Box::try_new_zeroed_in(PhysicalAllocator)?.assume_init() };
 
-    let mut secondary_ept: Box<Ept, PhysicalAllocator> =
-        unsafe { Box::try_new_zeroed_in(PhysicalAllocator)?.assume_init() };
-
     log::info!("Creating primary EPT (identity map)");
     primary_ept.identity_2mb(AccessType::READ_WRITE_EXECUTE)?;
-
-    log::info!("Creating secondary EPT (identity map)");
-    secondary_ept.identity_2mb(AccessType::READ_WRITE_EXECUTE)?;
 
     let hook_manager = HookManager::new(vec![]);
 
     let mut hv = Hypervisor::builder()
         .primary_ept(primary_ept)
-        .secondary_ept(secondary_ept)
         .hook_manager(hook_manager)
         .build()?;
 
