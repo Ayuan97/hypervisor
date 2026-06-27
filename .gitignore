@@ -1,0 +1,5 @@
+/target
+*.cer
+*.log
+.claude/
+.mcp.json

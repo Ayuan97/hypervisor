@@ -1,0 +1,13 @@
+[workspace]
+resolver = "2"
+members = ["driver", "hypervisor"]
+
+[profile.release]
+lto = true
+panic = "abort"
+debug-assertions = false
+
+[profile.dev]
+lto = true
+panic = "abort"
+debug-assertions = false

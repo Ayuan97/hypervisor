@@ -1,0 +1,59 @@
+[env]
+CARGO_MAKE_EXTEND_WORKSPACE_MAKEFILE = true
+WDK_VERSION = "10.0.26100.0"
+WDK_INF2CAT_OS = "10_X64,Server2022_X64"
+
+[env.development]
+CARGO_PROFILE = "dev"
+TARGET_DIR = "target/debug"
+
+[env.release]
+CARGO_PROFILE = "release"
+TARGET_DIR = "target/release"
+
+[tasks.default]
+alias = "sign"
+
+[tasks.build]
+command = "cargo"
+args = [
+    "build",
+    "--profile", "${CARGO_PROFILE}",
+    "-p", "matrix",
+]
+
+[tasks.rename]
+dependencies = ["build"]
+script = [
+    "copy /Y ${TARGET_DIR}\\matrix.dll ${TARGET_DIR}\\matrix.sys",
+]
+
+[tasks.stampinf]
+dependencies = ["rename"]
+script = [
+    "stampinf.exe -f driver\\matrix.inf -d * -a amd64 -v * -k 1.33",
+]
+
+[tasks.inf2cat]
+dependencies = ["stampinf"]
+script = [
+    "inf2cat.exe /driver:${TARGET_DIR} /os:${WDK_INF2CAT_OS} /uselocaltime",
+]
+
+[tasks.infverif]
+dependencies = ["inf2cat"]
+script = [
+    "infverif.exe /v /w driver\\matrix.inf",
+]
+
+[tasks.makecert]
+script = [
+    "makecert -r -pe -ss PrivateCertStore -n CN=WDKTestCert -eku 1.3.6.1.5.5.7.3.3 WDKTestCert.cer",
+]
+
+[tasks.sign]
+dependencies = ["infverif"]
+script = [
+    "signtool sign /v /s PrivateCertStore /n WDKTestCert /t http://timestamp.digicert.com ${TARGET_DIR}\\matrix.sys",
+    "signtool sign /v /s PrivateCertStore /n WDKTestCert /t http://timestamp.digicert.com ${TARGET_DIR}\\matrix.cat",
+]
