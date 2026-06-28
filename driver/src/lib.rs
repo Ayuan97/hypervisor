@@ -1,7 +1,6 @@
 #![no_std]
 #![allow(unused_mut)]
 #![feature(allocator_api, new_uninit)]
-#![feature(link_llvm_intrinsics)]
 
 extern crate alloc;
 #[cfg(not(test))]
@@ -26,27 +25,22 @@ use {
         utils::{alloc::PhysicalAllocator, nt::update_ntoskrnl_cr3},
     },
     log::LevelFilter,
-    wdk_sys::{DRIVER_OBJECT, NTSTATUS, PUNICODE_STRING, STATUS_SUCCESS, STATUS_UNSUCCESSFUL},
+    wdk_sys::{NTSTATUS, STATUS_SUCCESS, STATUS_UNSUCCESSFUL},
 };
 
 pub mod expanded_stack;
 
 #[export_name = "DriverEntry"]
 pub unsafe extern "system" fn driver_entry(
-    driver: &mut DRIVER_OBJECT,
-    _registry_path: PUNICODE_STRING,
+    _param0: *mut core::ffi::c_void,
+    _param1: *mut core::ffi::c_void,
 ) -> NTSTATUS {
     com_logger::builder()
         .base(0x2f8)
         .filter(LevelFilter::Info)
         .setup();
 
-    log::info!("Hypervisor driver loading...");
-
-    // wdk-sys 0.2.0 generates DRIVER_OBJECT as opaque; set DriverUnload at offset 0x68 (x64)
-    let unload_ptr = (driver as *mut DRIVER_OBJECT as *mut u8).add(0x68)
-        as *mut Option<unsafe extern "C" fn(*mut DRIVER_OBJECT)>;
-    *unload_ptr = Some(driver_unload);
+    log::info!("Hypervisor driver loading (manual map)...");
 
     with_expanded_stack(|| {
         match virtualize_system() {
@@ -59,15 +53,6 @@ pub unsafe extern "system" fn driver_entry(
         STATUS_SUCCESS
     })
 }
-
-pub extern "C" fn driver_unload(_driver: *mut DRIVER_OBJECT) {
-    log::info!("Hypervisor driver unloading...");
-    if let Some(hypervisor) = unsafe { HYPERVISOR.take() } {
-        drop(hypervisor);
-    }
-}
-
-static mut HYPERVISOR: Option<Hypervisor> = None;
 
 fn virtualize_system() -> Result<(), HypervisorError> {
     let mut primary_ept: Box<Ept, PhysicalAllocator> =
@@ -88,7 +73,8 @@ fn virtualize_system() -> Result<(), HypervisorError> {
     hv.virtualize_core()?;
     log::info!("All cores virtualized, VMCALL interface ready");
 
-    unsafe { HYPERVISOR = Some(hv) };
+    // Leak — hypervisor stays resident forever (no DriverUnload in manual map)
+    core::mem::forget(hv);
 
     Ok(())
 }
