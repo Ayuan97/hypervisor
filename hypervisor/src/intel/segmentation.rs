@@ -133,7 +133,9 @@ impl SegmentDescriptor {
         let table = DescriptorTables::from_pointer(gdtr);
 
         // Fetch the descriptor entry from the GDT.
-        let entry_value = table[index];
+        let Some(&entry_value) = table.get(index) else {
+            return Self::invalid();
+        };
 
         // Convert the entry value into descriptor flags.
         let entry = DescriptorFlags::from_bits_truncate(entry_value);
@@ -153,7 +155,9 @@ impl SegmentDescriptor {
             // For non-user segments (like TSS), the base address can span two GDT entries.
             // If this is the case, fetch the high 32 bits of the base address from the next GDT entry.
             if !entry.contains(DescriptorFlags::USER_SEGMENT) {
-                let high = table[index + 1];
+                let Some(&high) = table.get(index + 1) else {
+                    return Self::invalid();
+                };
                 base_address += high << 32;
             }
 
@@ -173,5 +177,36 @@ impl SegmentDescriptor {
             // If the segment is not present, return an invalid descriptor.
             Self::invalid()
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn gdtr_for(entries: &[u64]) -> DescriptorTablePointer<u64> {
+        DescriptorTablePointer::new_from_slice(entries)
+    }
+
+    #[test]
+    fn selector_outside_gdt_returns_invalid_descriptor() {
+        let entries = [0u64; 1];
+        let descriptor =
+            SegmentDescriptor::from_selector(SegmentSelector::from_raw(0x10), &gdtr_for(&entries));
+
+        assert!(descriptor
+            .access_rights
+            .contains(SegmentAccessRights::UNUSABLE));
+    }
+
+    #[test]
+    fn system_descriptor_without_high_entry_returns_invalid_descriptor() {
+        let entries = [DescriptorFlags::PRESENT.bits()];
+        let descriptor =
+            SegmentDescriptor::from_selector(SegmentSelector::from_raw(0), &gdtr_for(&entries));
+
+        assert!(descriptor
+            .access_rights
+            .contains(SegmentAccessRights::UNUSABLE));
     }
 }

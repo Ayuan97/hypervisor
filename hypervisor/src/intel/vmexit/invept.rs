@@ -1,22 +1,39 @@
-//! Handles VM exits for Intel Virtualization Technology (VT-x),
-//! focusing on memory management and guest-host interactions.
+//! Handles guest INVEPT VM exits.
 
-use crate::intel::{invept::invept_all_contexts, vmexit::ExitType};
+use crate::intel::{events::EventInjection, vmexit::ExitType};
 
 /// Handles the INVEPT VM exit.
 ///
-/// Invalidates all EPT contexts and advances the VM's instruction pointer.
+/// Injects #UD for guest INVEPT. With VMX hidden from CPUID, guest-visible VMX
+/// instructions must not appear to execute successfully.
 ///
 /// # Returns
-/// * `ExitType::IncrementRIP` - To move past the `INVEPT` instruction in the VM.
+/// * `ExitType::Continue` - Re-enter the guest with a pending #UD.
 pub fn handle_invept() -> ExitType {
     log::debug!("Handling INVEPT VM exit...");
+    handle_invept_with(EventInjection::vmentry_inject_ud)
+}
 
-    // Invalidate all EPT contexts to sync guest VM memory accesses with the host.
-    invept_all_contexts();
+fn handle_invept_with<F>(inject_ud: F) -> ExitType
+where
+    F: FnOnce(),
+{
+    inject_ud();
+    ExitType::Continue
+}
 
-    log::debug!("INVEPT VM exit handled successfully!");
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-    // Return instruction to increment the VM's instruction pointer.
-    ExitType::IncrementRIP
+    #[test]
+    fn guest_invept_injects_ud_without_advancing_rip() {
+        let mut injected = false;
+
+        assert!(matches!(
+            handle_invept_with(|| injected = true),
+            ExitType::Continue
+        ));
+        assert!(injected);
+    }
 }

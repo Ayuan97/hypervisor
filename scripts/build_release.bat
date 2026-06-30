@@ -1,37 +1,22 @@
 @echo off
 setlocal
 
-set "WDK_BIN=C:\Program Files (x86)\Windows Kits\10\bin\10.0.26100.0\x64"
+set "HV_BOOT_STOP_STAGE="
 set "DRIVER_PATH=%~dp0..\target\release\matrix.sys"
 set "DLL_PATH=%~dp0..\target\release\matrix.dll"
-set "SIGN_SUBJECT=%HV_SIGN_SUBJECT%"
-set "HV_BOOT_STOP_STAGE="
 
-echo [*] Building driver...
+echo [*] Building release driver...
 cd /d "%~dp0.."
-cargo build --release
+cargo build -p matrix --release
 if %errorlevel% neq 0 (
     echo [-] Build failed.
     exit /b 1
 )
 
-echo [*] Copying DLL to SYS...
+echo [*] Finalizing SYS...
 powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0finalize_driver.ps1" -Source "%DLL_PATH%" -Destination "%DRIVER_PATH%"
 if %errorlevel% neq 0 (
     echo [-] Finalize failed.
-    exit /b 1
-)
-
-if "%SIGN_SUBJECT%"=="" (
-    echo [-] HV_SIGN_SUBJECT is required for signing.
-    echo     Example: set HV_SIGN_SUBJECT=KernelTest
-    exit /b 1
-)
-
-echo [*] Signing driver...
-"%WDK_BIN%\signtool.exe" sign /s PrivateCertStore /n "%SIGN_SUBJECT%" /fd SHA256 "%DRIVER_PATH%"
-if %errorlevel% neq 0 (
-    echo [-] Signing failed.
     exit /b 1
 )
 
@@ -42,4 +27,4 @@ if %errorlevel% neq 0 (
     exit /b 1
 )
 
-echo [+] Build complete: %DRIVER_PATH%
+echo [+] Release driver ready: %DRIVER_PATH%

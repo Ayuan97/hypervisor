@@ -155,4 +155,7 @@ pub enum HypervisorError {
 
     #[error("Failed to parse hexadecimal string")]
     HexParseError,
+
+    #[error("Stopped at requested boot stage")]
+    BootStageStop,
 }

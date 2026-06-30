@@ -1,81 +1,103 @@
 # Hypervisor
 
-Type-2 Windows 内核 hypervisor (Intel VT-x)，为 game_overlay 提供 EPT 级物理内存访问，替代 BYOVD 驱动方案。
+Windows x64 Intel VT-x type-2 hypervisor. 当前目标是稳定加载、降低 guest 可见 VMX 痕迹，并在启动游戏/EAC 前完成自检。
 
-## 架构
+## 目录
 
-```
-game_overlay (Ring 3)
-    │ VMCALL(READ_PHYS, addr, len)
-    ▼
-Hypervisor (Ring -1)
-    │ EPT direct mapping
-    ▼
-Physical Memory
-```
-
-## 项目结构
-
-```
-driver/          WDK 驱动壳 — DriverEntry 加载并虚拟化所有 CPU 核心
+```text
+driver/          WDK driver entry，负责创建并启动 hypervisor
 hypervisor/      VT-x 核心逻辑
-  src/
-    intel/
-      ept/         EPT 页表管理 + hook 机制
-      vmexit/      VM-exit 处理（CPUID/RDTSC/VMCALL/EPT violation）
-      vmx.rs       VMX 生命周期
-      vmcs.rs      VMCS 初始化
-      vcpu.rs      Per-CPU 虚拟处理器
-      vmlaunch.rs  VMLAUNCH 入口 (asm)
-      vmm.rs       VM-exit 分发主循环
-    utils/         地址转换、内存分配、NT 绑定
+  src/intel/
+    ept/         EPT 页表与 hook 支撑
+    vmexit/      CPUID、MSR、CR、RDTSC、VMCALL、EPT 等 VM-exit 处理
+    vmcs.rs      VMCS guest/host/control 字段初始化
+    vcpu.rs      per-CPU 虚拟化/反虚拟化
+    vmlaunch.rs  VM-entry/VM-exit 汇编入口
+scripts/         启动脚本
+tools/           诊断与探针工具
 ```
 
-## VMCALL 通信协议
+## 当前通信模型
 
-| RAX (magic) | RCX (cmd) | RDX | R8 | R9 | 返回 |
-|---|---|---|---|---|---|
-| `0xA3B7E2914F6D8C15` | `0x01` PING | - | - | - | RAX = magic |
-| | `0x10` READ_PHYS | phys addr | len | out buf | RAX = 0 (ok) |
-| | `0x11` WRITE_PHYS | phys addr | len | in buf | RAX = 0 (ok) |
-| | `0x12` TRANSLATE_VA | CR3 | VA | - | RAX = PA |
+用户态诊断工具使用隐藏 CPUID leaf `0x40000000`，并要求 `r10/r11` 双 token。未授权访问必须返回全 0，普通 hypervisor leaves 也必须保持全 0。
 
-## 构建前置
+`VMCALL` 路径只给 CPL0 使用。用户态执行 `VMCALL`，即使带 token，也应表现为 `#UD`。
 
-- Rust nightly (`rustup default nightly`)
-- cargo-make (`cargo install cargo-make`)
-- Windows WDK/SDK (设置 `WDKContentRoot` 环境变量)
-- LLVM (`winget install LLVM.LLVM`)
-- Test signing: `bcdedit /set testsigning on`
+| 命令 | 用途 | 用户态 |
+|---|---|---|
+| `0x01` PING | 存活检查 | 允许，经 CPUID 诊断 leaf |
+| `0x14` GET_COUNTER | 退出计数 | 允许，经 CPUID 诊断 leaf |
+| `0x15` GET_CTL | 控制位/诊断状态 | 部分允许；敏感项 CPL0 |
+| `0x10` READ_PHYS | 物理读 | CPL0 only |
+| `0x11` WRITE_PHYS | 物理写 | 禁用 |
+| `0x12` TRANSLATE_VA | VA->PA | CPL0 only |
+| `0x13` GET_GUEST_CR3 | guest CR3 | CPL0 only |
+| `0x20` CLOAK_PAGE | EPT page cloak | CPL0 only |
+| `0xFF` DEVIRTUALIZE | 反虚拟化 | CPL0 only |
 
 ## 构建
 
-```bash
-cargo make --profile development   # debug
-cargo make --profile release       # release
+```powershell
+cargo build -p matrix --release
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts\finalize_driver.ps1
+rustc tools\cpuid_ping.rs -o tools\cpuid_ping.exe
+rustc tools\probe_test.rs -o tools\probe_test.exe
+rustc tools\phys_test.rs -o tools\phys_test.exe
+rustc tools\ping_test.rs -o tools\ping_test.exe
 ```
 
-## 测试环境
+## 启动顺序
 
-1. VMware Workstation，开启 VT-x 直通
-2. Windows 10/11 x64 虚拟机
-3. 关闭 VBS/HVCI
-4. 加载驱动: `sc create matrix binPath= <path>\matrix.sys type= kernel && sc start matrix`
-5. 验证: VMCALL PING 返回 magic
+1. 重启，确保没有旧 HV 实例残留。
+2. 确保 EAC/游戏未启动。
+3. 运行 `scripts\start_hv.bat`。
+4. 等待 `cpuid_ping.exe` 与 `probe_test.exe` 均通过。
+5. 脚本默认 seal 诊断通道；seal 后用户态 PING 不再返回 magic，只允许重复 seal 和 CPL0 DEVIRTUALIZE。
+6. 再启动 EAC/游戏。
 
-## 反检测
+如果 `start_hv.bat` 提示 HV 已 active，不要重复映射新 build；必须重启后再加载。
 
-| 威胁 | 对策 | 状态 |
-|------|------|------|
-| CPUID bit 31 | 伪造返回值 | TODO |
-| VMREAD 指令 | 注入 #UD | TODO |
-| RDTSC 时序 | 补偿 VM-exit cycles | TODO |
-| IA32_EFER MSR | 不修改 EFER | N/A |
+需要运行 `tools\phys_test.exe monitor` 时，可以先设置 `HV_NO_SEAL=1` 再启动脚本；监控结束后重启并按默认流程重新加载。
 
-## 参考
+## 自检要求
 
-- [matrix-rs](https://github.com/memN0ps/matrix-rs) — Type-2 Rust hypervisor (本项目基础)
-- [illusion-rs](https://github.com/memN0ps/illusion-rs) — Type-1 UEFI Rust hypervisor (长期目标)
-- [Intel SDM Vol.3](https://www.intel.com/) — Chapter 23-33 VMX
-- [Secret Club](https://secret.club/2020/04/13/how-anti-cheats-detect-system-emulation.html) — Anti-cheat 检测方法实录
-- [Detecting Hypervisor-Assisted Hooking](https://momo5502.com/posts/2022-05-02-detecting-hypervisor-assisted-hooking/) — EPT hook 检测研究
+```powershell
+cargo fmt --check
+cargo test -p hypervisor --lib -- --nocapture
+cargo check -p matrix
+cargo build -p matrix --release
+tools\cpuid_ping.exe
+tools\probe_test.exe
+tools\phys_test.exe
+```
+
+当前机器如果已有旧 HV 在内存中，只能验证用户态状态和热加载保护；新版 runtime 行为必须重启加载后再测。
+
+默认启动流程 seal 后，`tools\cpuid_ping.exe` 会降级为 limited check：把 PING access denied 识别为 sealed active，继续验证 CPUID masking，但跳过 VMCS controls 和 counters。CPL0 DEVIRTUALIZE 仍保留给卸载/故障恢复。需要完整 controls/counters 输出时，用 `HV_NO_SEAL=1` 启动。
+`tools\phys_test.exe monitor` 遇到 sealed 状态会直接退出并提示重新以 `HV_NO_SEAL=1` 启动。
+
+## 隐藏与稳定性状态
+
+| 项目 | 当前状态 |
+|---|---|
+| CPUID hypervisor bit | 隐藏 |
+| CPUID VMX/SMX bit | 隐藏 |
+| CPUID SGX/SGX_LC/WAITPKG | 隐藏 |
+| CPUID hypervisor leaves | 未授权全 0 |
+| IA32_FEATURE_CONTROL | 隐藏 VMX/SENTER/SGX enable 位 |
+| VMX MSR range | RDMSR/WRMSR 拦截并注入 `#GP` |
+| CR4.VMXE | guest read shadow 隐藏 |
+| VMX 指令探针 | guest 注入 `#UD` |
+| SGX ENCLS/ENCLV | 可用时退出并注入 `#UD`；无法安全隐藏 SGX host 时拒绝加载 |
+| Intel PT VMX 痕迹 | 支持时启用 VMX concealment；不完整则拒绝 Intel PT host |
+| RDTSC/RDTSCP | TSC offset 补偿 CPUID exit 开销 |
+| XSETBV/INVD/WBINVD | 按 CPL 注入原生一致异常 |
+| EPT/VPID invalidation | VMXON 后、VMXOFF 前执行 |
+| 首次 VMLAUNCH 失败 | 恢复调用栈与非易失寄存器后返回错误 |
+| 游戏前诊断通道 | 默认 seal；用户态 PING 不再返回 magic，拒绝 counters/controls，只允许重复 seal 与 CPL0 DEVIRTUALIZE |
+
+## 仍需实机重启验证
+
+- 新 build 加载后 `tools\probe_test.exe` 必须通过，尤其是用户态 token `VMCALL` 应为 `#UD`。
+- `tools\cpuid_ping.exe` 必须显示 masking OK、TSC offsetting enabled。
+- 启动游戏前建议运行 `tools\phys_test.exe monitor` 观察最后 VM-exit 计数。

@@ -11,8 +11,8 @@ use {
         intel::{
             controls::{adjust_vmx_controls, VmxControl},
             descriptor::DescriptorTables,
-            invept::invept_single_context,
-            invvpid::{invvpid_single_context, VPID_TAG},
+            invept::try_invept_single_context,
+            invvpid::{try_invvpid_single_context, VPID_TAG},
             segmentation::SegmentDescriptor,
             shared_data::SharedData,
             support::{vmclear, vmptrld, vmread, vmwrite_checked},
@@ -32,6 +32,7 @@ use {
     core::fmt,
     x86::{
         controlregs,
+        cpuid::cpuid,
         current::paging::BASE_PAGE_SIZE,
         dtables::{self},
         msr::{self},
@@ -269,37 +270,101 @@ impl Vmcs {
     pub fn setup_vmcs_control_fields(shared_data: &mut SharedData) -> Result<(), HypervisorError> {
         log::debug!("Setting up VMCS Control Fields");
 
-        const PRIMARY_CTL: u64 = (vmcs::control::PrimaryControls::SECONDARY_CONTROLS.bits() | vmcs::control::PrimaryControls::USE_MSR_BITMAPS.bits()) as u64;
-        const SECONDARY_CTL: u64 = (vmcs::control::SecondaryControls::ENABLE_RDTSCP.bits()
-            | vmcs::control::SecondaryControls::ENABLE_XSAVES_XRSTORS.bits()
-            | vmcs::control::SecondaryControls::ENABLE_INVPCID.bits()
-            | vmcs::control::SecondaryControls::ENABLE_VPID.bits()
-            | vmcs::control::SecondaryControls::ENABLE_EPT.bits()) as u64;
-        const ENTRY_CTL: u64 = vmcs::control::EntryControls::IA32E_MODE_GUEST.bits() as u64;
-        const EXIT_CTL: u64 = vmcs::control::ExitControls::HOST_ADDRESS_SPACE_SIZE.bits() as u64;
+        let primary_ctl = required_primary_controls();
+        let secondary_ctl = required_secondary_controls();
+        let requested_secondary_ctl = requested_secondary_controls();
+        let entry_ctl = required_entry_controls();
+        let requested_entry_ctl = requested_entry_controls();
+        let exit_ctl = required_exit_controls();
+        let requested_exit_ctl = requested_exit_controls();
         const PINBASED_CTL: u64 = 0;
 
-        let ctl_pin = adjust_vmx_controls(VmxControl::PinBased, PINBASED_CTL);
-        let ctl_pri = adjust_vmx_controls(VmxControl::ProcessorBased, PRIMARY_CTL);
-        let ctl_sec = adjust_vmx_controls(VmxControl::ProcessorBased2, SECONDARY_CTL);
-        let ctl_ent = adjust_vmx_controls(VmxControl::VmEntry, ENTRY_CTL);
-        let ctl_ext = adjust_vmx_controls(VmxControl::VmExit, EXIT_CTL);
+        let ctl_pin = adjust_vmx_controls(VmxControl::PinBased, PINBASED_CTL)?;
+        let ctl_pri = adjust_vmx_controls(VmxControl::ProcessorBased, primary_ctl)?;
+        let ctl_sec = adjust_vmx_controls(VmxControl::ProcessorBased2, requested_secondary_ctl)?;
+        let ctl_ent = adjust_vmx_controls(VmxControl::VmEntry, requested_entry_ctl)?;
+        let ctl_ext = adjust_vmx_controls(VmxControl::VmExit, requested_exit_ctl)?;
 
-        if !required_controls_present(PRIMARY_CTL, ctl_pri)
-            || !required_controls_present(SECONDARY_CTL, ctl_sec)
-            || !required_controls_present(ENTRY_CTL, ctl_ent)
-            || !required_controls_present(EXIT_CTL, ctl_ext)
+        if !required_controls_present(primary_ctl, ctl_pri)
+            || !required_controls_present(secondary_ctl, ctl_sec)
+            || !required_controls_present(entry_ctl, ctl_ent)
+            || !required_controls_present(exit_ctl, ctl_ext)
         {
             log::error!(
                 "Required VMX controls unavailable: pri={:#x}/{:#x} sec={:#x}/{:#x} ent={:#x}/{:#x} ext={:#x}/{:#x}",
                 ctl_pri,
-                PRIMARY_CTL,
+                primary_ctl,
                 ctl_sec,
-                SECONDARY_CTL,
+                secondary_ctl,
                 ctl_ent,
-                ENTRY_CTL,
+                entry_ctl,
                 ctl_ext,
-                EXIT_CTL
+                exit_ctl
+            );
+            return Err(HypervisorError::VMXUnsupported);
+        }
+
+        if !pinbased_interrupt_exiting_ready(ctl_pin) {
+            log::error!(
+                "Unsupported pin-based VMX controls are active: pin={:#x}",
+                ctl_pin
+            );
+            return Err(HypervisorError::VMXUnsupported);
+        }
+        let unsupported_primary = unsupported_primary_exit_controls(ctl_pri);
+        if unsupported_primary != 0 {
+            log::error!(
+                "Unsupported primary VM-exit controls are active: pri={:#x} unsupported={:#x}",
+                ctl_pri,
+                unsupported_primary
+            );
+            return Err(HypervisorError::VMXUnsupported);
+        }
+        let unsupported_secondary = unsupported_secondary_controls(ctl_sec);
+        if unsupported_secondary != 0 {
+            log::error!(
+                "Unsupported secondary VM-execution controls are active: sec={:#x} unsupported={:#x}",
+                ctl_sec,
+                unsupported_secondary
+            );
+            return Err(HypervisorError::VMXUnsupported);
+        }
+        let unsupported_entry = unsupported_entry_controls(ctl_ent);
+        if unsupported_entry != 0 {
+            log::error!(
+                "Unsupported VM-entry controls are active: ent={:#x} unsupported={:#x}",
+                ctl_ent,
+                unsupported_entry
+            );
+            return Err(HypervisorError::VMXUnsupported);
+        }
+        let unsupported_exit = unsupported_exit_controls(ctl_ext);
+        if unsupported_exit != 0 {
+            log::error!(
+                "Unsupported VM-exit controls are active: ext={:#x} unsupported={:#x}",
+                ctl_ext,
+                unsupported_exit
+            );
+            return Err(HypervisorError::VMXUnsupported);
+        }
+
+        let (host_leaf7_ebx, host_leaf12_eax) = host_sgx_feature_bits();
+        if !sgx_instruction_exiting_ready(host_leaf7_ebx, host_leaf12_eax, ctl_sec) {
+            log::error!(
+                "SGX is present but cannot be safely hidden because ENCLU does not have a VM-exit control: leaf7_ebx={:#x} leaf12_eax={:#x} sec={:#x}",
+                host_leaf7_ebx,
+                host_leaf12_eax,
+                ctl_sec
+            );
+            return Err(HypervisorError::VMXUnsupported);
+        }
+        if !pt_vmx_concealment_ready(host_leaf7_ebx, ctl_sec, ctl_ext, ctl_ent) {
+            log::error!(
+                "Intel PT is present but VMX concealment controls are incomplete: leaf7_ebx={:#x} sec={:#x} ext={:#x} ent={:#x}",
+                host_leaf7_ebx,
+                ctl_sec,
+                ctl_ext,
+                ctl_ent
             );
             return Err(HypervisorError::VMXUnsupported);
         }
@@ -309,6 +374,9 @@ impl Vmcs {
         vmwrite_checked(vmcs::control::SECONDARY_PROCBASED_EXEC_CONTROLS, ctl_sec)?;
         vmwrite_checked(vmcs::control::VMENTRY_CONTROLS, ctl_ent)?;
         vmwrite_checked(vmcs::control::VMEXIT_CONTROLS, ctl_ext)?;
+        if secondary_control_present(ctl_sec, vmcs::control::SecondaryControls::ENCLS_EXITING) {
+            vmwrite_checked(vmcs::control::ENCLS_EXITING_BITMAP_FULL, encls_exiting_bitmap())?;
+        }
 
         {
             use crate::intel::diag;
@@ -337,8 +405,8 @@ impl Vmcs {
         vmwrite_checked(vmcs::control::EPTP_FULL, shared_data.primary_eptp)?;
         vmwrite_checked(vmcs::control::VPID, VPID_TAG)?;
 
-        invept_single_context(shared_data.primary_eptp);
-        invvpid_single_context(VPID_TAG);
+        try_invept_single_context(shared_data.primary_eptp)?;
+        try_invvpid_single_context(VPID_TAG)?;
 
         log::debug!("VMCS Control Fields setup successfully!");
 
@@ -351,8 +419,258 @@ impl Vmcs {
     }
 }
 
+fn required_primary_controls() -> u64 {
+    (vmcs::control::PrimaryControls::SECONDARY_CONTROLS.bits()
+        | vmcs::control::PrimaryControls::USE_MSR_BITMAPS.bits()) as u64
+}
+
+fn required_secondary_controls() -> u64 {
+    (vmcs::control::SecondaryControls::ENABLE_RDTSCP.bits()
+        | vmcs::control::SecondaryControls::ENABLE_XSAVES_XRSTORS.bits()
+        | vmcs::control::SecondaryControls::ENABLE_INVPCID.bits()
+        | vmcs::control::SecondaryControls::ENABLE_VPID.bits()
+        | vmcs::control::SecondaryControls::ENABLE_EPT.bits()) as u64
+}
+
+const PT_CONCEAL_SECONDARY: u8 = 1;
+const PT_CONCEAL_EXIT: u8 = 2;
+const PT_CONCEAL_ENTRY: u8 = 4;
+const PT_CONCEAL_ALL: u8 = PT_CONCEAL_SECONDARY | PT_CONCEAL_EXIT | PT_CONCEAL_ENTRY;
+
+fn optional_secondary_controls() -> u64 {
+    optional_secondary_controls_for_pt_mask(pt_vmx_concealment_mask())
+}
+
+fn optional_secondary_controls_for_pt_mask(mask: u8) -> u64 {
+    let mut controls = (vmcs::control::SecondaryControls::ENCLS_EXITING.bits()
+        | vmcs::control::SecondaryControls::ENCLV_EXITING.bits()) as u64;
+
+    if mask & PT_CONCEAL_SECONDARY != 0 {
+        controls |= vmcs::control::SecondaryControls::CONCEAL_VMX_FROM_PT.bits() as u64;
+    }
+
+    controls
+}
+
+fn requested_secondary_controls() -> u64 {
+    required_secondary_controls() | optional_secondary_controls()
+}
+
+fn required_entry_controls() -> u64 {
+    vmcs::control::EntryControls::IA32E_MODE_GUEST.bits() as u64
+}
+
+fn optional_entry_controls() -> u64 {
+    optional_entry_controls_for_pt_mask(pt_vmx_concealment_mask())
+}
+
+fn optional_entry_controls_for_pt_mask(mask: u8) -> u64 {
+    if mask & PT_CONCEAL_ENTRY != 0 {
+        vmcs::control::EntryControls::CONCEAL_VMX_FROM_PT.bits() as u64
+    } else {
+        0
+    }
+}
+
+fn requested_entry_controls() -> u64 {
+    required_entry_controls() | optional_entry_controls()
+}
+
+fn required_exit_controls() -> u64 {
+    vmcs::control::ExitControls::HOST_ADDRESS_SPACE_SIZE.bits() as u64
+}
+
+fn optional_exit_controls() -> u64 {
+    optional_exit_controls_for_pt_mask(pt_vmx_concealment_mask())
+}
+
+fn optional_exit_controls_for_pt_mask(mask: u8) -> u64 {
+    if mask & PT_CONCEAL_EXIT != 0 {
+        vmcs::control::ExitControls::CONCEAL_VMX_FROM_PT.bits() as u64
+    } else {
+        0
+    }
+}
+
+fn requested_exit_controls() -> u64 {
+    required_exit_controls() | optional_exit_controls()
+}
+
 fn required_controls_present(required: u64, effective: u64) -> bool {
     effective & required == required
+}
+
+fn secondary_control_present(effective: u64, control: vmcs::control::SecondaryControls) -> bool {
+    effective & control.bits() as u64 != 0
+}
+
+fn pinbased_interrupt_exiting_ready(effective_pinbased: u64) -> bool {
+    let unsupported = (vmcs::control::PinbasedControls::EXTERNAL_INTERRUPT_EXITING.bits()
+        | vmcs::control::PinbasedControls::VIRTUAL_NMIS.bits()
+        | vmcs::control::PinbasedControls::VMX_PREEMPTION_TIMER.bits()
+        | vmcs::control::PinbasedControls::POSTED_INTERRUPTS.bits()) as u64;
+
+    effective_pinbased & unsupported == 0
+}
+
+fn unsupported_primary_exit_controls(effective_primary: u64) -> u64 {
+    let unsupported = (vmcs::control::PrimaryControls::INTERRUPT_WINDOW_EXITING.bits()
+        | vmcs::control::PrimaryControls::HLT_EXITING.bits()
+        | vmcs::control::PrimaryControls::INVLPG_EXITING.bits()
+        | vmcs::control::PrimaryControls::MWAIT_EXITING.bits()
+        | vmcs::control::PrimaryControls::RDPMC_EXITING.bits()
+        | vmcs::control::PrimaryControls::CR3_LOAD_EXITING.bits()
+        | vmcs::control::PrimaryControls::CR3_STORE_EXITING.bits()
+        | vmcs::control::PrimaryControls::CR8_LOAD_EXITING.bits()
+        | vmcs::control::PrimaryControls::CR8_STORE_EXITING.bits()
+        | vmcs::control::PrimaryControls::USE_TPR_SHADOW.bits()
+        | vmcs::control::PrimaryControls::NMI_WINDOW_EXITING.bits()
+        | vmcs::control::PrimaryControls::MOV_DR_EXITING.bits()
+        | vmcs::control::PrimaryControls::UNCOND_IO_EXITING.bits()
+        | vmcs::control::PrimaryControls::USE_IO_BITMAPS.bits()
+        | vmcs::control::PrimaryControls::MONITOR_TRAP_FLAG.bits()
+        | vmcs::control::PrimaryControls::MONITOR_EXITING.bits()
+        | vmcs::control::PrimaryControls::PAUSE_EXITING.bits()) as u64;
+
+    effective_primary & unsupported
+}
+
+fn unsupported_secondary_controls(effective_secondary: u64) -> u64 {
+    let unsupported = (vmcs::control::SecondaryControls::VIRTUALIZE_APIC.bits()
+        | vmcs::control::SecondaryControls::DTABLE_EXITING.bits()
+        | vmcs::control::SecondaryControls::VIRTUALIZE_X2APIC.bits()
+        | vmcs::control::SecondaryControls::UNRESTRICTED_GUEST.bits()
+        | vmcs::control::SecondaryControls::VIRTUALIZE_APIC_REGISTER.bits()
+        | vmcs::control::SecondaryControls::VIRTUAL_INTERRUPT_DELIVERY.bits()
+        | vmcs::control::SecondaryControls::PAUSE_LOOP_EXITING.bits()
+        | vmcs::control::SecondaryControls::RDRAND_EXITING.bits()
+        | vmcs::control::SecondaryControls::ENABLE_VM_FUNCTIONS.bits()
+        | vmcs::control::SecondaryControls::VMCS_SHADOWING.bits()
+        | vmcs::control::SecondaryControls::RDSEED_EXITING.bits()
+        | vmcs::control::SecondaryControls::ENABLE_PML.bits()
+        | vmcs::control::SecondaryControls::EPT_VIOLATION_VE.bits()
+        | vmcs::control::SecondaryControls::MODE_BASED_EPT.bits()
+        | vmcs::control::SecondaryControls::SUB_PAGE_EPT.bits()
+        | vmcs::control::SecondaryControls::INTEL_PT_GUEST_PHYSICAL.bits()
+        | vmcs::control::SecondaryControls::USE_TSC_SCALING.bits()
+        | vmcs::control::SecondaryControls::ENABLE_USER_WAIT_PAUSE.bits())
+        as u64;
+
+    effective_secondary & unsupported
+}
+
+fn unsupported_entry_controls(effective_entry: u64) -> u64 {
+    let unsupported = (vmcs::control::EntryControls::ENTRY_TO_SMM.bits()
+        | vmcs::control::EntryControls::DEACTIVATE_DUAL_MONITOR.bits()
+        | vmcs::control::EntryControls::LOAD_IA32_PERF_GLOBAL_CTRL.bits()
+        | vmcs::control::EntryControls::LOAD_IA32_PAT.bits()
+        | vmcs::control::EntryControls::LOAD_IA32_EFER.bits()
+        | vmcs::control::EntryControls::LOAD_IA32_BNDCFGS.bits()
+        | vmcs::control::EntryControls::LOAD_IA32_RTIT_CTL.bits()) as u64;
+
+    effective_entry & unsupported
+}
+
+fn unsupported_exit_controls(effective_exit: u64) -> u64 {
+    let unsupported = (vmcs::control::ExitControls::LOAD_IA32_PERF_GLOBAL_CTRL.bits()
+        | vmcs::control::ExitControls::ACK_INTERRUPT_ON_EXIT.bits()
+        | vmcs::control::ExitControls::SAVE_IA32_PAT.bits()
+        | vmcs::control::ExitControls::LOAD_IA32_PAT.bits()
+        | vmcs::control::ExitControls::SAVE_IA32_EFER.bits()
+        | vmcs::control::ExitControls::LOAD_IA32_EFER.bits()
+        | vmcs::control::ExitControls::SAVE_VMX_PREEMPTION_TIMER.bits()
+        | vmcs::control::ExitControls::CLEAR_IA32_BNDCFGS.bits()
+        | vmcs::control::ExitControls::CLEAR_IA32_RTIT_CTL.bits()) as u64;
+
+    effective_exit & unsupported
+}
+
+const CPUID_7_EBX_SGX: u32 = 1 << 2;
+const CPUID_7_EBX_INTEL_PT: u32 = 1 << 25;
+
+fn pt_vmx_concealment_mask() -> u8 {
+    pt_vmx_concealment_mask_from_env(
+        option_env!("HV_PT_CONCEAL_MASK"),
+        option_env!("HV_ENABLE_PT_CONCEAL"),
+    )
+}
+
+fn pt_vmx_concealment_mask_from_env(mask: Option<&str>, legacy_enable: Option<&str>) -> u8 {
+    if legacy_enable == Some("1") {
+        return PT_CONCEAL_ALL;
+    }
+
+    match mask {
+        Some("1") => PT_CONCEAL_SECONDARY,
+        Some("2") => PT_CONCEAL_EXIT,
+        Some("3") => PT_CONCEAL_SECONDARY | PT_CONCEAL_EXIT,
+        Some("4") => PT_CONCEAL_ENTRY,
+        Some("5") => PT_CONCEAL_SECONDARY | PT_CONCEAL_ENTRY,
+        Some("6") => PT_CONCEAL_EXIT | PT_CONCEAL_ENTRY,
+        Some("7") => PT_CONCEAL_ALL,
+        _ => 0,
+    }
+}
+
+fn host_sgx_feature_bits() -> (u32, u32) {
+    let leaf7 = cpuid!(0x7, 0);
+    let leaf12_eax = if leaf7.ebx & CPUID_7_EBX_SGX != 0 {
+        cpuid!(0x12, 0).eax
+    } else {
+        0
+    };
+
+    (leaf7.ebx, leaf12_eax)
+}
+
+fn sgx_instruction_exiting_ready(
+    host_leaf7_ebx: u32,
+    _host_leaf12_eax: u32,
+    _effective_secondary: u64,
+) -> bool {
+    host_leaf7_ebx & CPUID_7_EBX_SGX == 0
+}
+
+fn pt_vmx_concealment_ready(
+    host_leaf7_ebx: u32,
+    effective_secondary: u64,
+    effective_exit: u64,
+    effective_entry: u64,
+) -> bool {
+    pt_vmx_concealment_ready_for_mask(
+        pt_vmx_concealment_mask(),
+        host_leaf7_ebx,
+        effective_secondary,
+        effective_exit,
+        effective_entry,
+    )
+}
+
+fn pt_vmx_concealment_ready_for_mask(
+    mask: u8,
+    host_leaf7_ebx: u32,
+    effective_secondary: u64,
+    effective_exit: u64,
+    effective_entry: u64,
+) -> bool {
+    if mask != PT_CONCEAL_ALL || host_leaf7_ebx & CPUID_7_EBX_INTEL_PT == 0 {
+        return true;
+    }
+
+    let secondary_ready = secondary_control_present(
+        effective_secondary,
+        vmcs::control::SecondaryControls::CONCEAL_VMX_FROM_PT,
+    );
+    let exit_ready =
+        effective_exit & vmcs::control::ExitControls::CONCEAL_VMX_FROM_PT.bits() as u64 != 0;
+    let entry_ready =
+        effective_entry & vmcs::control::EntryControls::CONCEAL_VMX_FROM_PT.bits() as u64 != 0;
+
+    secondary_ready && exit_ready && entry_ready
+}
+
+fn encls_exiting_bitmap() -> u64 {
+    u64::MAX
 }
 
 /// Debug implementation to dump the VMCS fields.
@@ -471,6 +789,180 @@ mod tests {
     fn required_controls_must_all_be_present() {
         assert!(required_controls_present(0b1010, 0b1110));
         assert!(!required_controls_present(0b1010, 0b0010));
+    }
+
+    #[test]
+    fn primary_controls_do_not_request_dynamic_tsc_offsetting_by_default() {
+        let required = required_primary_controls();
+        let tsc_offsetting = vmcs::control::PrimaryControls::USE_TSC_OFFSETTING.bits() as u64;
+
+        assert_eq!(required & tsc_offsetting, 0);
+    }
+
+    #[test]
+    fn requested_controls_do_not_enable_pt_vmx_concealment_by_default() {
+        let secondary_pt = vmcs::control::SecondaryControls::CONCEAL_VMX_FROM_PT.bits() as u64;
+        let entry_pt = vmcs::control::EntryControls::CONCEAL_VMX_FROM_PT.bits() as u64;
+        let exit_pt = vmcs::control::ExitControls::CONCEAL_VMX_FROM_PT.bits() as u64;
+
+        assert_eq!(requested_secondary_controls() & secondary_pt, 0);
+        assert_eq!(requested_entry_controls() & entry_pt, 0);
+        assert_eq!(requested_exit_controls() & exit_pt, 0);
+    }
+
+    #[test]
+    fn intel_pt_hosts_do_not_require_vmx_concealment_when_not_requested() {
+        let intel_pt = 1 << 25;
+
+        assert!(pt_vmx_concealment_ready(0, 0, 0, 0));
+        assert!(pt_vmx_concealment_ready(intel_pt, 0, 0, 0));
+    }
+
+    #[test]
+    fn pt_vmx_concealment_mask_can_select_individual_controls() {
+        let secondary_pt = vmcs::control::SecondaryControls::CONCEAL_VMX_FROM_PT.bits() as u64;
+        let entry_pt = vmcs::control::EntryControls::CONCEAL_VMX_FROM_PT.bits() as u64;
+        let exit_pt = vmcs::control::ExitControls::CONCEAL_VMX_FROM_PT.bits() as u64;
+
+        assert_eq!(pt_vmx_concealment_mask_from_env(None, None), 0);
+        assert_eq!(pt_vmx_concealment_mask_from_env(Some("1"), None), 1);
+        assert_eq!(pt_vmx_concealment_mask_from_env(Some("2"), None), 2);
+        assert_eq!(pt_vmx_concealment_mask_from_env(Some("4"), None), 4);
+        assert_eq!(pt_vmx_concealment_mask_from_env(Some("7"), None), 7);
+        assert_eq!(pt_vmx_concealment_mask_from_env(None, Some("1")), 7);
+
+        assert_eq!(
+            optional_secondary_controls_for_pt_mask(1) & secondary_pt,
+            secondary_pt
+        );
+        assert_eq!(optional_entry_controls_for_pt_mask(1) & entry_pt, 0);
+        assert_eq!(optional_exit_controls_for_pt_mask(1) & exit_pt, 0);
+
+        assert_eq!(optional_secondary_controls_for_pt_mask(2) & secondary_pt, 0);
+        assert_eq!(optional_entry_controls_for_pt_mask(2) & entry_pt, 0);
+        assert_eq!(optional_exit_controls_for_pt_mask(2) & exit_pt, exit_pt);
+
+        assert_eq!(optional_secondary_controls_for_pt_mask(4) & secondary_pt, 0);
+        assert_eq!(optional_entry_controls_for_pt_mask(4) & entry_pt, entry_pt);
+        assert_eq!(optional_exit_controls_for_pt_mask(4) & exit_pt, 0);
+    }
+
+    #[test]
+    fn pt_vmx_concealment_readiness_requires_complete_controls_only_for_full_mask() {
+        let intel_pt = 1 << 25;
+        let secondary_pt = vmcs::control::SecondaryControls::CONCEAL_VMX_FROM_PT.bits() as u64;
+        let entry_pt = vmcs::control::EntryControls::CONCEAL_VMX_FROM_PT.bits() as u64;
+        let exit_pt = vmcs::control::ExitControls::CONCEAL_VMX_FROM_PT.bits() as u64;
+
+        assert!(pt_vmx_concealment_ready_for_mask(
+            1,
+            intel_pt,
+            secondary_pt,
+            0,
+            0
+        ));
+        assert!(!pt_vmx_concealment_ready_for_mask(
+            7,
+            intel_pt,
+            secondary_pt,
+            0,
+            entry_pt
+        ));
+        assert!(pt_vmx_concealment_ready_for_mask(
+            7,
+            intel_pt,
+            secondary_pt,
+            exit_pt,
+            entry_pt
+        ));
+    }
+
+    #[test]
+    fn external_interrupt_exiting_is_rejected_without_irq_delivery_support() {
+        let ext_int = vmcs::control::PinbasedControls::EXTERNAL_INTERRUPT_EXITING.bits() as u64;
+        let virtual_nmis = vmcs::control::PinbasedControls::VIRTUAL_NMIS.bits() as u64;
+        let preemption_timer = vmcs::control::PinbasedControls::VMX_PREEMPTION_TIMER.bits() as u64;
+        let posted_interrupts = vmcs::control::PinbasedControls::POSTED_INTERRUPTS.bits() as u64;
+
+        assert!(pinbased_interrupt_exiting_ready(0));
+        assert!(!pinbased_interrupt_exiting_ready(ext_int));
+        assert!(!pinbased_interrupt_exiting_ready(virtual_nmis));
+        assert!(!pinbased_interrupt_exiting_ready(preemption_timer));
+        assert!(!pinbased_interrupt_exiting_ready(posted_interrupts));
+    }
+
+    #[test]
+    fn unsupported_forced_primary_exit_controls_are_rejected() {
+        let baseline = required_primary_controls();
+        let hlt = vmcs::control::PrimaryControls::HLT_EXITING.bits() as u64;
+        let rdpmc = vmcs::control::PrimaryControls::RDPMC_EXITING.bits() as u64;
+        let io = vmcs::control::PrimaryControls::UNCOND_IO_EXITING.bits() as u64;
+
+        assert_eq!(unsupported_primary_exit_controls(baseline), 0);
+        assert_ne!(unsupported_primary_exit_controls(baseline | hlt), 0);
+        assert_ne!(unsupported_primary_exit_controls(baseline | rdpmc), 0);
+        assert_ne!(unsupported_primary_exit_controls(baseline | io), 0);
+    }
+
+    #[test]
+    fn unsupported_forced_secondary_controls_are_rejected() {
+        let baseline = requested_secondary_controls();
+        let vmfunc = vmcs::control::SecondaryControls::ENABLE_VM_FUNCTIONS.bits() as u64;
+        let pml = vmcs::control::SecondaryControls::ENABLE_PML.bits() as u64;
+        let tsc_scaling = vmcs::control::SecondaryControls::USE_TSC_SCALING.bits() as u64;
+        let user_wait = vmcs::control::SecondaryControls::ENABLE_USER_WAIT_PAUSE.bits() as u64;
+
+        assert_eq!(unsupported_secondary_controls(baseline), 0);
+        assert_ne!(unsupported_secondary_controls(baseline | vmfunc), 0);
+        assert_ne!(unsupported_secondary_controls(baseline | pml), 0);
+        assert_ne!(unsupported_secondary_controls(baseline | tsc_scaling), 0);
+        assert_ne!(unsupported_secondary_controls(baseline | user_wait), 0);
+    }
+
+    #[test]
+    fn unsupported_forced_entry_and_exit_controls_are_rejected() {
+        let entry = requested_entry_controls();
+        let exit = requested_exit_controls();
+        let entry_efer = vmcs::control::EntryControls::LOAD_IA32_EFER.bits() as u64;
+        let exit_efer = vmcs::control::ExitControls::LOAD_IA32_EFER.bits() as u64;
+        let exit_ack = vmcs::control::ExitControls::ACK_INTERRUPT_ON_EXIT.bits() as u64;
+
+        assert_eq!(unsupported_entry_controls(entry), 0);
+        assert_eq!(unsupported_exit_controls(exit), 0);
+        assert_ne!(unsupported_entry_controls(entry | entry_efer), 0);
+        assert_ne!(unsupported_exit_controls(exit | exit_efer), 0);
+        assert_ne!(unsupported_exit_controls(exit | exit_ack), 0);
+    }
+
+    #[test]
+    fn requested_secondary_controls_enable_sgx_instruction_exiting_when_supported() {
+        let encls = vmcs::control::SecondaryControls::ENCLS_EXITING.bits() as u64;
+        let enclv = vmcs::control::SecondaryControls::ENCLV_EXITING.bits() as u64;
+
+        assert_eq!(requested_secondary_controls() & encls, encls);
+        assert_eq!(requested_secondary_controls() & enclv, enclv);
+    }
+
+    #[test]
+    fn sgx_hosts_are_rejected_because_enclu_cannot_be_exited() {
+        let sgx_leaf7_ebx = 1 << 2;
+        let sgx_leaf12_enclv = 1 << 5;
+        let encls = vmcs::control::SecondaryControls::ENCLS_EXITING.bits() as u64;
+        let enclv = vmcs::control::SecondaryControls::ENCLV_EXITING.bits() as u64;
+
+        assert!(sgx_instruction_exiting_ready(0, 0, 0));
+        assert!(!sgx_instruction_exiting_ready(sgx_leaf7_ebx, 0, 0));
+        assert!(!sgx_instruction_exiting_ready(sgx_leaf7_ebx, 0, encls));
+        assert!(!sgx_instruction_exiting_ready(
+            sgx_leaf7_ebx,
+            sgx_leaf12_enclv,
+            encls
+        ));
+        assert!(!sgx_instruction_exiting_ready(
+            sgx_leaf7_ebx,
+            sgx_leaf12_enclv,
+            encls | enclv
+        ));
     }
 
     #[test]

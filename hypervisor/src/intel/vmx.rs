@@ -7,6 +7,7 @@ use {
         error::HypervisorError,
         intel::{
             descriptor::DescriptorTables,
+            diag,
             paging::PageTables,
             shared_data::SharedData,
             support,
@@ -14,7 +15,7 @@ use {
             vmcs::Vmcs,
             vmlaunch::launch_vm,
             vmstack::{VmStack, STACK_CONTENTS_SIZE},
-            vmxon::Vmxon,
+            vmxon::{ControlRegisterSnapshot, Vmxon},
         },
         utils::capture::GuestRegisters,
         utils::{
@@ -64,6 +65,9 @@ pub struct Vmx {
     /// Allocated using `MmAllocateContiguousMemorySpecifyCacheNode`.
     pub host_paging: Box<PageTables, PhysicalAllocator>,
 
+    /// Control registers captured before enabling VMX operation.
+    pub control_registers: ControlRegisterSnapshot,
+
     /// The guest's general-purpose registers state.
     pub guest_registers: GuestRegisters,
 
@@ -72,6 +76,9 @@ pub struct Vmx {
 
     /// Guest PA to re-cloak after MTF single-step completes.
     pub mtf_recloak_pa: Option<u64>,
+
+    /// Cumulative guest TSC offset used to hide unavoidable CPUID VM-exit cost.
+    pub tsc_offset: u64,
 }
 
 impl Vmx {
@@ -84,6 +91,7 @@ impl Vmx {
     #[rustfmt::skip]
     pub fn new(shared_data: &mut SharedData, context: &CONTEXT) -> Result<Box<Self>, HypervisorError> {
         log::debug!("Setting up VMX");
+        diag::boot_stage(500)?;
 
         // Allocate memory for the hypervisor's needs
         let vmxon_region = unsafe { Box::try_new_zeroed_in(PhysicalAllocator)?.assume_init() };
@@ -93,14 +101,18 @@ impl Vmx {
         let vmstack = unsafe { Box::try_new_zeroed_in(KernelAlloc)?.assume_init() };
         let mut host_paging: Box<PageTables, PhysicalAllocator> = unsafe { Box::try_new_zeroed_in(PhysicalAllocator)?.assume_init() };
         let guest_registers = GuestRegisters::default();
+        let control_registers = ControlRegisterSnapshot::capture();
+        diag::boot_stage(510)?;
 
         // To capture the current GDT and IDT for the guest the order is important so we can setup up a new GDT and IDT for the host.
         // This is done here instead of `setup_virtualization` because it uses a vec to allocate memory for the new GDT
         DescriptorTables::initialize_for_guest(&mut guest_descriptor_table)?;
         DescriptorTables::initialize_for_host(&mut host_descriptor_table)?;
+        diag::boot_stage(520)?;
 
         // Build hypervisor-owned paging once per CPU and keep the identity CR3 for diagnostics.
         if unsafe { NTOSKRNL_CR3 } == 0 {
+            let _ = diag::boot_stage(521);
             return Err(HypervisorError::InvalidCr3BaseAddress);
         }
 
@@ -112,6 +124,7 @@ impl Vmx {
                 IDENTITY_CR3 = identity_cr3;
             }
         }
+        diag::boot_stage(530)?;
 
         log::trace!("Creating Vmx instance");
 
@@ -122,16 +135,20 @@ impl Vmx {
             host_descriptor_table,
             vmstack,
             host_paging,
+            control_registers,
             guest_registers,
             shared_data: unsafe { NonNull::new_unchecked(shared_data as *mut _) },
             mtf_recloak_pa: None,
+            tsc_offset: 0,
         };
 
         let mut instance = Box::new(instance);
 
         instance.vmstack.vmx = &mut *instance as *mut _ as _;
 
+        diag::boot_stage(540)?;
         instance.setup_virtualization(shared_data, context)?;
+        diag::boot_stage(550)?;
 
         log::debug!("Dumping VMCS: {:#x?}", instance.vmcs_region);
         log::debug!("Dumping CONTEXT: {:#x?}", &context);
@@ -139,6 +156,20 @@ impl Vmx {
         log::debug!("VMX setup successfully!");
 
         Ok(instance)
+    }
+
+    pub fn teardown_vmx_operation(&self, context: &str) {
+        if let Err(error) = Vcpu::invalidate_contexts() {
+            log::error!(
+                "Failed to invalidate contexts during {}: {:?}",
+                context,
+                error
+            );
+        }
+        if let Err(error) = support::vmxoff() {
+            log::error!("Failed to cleanup VMXON during {}: {:?}", context, error);
+        }
+        self.restore_control_registers();
     }
 
     /// Sets up the virtualization environment using the VMX capabilities.
@@ -157,10 +188,45 @@ impl Vmx {
         context: &CONTEXT,
     ) -> Result<(), HypervisorError> {
         log::debug!("Setting up virtualization");
+        diag::boot_stage(600)?;
 
         Vmxon::setup(&mut self.vmxon_region)?;
-        Vcpu::invalidate_contexts();
+        if let Err(error) = diag::boot_stage(610) {
+            if let Err(vmxoff_error) = support::vmxoff() {
+                log::error!(
+                    "Failed to cleanup VMXON after boot-stage stop: {:?}",
+                    vmxoff_error
+                );
+            }
+            self.restore_control_registers();
+            return Err(error);
+        }
+        if let Err(error) = Vcpu::invalidate_contexts() {
+            log::error!(
+                "Initial context invalidation failed after VMXON: {:?}",
+                error
+            );
+            if let Err(vmxoff_error) = support::vmxoff() {
+                log::error!(
+                    "Failed to cleanup VMXON after context invalidation failure: {:?}",
+                    vmxoff_error
+                );
+            }
+            self.restore_control_registers();
+            let _ = diag::boot_stage(611);
+            return Err(error);
+        }
 
+        if let Err(error) = diag::boot_stage(620) {
+            if let Err(vmxoff_error) = support::vmxoff() {
+                log::error!(
+                    "Failed to cleanup VMXON after boot-stage stop: {:?}",
+                    vmxoff_error
+                );
+            }
+            self.restore_control_registers();
+            return Err(error);
+        }
         let setup_result = (|| -> Result<(), HypervisorError> {
             Vmcs::setup(&mut self.vmcs_region)?;
             VmStack::setup(&mut self.vmstack)?;
@@ -189,17 +255,28 @@ impl Vmx {
 
         if let Err(error) = setup_result {
             log::error!("Virtualization setup failed after VMXON: {:?}", error);
-            Vcpu::invalidate_contexts();
+            let _ = diag::boot_stage(621);
+            if let Err(invalidate_error) = Vcpu::invalidate_contexts() {
+                log::error!(
+                    "Failed to invalidate contexts during VMXON cleanup: {:?}",
+                    invalidate_error
+                );
+            }
             if let Err(vmxoff_error) = support::vmxoff() {
                 log::error!(
                     "Failed to cleanup VMXON after setup failure: {:?}",
                     vmxoff_error
                 );
             }
+            self.restore_control_registers();
             return Err(error);
         }
 
         log::debug!("Virtualization setup successfully!");
+        if let Err(error) = diag::boot_stage(630) {
+            self.teardown_vmx_operation("boot-stage stop");
+            return Err(error);
+        }
 
         Ok(())
     }
@@ -209,7 +286,7 @@ impl Vmx {
     /// This method will continuously execute the VM until a VM-exit event occurs. Upon VM-exit,
     /// it updates the VM state, interprets the VM-exit reason, and handles it appropriately.
     /// The loop continues until an unhandled or error-causing VM-exit is encountered.
-    pub fn run(&mut self, cpu_index: u32) {
+    pub fn run(&mut self, cpu_index: u32) -> Result<(), HypervisorError> {
         log::trace!("Executing VMLAUNCH to run the guest until a VM-exit event occurs");
 
         let stack_contents_ptr = self.vmstack.stack_contents.as_mut_ptr();
@@ -218,7 +295,19 @@ impl Vmx {
         log::trace!("Vmx: {:#p}", self.vmstack.vmx);
 
         log::info!("Launching VM for processor {}", cpu_index);
+        if let Err(error) = diag::boot_stage(700 + cpu_index as u64) {
+            self.teardown_vmx_operation("boot-stage stop");
+            return Err(error);
+        }
         unsafe { launch_vm(&mut self.guest_registers, vmcs_host_rsp as *mut u64) };
+
+        self.restore_control_registers();
+        let _ = diag::boot_stage(790 + cpu_index as u64);
+        Err(HypervisorError::VMLAUNCHFailed)
+    }
+
+    pub fn restore_control_registers(&self) {
+        self.control_registers.restore();
     }
 
     /// Returns a mutable reference to the shared data.
@@ -228,5 +317,17 @@ impl Vmx {
     /// A mutable reference to the shared data.
     pub fn shared_data(&mut self) -> &mut SharedData {
         unsafe { self.shared_data.as_mut() }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn run_surfaces_vm_entry_failure_to_caller() {
+        fn assert_signature(_: fn(&mut Vmx, u32) -> Result<(), HypervisorError>) {}
+
+        assert_signature(Vmx::run);
     }
 }

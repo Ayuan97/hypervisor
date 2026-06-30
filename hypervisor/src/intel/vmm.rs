@@ -4,6 +4,7 @@ use {
     crate::{
         error::HypervisorError,
         intel::{
+            diag,
             ept::{hooks::HookManager, paging::Ept},
             shared_data::SharedData,
             vcpu::Vcpu,
@@ -14,6 +15,7 @@ use {
         },
     },
     alloc::{boxed::Box, vec::Vec},
+    core::mem::ManuallyDrop,
 };
 
 #[derive(Default)]
@@ -69,8 +71,9 @@ impl HypervisorBuilder {
         };
 
         Ok(Hypervisor {
-            processors,
-            shared_data,
+            processors: ManuallyDrop::new(processors),
+            shared_data: ManuallyDrop::new(shared_data),
+            devirtualized: true,
         })
     }
 
@@ -94,10 +97,13 @@ impl HypervisorBuilder {
 /// The main struct representing the hypervisor.
 pub struct Hypervisor {
     /// The processors to virtualize.
-    processors: Vec<Vcpu>,
+    processors: ManuallyDrop<Vec<Vcpu>>,
 
     /// The shared data between processors.
-    shared_data: Box<SharedData>,
+    shared_data: ManuallyDrop<Box<SharedData>>,
+
+    /// Whether all processors are known to be outside VMX non-root operation.
+    devirtualized: bool,
 }
 
 impl Hypervisor {
@@ -115,11 +121,23 @@ impl Hypervisor {
         log::trace!("Virtualizing processors");
 
         for processor in self.processors.iter_mut() {
+            diag::boot_stage(300 + processor.id() as u64)?;
+            log::info!("hv stage 300 cpu={}", processor.id());
             let Some(executor) = ProcessorExecutor::switch_to_processor(processor.id()) else {
+                let _ = diag::boot_stage(390 + processor.id() as u64);
                 return Err(HypervisorError::ProcessorSwitchFailed);
             };
 
+            if let Err(error) = diag::boot_stage(310 + processor.id() as u64) {
+                drop(executor);
+                return Err(error);
+            }
+            self.devirtualized = false;
             processor.virtualize_cpu(self.shared_data.as_mut())?;
+            if let Err(error) = diag::boot_stage(320 + processor.id() as u64) {
+                drop(executor);
+                return Err(error);
+            }
 
             drop(executor);
         }
@@ -135,15 +153,24 @@ impl Hypervisor {
     pub fn devirtualize_system(&mut self) -> Result<(), HypervisorError> {
         log::trace!("Devirtualizing processors");
 
+        if self.devirtualized {
+            return Ok(());
+        }
+
         for processor in self.processors.iter_mut() {
+            diag::set_boot_stage(800 + processor.id() as u64);
             let Some(executor) = ProcessorExecutor::switch_to_processor(processor.id()) else {
+                diag::set_boot_stage(890 + processor.id() as u64);
                 return Err(HypervisorError::ProcessorSwitchFailed);
             };
 
             processor.devirtualize_cpu()?;
+            diag::set_boot_stage(820 + processor.id() as u64);
 
             drop(executor);
         }
+
+        self.devirtualized = true;
 
         Ok(())
     }
@@ -213,18 +240,53 @@ impl Hypervisor {
     }
 }
 
+fn drop_should_release_owned_resources(devirtualized: bool, cleanup_succeeded: bool) -> bool {
+    devirtualized || cleanup_succeeded
+}
+
 impl Drop for Hypervisor {
     /// Handles the dropping of the `Hypervisor` instance.
     ///
     /// When a `Hypervisor` instance goes out of scope or is explicitly dropped,
     /// this method attempts to devirtualize the system and logs the result.
     fn drop(&mut self) {
-        match self.devirtualize_system() {
-            Ok(_) => log::trace!("Devirtualized successfully!"),
-            Err(err) => log::trace!("Failed to devirtualize {}", err),
+        let was_devirtualized = self.devirtualized;
+        let cleanup_succeeded = if was_devirtualized {
+            true
+        } else {
+            match self.devirtualize_system() {
+                Ok(_) => {
+                    log::trace!("Devirtualized successfully!");
+                    true
+                }
+                Err(err) => {
+                    log::error!(
+                        "Failed to devirtualize {}; leaking hypervisor resources",
+                        err
+                    );
+                    false
+                }
+            }
+        };
+
+        if drop_should_release_owned_resources(was_devirtualized, cleanup_succeeded) {
+            unsafe {
+                crate::utils::nt::IDENTITY_CR3 = 0;
+                ManuallyDrop::drop(&mut self.processors);
+                ManuallyDrop::drop(&mut self.shared_data);
+            }
         }
-        unsafe {
-            crate::utils::nt::IDENTITY_CR3 = 0;
-        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn drop_releases_owned_resources_only_after_successful_cleanup() {
+        assert!(drop_should_release_owned_resources(true, false));
+        assert!(drop_should_release_owned_resources(false, true));
+        assert!(!drop_should_release_owned_resources(false, false));
     }
 }

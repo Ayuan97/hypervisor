@@ -131,7 +131,10 @@ fn handle_breakpoint_exception(guest_registers: &mut GuestRegisters, vmx: &mut V
         log::trace!("Transferring execution to handler: {:#x}", handler);
         guest_registers.rip = handler;
         if let Err(error) = vmwrite_checked(vmcs::guest::RIP, guest_registers.rip) {
-            log::error!("Failed to redirect guest RIP for breakpoint hook: {:?}", error);
+            log::error!(
+                "Failed to redirect guest RIP for breakpoint hook: {:?}",
+                error
+            );
             EventInjection::vmentry_inject_bp();
             return;
         }

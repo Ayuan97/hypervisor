@@ -1,9 +1,28 @@
 use std::arch::asm;
 use std::io::Write;
 
-const CPUID_LEAF: u64 = 0x7A3F_E1D9;
+const CPUID_LEAF: u64 = 0x4000_0000;
 const EXPECTED_MAGIC: u64 = 0xA3B7_E291_4F6D_8C15;
 const HV_STATUS_ACCESS_DENIED: u64 = u64::MAX - 1;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn access_denied_response_marks_diagnostics_as_sealed() {
+        assert!(diagnostics_access_denied(HV_STATUS_ACCESS_DENIED));
+        assert!(!diagnostics_access_denied(EXPECTED_MAGIC));
+        assert!(!diagnostics_access_denied(0));
+    }
+
+    #[test]
+    fn ping_response_distinguishes_loaded_from_missing_hv() {
+        assert!(ping_response_indicates_loaded(EXPECTED_MAGIC));
+        assert!(ping_response_indicates_loaded(HV_STATUS_ACCESS_DENIED));
+        assert!(!ping_response_indicates_loaded(0));
+    }
+}
 
 fn hv(cmd: u64, p1: u64, p2: u64, p3: u64) -> u64 {
     let result: u64;
@@ -17,9 +36,19 @@ fn hv(cmd: u64, p1: u64, p2: u64, p3: u64) -> u64 {
             inlateout("rdx") p1 => _,
             in("r8") p2,
             in("r9") p3,
+            in("r10") EXPECTED_MAGIC,
+            in("r11") EXPECTED_MAGIC,
         );
     }
     result
+}
+
+fn diagnostics_access_denied(value: u64) -> bool {
+    value == HV_STATUS_ACCESS_DENIED
+}
+
+fn ping_response_indicates_loaded(value: u64) -> bool {
+    value == EXPECTED_MAGIC || diagnostics_access_denied(value)
 }
 
 fn step(n: u32, total: u32, desc: &str) {
@@ -36,9 +65,16 @@ fn main() {
 
     println!("=== HV User-Mode Safety Diagnostic ===\n");
 
-    step(1, 4, "CPUID ping");
+    step(1, 2, "CPUID ping");
     let r = hv(0x01, 0, 0, 0);
-    if r != EXPECTED_MAGIC {
+    if diagnostics_access_denied(r) {
+        println!("SEALED");
+        println!("\nHV is loaded, but diagnostics are sealed.");
+        println!("Run this before sealing, or start with HV_NO_SEAL=1 for diagnostics.");
+        pause();
+        return;
+    }
+    if !ping_response_indicates_loaded(r) {
         println!("FAIL (0x{:X})", r);
         println!("\nHV not loaded. Run start_hv.bat first.");
         pause();
@@ -46,25 +82,7 @@ fn main() {
     }
     println!("OK");
 
-    step(2, 4, "get guest CR3");
-    let cr3 = hv(0x13, 0, 0, 0);
-    if cr3 == 0 {
-        println!("FAIL");
-        pause();
-        return;
-    }
-    println!("OK (0x{:X})", cr3);
-
-    step(3, 4, "read IDENTITY_CR3 (ctl index 5)");
-    let id_cr3 = hv(0x15, 5, 0, 0);
-    println!("0x{:X}", id_cr3);
-    if id_cr3 == 0 || id_cr3 == u64::MAX {
-        println!("\n[!] IDENTITY_CR3 invalid. Identity page tables not initialized.");
-        pause();
-        return;
-    }
-
-    step(4, 4, "read_phys(PA=0, 8 bytes) denied from user mode");
+    step(2, 2, "read_phys(PA=0, 8 bytes) denied from user mode");
     let v = hv(0x10, 0, 8, 0);
     if v == HV_STATUS_ACCESS_DENIED {
         println!("OK");
@@ -86,8 +104,21 @@ fn monitor() {
     println!("If the system freezes, the last line printed is the clue.\n");
 
     let r = hv(0x01, 0, 0, 0);
-    if r != EXPECTED_MAGIC {
+    if diagnostics_access_denied(r) {
+        println!("Diagnostics are sealed.");
+        println!("Restart and run scripts\\start_hv.bat with HV_NO_SEAL=1 before using monitor.");
+        pause();
+        return;
+    }
+    if !ping_response_indicates_loaded(r) {
         println!("HV not loaded.");
+        pause();
+        return;
+    }
+
+    if diagnostics_access_denied(hv(0x14, 0, 0, 0)) {
+        println!("Diagnostics are sealed.");
+        println!("Restart and run scripts\\start_hv.bat with HV_NO_SEAL=1 before using monitor.");
         pause();
         return;
     }
@@ -101,21 +132,50 @@ fn monitor() {
             10 => "CPUID",
             12 => "HLT",
             13 => "INVD",
+            15 => "RDPMC",
+            16 => "RDTSC",
             18 => "VMCALL",
+            19 => "VMCLEAR",
+            20 => "VMLAUNCH",
+            21 => "VMPTRLD",
+            22 => "VMPTRST",
+            23 => "VMREAD",
+            24 => "VMRESUME",
+            25 => "VMWRITE",
+            26 => "VMXOFF",
+            27 => "VMXON",
             28 => "ControlRegAccess",
             30 => "IOInstruction",
             31 => "RDMSR",
             32 => "WRMSR",
             33 => "EntryFail_Guest",
             34 => "EntryFail_MSR",
+            36 => "MWAIT",
             37 => "MonitorTrapFlag",
+            40 => "PAUSE",
             43 => "TPR_Below",
             48 => "EPTViolation",
             49 => "EPTMisconfig",
             50 => "INVEPT",
+            51 => "RDTSCP",
             53 => "INVVPID",
+            54 => "WBINVD",
             55 => "XSETBV",
-            58 => "RDTSCP",
+            57 => "RDRAND",
+            58 => "INVPCID",
+            59 => "VMFUNC",
+            60 => "ENCLS",
+            61 => "RDSEED",
+            62 => "PMLFull",
+            63 => "XSAVES",
+            64 => "XRSTORS",
+            65 => "PCONFIG",
+            67 => "UMWAIT",
+            68 => "TPAUSE",
+            69 => "LOADIWKEY",
+            70 => "ENCLV",
+            74 => "BusLock",
+            75 => "InstructionTimeout",
             _ => "Unknown",
         }
     };
@@ -135,10 +195,12 @@ fn monitor() {
         let other = hv(0x14, 8, 0, 0);
         let msr = hv(0x14, 9, 0, 0);
         let last_reason = hv(0x15, 6, 0, 0);
+        let tsc_offset = hv(0x15, 8, 0, 0);
+        let basic_reason = last_reason & 0xffff;
 
         let delta = total.wrapping_sub(prev_total);
         let line = format!(
-            "[{:>4}] T={:<8} +{:<6} CPUID={} ExtInt={} Exc={} EPT_V={} CR={} MSR={} XSETBV={} Other={} last={}({})",
+            "[{:>4}] T={:<8} +{:<6} CPUID={} ExtInt={} Exc={} EPT_V={} CR={} MSR={} XSETBV={} Other={} TSC_OFF={:#x} last={}({})",
             tick,
             total,
             delta,
@@ -150,8 +212,9 @@ fn monitor() {
             msr,
             xsetbv,
             other,
+            tsc_offset,
             last_reason,
-            reason_name(last_reason)
+            reason_name(basic_reason)
         );
         println!("{}", line);
         std::io::stdout().flush().unwrap();

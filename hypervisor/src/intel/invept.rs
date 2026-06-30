@@ -4,6 +4,13 @@
 //! that cache translations derived from EPT. It's used to ensure that modifications to EPT entries don't cause
 //! inconsistencies due to stale cached translations.
 
+use crate::error::HypervisorError;
+use x86::msr;
+
+const EPT_VPID_CAP_INVEPT: u64 = 1 << 20;
+const EPT_VPID_CAP_SINGLE_CONTEXT_INVEPT: u64 = 1 << 25;
+const EPT_VPID_CAP_ALL_CONTEXT_INVEPT: u64 = 1 << 26;
+
 /// Represents the types of INVEPT operations.
 #[repr(u64)]
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
@@ -56,7 +63,9 @@ fn invept(invept_type: InveptType, eptp: u64) {
 ///            page-walk length (bits 5:3), and address of the EPTP (bits 63:12).
 pub fn invept_single_context(eptp: u64) {
     // Perform the INVEPT operation for a single context.
-    invept(InveptType::SingleContext, eptp);
+    if let Err(error) = try_invept_single_context(eptp) {
+        log::error!("Skipping single-context INVEPT: {:?}", error);
+    }
 }
 
 /// Invalidates entries in the TLB and other processor structures that cache translations derived from EPT
@@ -67,5 +76,66 @@ pub fn invept_single_context(eptp: u64) {
 pub fn invept_all_contexts() {
     // Perform the INVEPT operation for all contexts.
     // The EPT pointer is irrelevant for this type of operation and is thus set to 0.
+    if let Err(error) = try_invept_all_contexts() {
+        log::error!("Skipping all-context INVEPT: {:?}", error);
+    }
+}
+
+pub fn try_invept_single_context(eptp: u64) -> Result<(), HypervisorError> {
+    let cap = ept_vpid_capability();
+    if !single_context_invept_supported(cap) {
+        return Err(HypervisorError::VMXUnsupported);
+    }
+
+    invept(InveptType::SingleContext, eptp);
+    Ok(())
+}
+
+pub fn try_invept_all_contexts() -> Result<(), HypervisorError> {
+    let cap = ept_vpid_capability();
+    if !all_context_invept_supported(cap) {
+        return Err(HypervisorError::VMXUnsupported);
+    }
+
     invept(InveptType::AllContexts, 0);
+    Ok(())
+}
+
+fn ept_vpid_capability() -> u64 {
+    unsafe { msr::rdmsr(msr::IA32_VMX_EPT_VPID_CAP) }
+}
+
+fn single_context_invept_supported(capability: u64) -> bool {
+    capability & (EPT_VPID_CAP_INVEPT | EPT_VPID_CAP_SINGLE_CONTEXT_INVEPT)
+        == (EPT_VPID_CAP_INVEPT | EPT_VPID_CAP_SINGLE_CONTEXT_INVEPT)
+}
+
+fn all_context_invept_supported(capability: u64) -> bool {
+    capability & (EPT_VPID_CAP_INVEPT | EPT_VPID_CAP_ALL_CONTEXT_INVEPT)
+        == (EPT_VPID_CAP_INVEPT | EPT_VPID_CAP_ALL_CONTEXT_INVEPT)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn all_context_invept_requires_instruction_and_type_capability_bits() {
+        let invept = 1u64 << 20;
+        let all_context = 1u64 << 26;
+
+        assert!(!all_context_invept_supported(0));
+        assert!(!all_context_invept_supported(invept));
+        assert!(all_context_invept_supported(invept | all_context));
+    }
+
+    #[test]
+    fn single_context_invept_requires_instruction_and_type_capability_bits() {
+        let invept = 1u64 << 20;
+        let single_context = 1u64 << 25;
+
+        assert!(!single_context_invept_supported(0));
+        assert!(!single_context_invept_supported(invept));
+        assert!(single_context_invept_supported(invept | single_context));
+    }
 }

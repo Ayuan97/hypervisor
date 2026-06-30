@@ -1,4 +1,4 @@
-//! A module providing utilities and structures for handling VM exits.
+﻿//! A module providing utilities and structures for handling VM exits.
 //!
 //! This module focuses on the reasons for VM exits, VM instruction errors, and the associated handlers for each exit type.
 //! The handlers interpret and respond to different VM exit reasons, ensuring the safe and correct execution of the virtual machine.
@@ -6,7 +6,8 @@
 use {
     super::{
         diag,
-        support::{vmread_checked, vmwrite_checked},
+        support::{self, vmread_checked, vmwrite_checked},
+        vcpu::Vcpu,
         vmerror::VmxBasicExitReason,
     },
     crate::{
@@ -17,19 +18,23 @@ use {
                 cr::handle_cr_access,
                 ept::{handle_ept_misconfiguration, handle_ept_violation, handle_mtf},
                 exception::{handle_exception, handle_undefined_opcode_exception},
-                invd::handle_invd,
+                invd::{handle_invd, handle_wbinvd_or_wbnoinvd},
                 invept::handle_invept,
                 invvpid::handle_invvpid,
                 msr::{handle_msr_access, MsrAccessType},
-                rdtsc::handle_rdtsc,
+                rdtsc::{handle_rdtsc, handle_rdtscp},
                 vmcall::handle_vmcall,
                 xsetbv::handle_xsetbv,
             },
             vmx::Vmx,
         },
-        utils::capture::GuestRegisters,
+        utils::{capture::GuestRegisters, instructions::cr3_write, processor::clear_virtualized},
     },
-    x86::vmx::vmcs::{guest, ro},
+    x86::{
+        dtables::{lgdt, lidt, DescriptorTablePointer},
+        msr as x86_msr,
+        vmx::vmcs::{guest, ro},
+    },
 };
 
 pub mod cpuid;
@@ -45,7 +50,7 @@ pub mod vmcall;
 pub mod xsetbv;
 
 /// Represents the type of VM exit.
-#[derive(PartialOrd, PartialEq)]
+#[derive(Debug, Copy, Clone, PartialOrd, PartialEq)]
 pub enum ExitType {
     ExitHypervisor,
     IncrementRIP,
@@ -78,7 +83,7 @@ impl VmExit {
         &self,
         guest_registers: &mut GuestRegisters,
         vmx: &mut Vmx,
-    ) -> Result<(), HypervisorError> {
+    ) -> Result<ExitType, HypervisorError> {
         log::debug!("Handling VMEXIT...");
 
         // Upon VM-exit, transfer the guest register values from VMCS to `self.registers` to ensure it reflects the latest and complete state.
@@ -88,7 +93,7 @@ impl VmExit {
 
         let exit_reason = vmread_checked(ro::EXIT_REASON)? as u32;
 
-        let Some(basic_exit_reason) = VmxBasicExitReason::from_u32(exit_reason) else {
+        let Some(basic_exit_reason) = decode_basic_exit_reason(exit_reason) else {
             log::error!("Unknown exit reason: {:#x}", exit_reason);
             return Err(HypervisorError::UnknownVMExitReason);
         };
@@ -133,14 +138,9 @@ impl VmExit {
                 handle_cr_access(guest_registers)
             }
 
-            VmxBasicExitReason::Getsec
-            | VmxBasicExitReason::Vmclear
-            | VmxBasicExitReason::Vmlaunch
-            | VmxBasicExitReason::Vmptrld
-            | VmxBasicExitReason::Vmptrst
-            | VmxBasicExitReason::Vmresume
-            | VmxBasicExitReason::Vmxon
-            | VmxBasicExitReason::Vmxoff => handle_undefined_opcode_exception(),
+            reason if vmx_probe_instruction_should_inject_ud(reason) => {
+                handle_undefined_opcode_exception()
+            }
 
             VmxBasicExitReason::MonitorTrapFlag => handle_mtf(vmx),
 
@@ -153,7 +153,9 @@ impl VmExit {
                 handle_msr_access(guest_registers, MsrAccessType::Write)
             }
             VmxBasicExitReason::Invd => handle_invd(guest_registers),
-            VmxBasicExitReason::Rdtsc => handle_rdtsc(guest_registers),
+            VmxBasicExitReason::WbinvdOrWbnoinvd => handle_wbinvd_or_wbnoinvd(),
+            VmxBasicExitReason::Rdtsc => handle_rdtsc(guest_registers, vmx.tsc_offset),
+            VmxBasicExitReason::Rdtscp => handle_rdtscp(guest_registers, vmx.tsc_offset),
             VmxBasicExitReason::EptViolation => {
                 diag::EXIT_EPT_VIOLATION.fetch_add(1, Relaxed);
                 handle_ept_violation(guest_registers, vmx)
@@ -175,8 +177,13 @@ impl VmExit {
             }
         };
 
-        if exit_type == ExitType::IncrementRIP {
+        if exit_type_advances_rip(exit_type) {
             self.advance_guest_rip(guest_registers)?;
+        }
+
+        if exit_type == ExitType::ExitHypervisor {
+            self.leave_vmx_root(vmx)?;
+            return Ok(exit_type);
         }
 
         super::host_idt::check_pending_nmi();
@@ -187,7 +194,7 @@ impl VmExit {
         );
         log::debug!("VMEXIT handled successfully.");
 
-        return Ok(());
+        Ok(exit_type)
     }
 
     /// Advances the guest's instruction pointer (RIP) after a VM exit.
@@ -203,5 +210,139 @@ impl VmExit {
         vmwrite_checked(guest::RIP, guest_registers.rip)?;
         log::trace!("Guest RIP advanced to: {:#x}", guest_registers.rip);
         Ok(())
+    }
+
+    fn leave_vmx_root(&self, vmx: &Vmx) -> Result<(), HypervisorError> {
+        let guest_state = GuestRootState::read_from_vmcs()?;
+
+        if let Err(error) = Vcpu::invalidate_contexts() {
+            log::error!("Context invalidation before VMXOFF failed: {:?}", error);
+        }
+
+        support::vmxoff()?;
+        unsafe {
+            guest_state.restore_after_vmxoff(vmx);
+        }
+        clear_virtualized();
+        Ok(())
+    }
+}
+
+#[derive(Debug, Copy, Clone)]
+pub(crate) struct GuestRootState {
+    cr3: u64,
+    fs_base: u64,
+    gs_base: u64,
+    gdtr_base: u64,
+    gdtr_limit: u16,
+    idtr_base: u64,
+    idtr_limit: u16,
+    sysenter_cs: u64,
+    sysenter_esp: u64,
+    sysenter_eip: u64,
+}
+
+impl GuestRootState {
+    pub(crate) fn read_from_vmcs() -> Result<Self, HypervisorError> {
+        Ok(Self {
+            cr3: vmread_checked(guest::CR3)?,
+            fs_base: vmread_checked(guest::FS_BASE)?,
+            gs_base: vmread_checked(guest::GS_BASE)?,
+            gdtr_base: vmread_checked(guest::GDTR_BASE)?,
+            gdtr_limit: vmread_checked(guest::GDTR_LIMIT)? as u16,
+            idtr_base: vmread_checked(guest::IDTR_BASE)?,
+            idtr_limit: vmread_checked(guest::IDTR_LIMIT)? as u16,
+            sysenter_cs: vmread_checked(guest::IA32_SYSENTER_CS)?,
+            sysenter_esp: vmread_checked(guest::IA32_SYSENTER_ESP)?,
+            sysenter_eip: vmread_checked(guest::IA32_SYSENTER_EIP)?,
+        })
+    }
+
+    pub(crate) unsafe fn restore_after_vmxoff(&self, vmx: &Vmx) {
+        vmx.restore_control_registers();
+        x86_msr::wrmsr(x86_msr::IA32_FS_BASE, self.fs_base);
+        x86_msr::wrmsr(x86_msr::IA32_GS_BASE, self.gs_base);
+        x86_msr::wrmsr(x86_msr::IA32_SYSENTER_CS, self.sysenter_cs);
+        x86_msr::wrmsr(x86_msr::IA32_SYSENTER_ESP, self.sysenter_esp);
+        x86_msr::wrmsr(x86_msr::IA32_SYSENTER_EIP, self.sysenter_eip);
+
+        let gdtr = DescriptorTablePointer::<u64> {
+            limit: self.gdtr_limit,
+            base: self.gdtr_base as *const u64,
+        };
+        let idtr = DescriptorTablePointer::<u64> {
+            limit: self.idtr_limit,
+            base: self.idtr_base as *const u64,
+        };
+        lgdt(&gdtr);
+        lidt(&idtr);
+        cr3_write(self.cr3);
+    }
+}
+
+fn exit_type_advances_rip(exit_type: ExitType) -> bool {
+    matches!(exit_type, ExitType::IncrementRIP | ExitType::ExitHypervisor)
+}
+
+fn vmx_probe_instruction_should_inject_ud(reason: VmxBasicExitReason) -> bool {
+    matches!(
+        reason,
+        VmxBasicExitReason::Getsec
+            | VmxBasicExitReason::Encls
+            | VmxBasicExitReason::Enclv
+            | VmxBasicExitReason::Vmclear
+            | VmxBasicExitReason::Vmlaunch
+            | VmxBasicExitReason::Vmptrld
+            | VmxBasicExitReason::Vmptrst
+            | VmxBasicExitReason::Vmread
+            | VmxBasicExitReason::Vmresume
+            | VmxBasicExitReason::Vmwrite
+            | VmxBasicExitReason::Vmxon
+            | VmxBasicExitReason::Vmxoff
+    )
+}
+
+fn decode_basic_exit_reason(raw_exit_reason: u32) -> Option<VmxBasicExitReason> {
+    VmxBasicExitReason::from_u32(raw_exit_reason & 0xffff)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn guest_vmx_probe_instructions_inject_ud() {
+        assert!(vmx_probe_instruction_should_inject_ud(
+            VmxBasicExitReason::Vmread
+        ));
+        assert!(vmx_probe_instruction_should_inject_ud(
+            VmxBasicExitReason::Vmwrite
+        ));
+        assert!(vmx_probe_instruction_should_inject_ud(
+            VmxBasicExitReason::Vmclear
+        ));
+        assert!(!vmx_probe_instruction_should_inject_ud(
+            VmxBasicExitReason::Cpuid
+        ));
+    }
+
+    #[test]
+    fn sgx_instruction_exits_inject_ud() {
+        assert!(vmx_probe_instruction_should_inject_ud(
+            VmxBasicExitReason::Encls
+        ));
+        assert!(vmx_probe_instruction_should_inject_ud(
+            VmxBasicExitReason::Enclv
+        ));
+    }
+
+    #[test]
+    fn raw_exit_reason_decoding_ignores_non_basic_flags() {
+        let raw = 0x8000_0000 | VmxBasicExitReason::Cpuid as u32;
+
+        assert_eq!(
+            decode_basic_exit_reason(raw),
+            Some(VmxBasicExitReason::Cpuid)
+        );
     }
 }

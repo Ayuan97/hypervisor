@@ -12,6 +12,19 @@ use {
     },
 };
 
+const IA32_VMX_MSR_START: u32 = 0x480;
+const IA32_VMX_MSR_END: u32 = 0x491;
+const IA32_FEATURE_CONTROL_MSR: u32 = 0x3a;
+const IA32_SGXLEPUBKEYHASH_MSR_START: u32 = 0x8c;
+const IA32_SGXLEPUBKEYHASH_MSR_END: u32 = 0x8f;
+const IA32_RTIT_OUTPUT_BASE_MSR: u32 = 0x560;
+const IA32_RTIT_OUTPUT_MASK_PTRS_MSR: u32 = 0x561;
+const IA32_RTIT_CTL_MSR: u32 = 0x570;
+const IA32_RTIT_STATUS_MSR: u32 = 0x571;
+const IA32_RTIT_CR3_MATCH_MSR: u32 = 0x572;
+const IA32_RTIT_ADDR_MSR_START: u32 = 0x580;
+const IA32_RTIT_ADDR_MSR_END: u32 = 0x58f;
+
 /// Represents the MSR Bitmap structure used in VMX.
 ///
 /// In processors that support the 1-setting of the “use MSR bitmaps” VM-execution control,
@@ -57,6 +70,7 @@ impl MsrBitmap {
         log::trace!("Initializing MSR Bitmap");
 
         Self::initialize_bitmap(instance.as_mut() as *mut _ as _);
+        instance.intercept_vmx_msrs();
 
         log::trace!("MSR Bitmap setup successfully!");
 
@@ -75,9 +89,112 @@ impl MsrBitmap {
             RtlInitializeBitMap(
                 bitmap_header_ptr as _,
                 bitmap_ptr as _,
-                core::mem::size_of::<Self>() as u32,
+                msr_bitmap_size_bits(),
             )
         }
         unsafe { RtlClearAllBits(bitmap_header_ptr as _) }
+    }
+
+    fn intercept_vmx_msrs(&mut self) {
+        set_msr_bitmap_bit(&mut self.read_low_msrs, IA32_FEATURE_CONTROL_MSR);
+        set_msr_bitmap_bit(&mut self.write_low_msrs, IA32_FEATURE_CONTROL_MSR);
+
+        for msr in IA32_SGXLEPUBKEYHASH_MSR_START..=IA32_SGXLEPUBKEYHASH_MSR_END {
+            set_msr_bitmap_bit(&mut self.read_low_msrs, msr);
+            set_msr_bitmap_bit(&mut self.write_low_msrs, msr);
+        }
+
+        for msr in IA32_VMX_MSR_START..=IA32_VMX_MSR_END {
+            set_msr_bitmap_bit(&mut self.read_low_msrs, msr);
+            set_msr_bitmap_bit(&mut self.write_low_msrs, msr);
+        }
+
+        for msr in [
+            IA32_RTIT_OUTPUT_BASE_MSR,
+            IA32_RTIT_OUTPUT_MASK_PTRS_MSR,
+            IA32_RTIT_CTL_MSR,
+            IA32_RTIT_STATUS_MSR,
+            IA32_RTIT_CR3_MATCH_MSR,
+        ] {
+            set_msr_bitmap_bit(&mut self.read_low_msrs, msr);
+            set_msr_bitmap_bit(&mut self.write_low_msrs, msr);
+        }
+
+        for msr in IA32_RTIT_ADDR_MSR_START..=IA32_RTIT_ADDR_MSR_END {
+            set_msr_bitmap_bit(&mut self.read_low_msrs, msr);
+            set_msr_bitmap_bit(&mut self.write_low_msrs, msr);
+        }
+    }
+}
+
+fn set_msr_bitmap_bit(bitmap: &mut [u8], msr: u32) {
+    let bit = msr as usize;
+    let byte_index = bit / 8;
+    if byte_index >= bitmap.len() {
+        return;
+    }
+    bitmap[byte_index] |= 1u8 << (bit & 7);
+}
+
+fn msr_bitmap_size_bits() -> u32 {
+    (core::mem::size_of::<MsrBitmap>() * 8) as u32
+}
+
+#[cfg(test)]
+fn msr_bitmap_bit_is_set(bitmap: &[u8], msr: u32) -> bool {
+    let bit = msr as usize;
+    let byte_index = bit / 8;
+    byte_index < bitmap.len() && (bitmap[byte_index] & (1u8 << (bit & 7))) != 0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn empty_bitmap() -> MsrBitmap {
+        MsrBitmap {
+            read_low_msrs: [0; 0x400],
+            read_high_msrs: [0; 0x400],
+            write_low_msrs: [0; 0x400],
+            write_high_msrs: [0; 0x400],
+        }
+    }
+
+    #[test]
+    fn vmx_msrs_are_intercepted_for_reads_and_writes() {
+        let mut bitmap = empty_bitmap();
+
+        bitmap.intercept_vmx_msrs();
+
+        assert!(msr_bitmap_bit_is_set(&bitmap.read_low_msrs, 0x480));
+        assert!(msr_bitmap_bit_is_set(&bitmap.write_low_msrs, 0x480));
+        assert!(msr_bitmap_bit_is_set(&bitmap.read_low_msrs, 0x491));
+        assert!(msr_bitmap_bit_is_set(&bitmap.write_low_msrs, 0x491));
+        assert!(msr_bitmap_bit_is_set(&bitmap.read_low_msrs, 0x3a));
+        assert!(msr_bitmap_bit_is_set(&bitmap.write_low_msrs, 0x3a));
+        assert!(msr_bitmap_bit_is_set(&bitmap.read_low_msrs, 0x8c));
+        assert!(msr_bitmap_bit_is_set(&bitmap.write_low_msrs, 0x8f));
+        assert!(!msr_bitmap_bit_is_set(&bitmap.read_low_msrs, 0x47f));
+        assert!(!msr_bitmap_bit_is_set(&bitmap.write_low_msrs, 0x492));
+    }
+
+    #[test]
+    fn intel_pt_msrs_are_intercepted_for_reads_and_writes() {
+        let mut bitmap = empty_bitmap();
+
+        bitmap.intercept_vmx_msrs();
+
+        for msr in [0x560, 0x561, 0x570, 0x571, 0x572, 0x580, 0x58f] {
+            assert!(msr_bitmap_bit_is_set(&bitmap.read_low_msrs, msr));
+            assert!(msr_bitmap_bit_is_set(&bitmap.write_low_msrs, msr));
+        }
+    }
+
+    #[test]
+    fn rtl_bitmap_size_covers_the_full_msr_bitmap_buffer() {
+        assert_eq!(
+            msr_bitmap_size_bits(),
+            (core::mem::size_of::<MsrBitmap>() * 8) as u32
+        );
     }
 }

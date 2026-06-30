@@ -1,4 +1,4 @@
-#![allow(dead_code)]
+﻿#![allow(dead_code)]
 
 use {
     core::arch::asm,
@@ -49,6 +49,11 @@ pub fn cr0_write(val: Cr0) {
 /// Reads the CR3 register.
 pub fn cr3() -> u64 {
     unsafe { x86::controlregs::cr3() }
+}
+
+/// Writes the CR3 register.
+pub unsafe fn cr3_write(value: u64) {
+    asm!("mov cr3, {}", in(reg) value, options(nostack, preserves_flags));
 }
 
 /// Reads the CR4 register.

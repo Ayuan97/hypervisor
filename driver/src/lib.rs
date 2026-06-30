@@ -20,6 +20,7 @@ use {
     hypervisor::{
         error::HypervisorError,
         intel::{
+            diag,
             ept::{
                 hooks::HookManager,
                 paging::{AccessType, Ept},
@@ -38,9 +39,49 @@ use {
 pub mod expanded_stack;
 
 static HYPERVISOR: AtomicPtr<Hypervisor> = AtomicPtr::new(null_mut());
+const STAGE_STOP_STATUS_BASE: u32 = 0xE0F0_0000;
+const BOOT_STOP_STAGE: u64 = parse_boot_stop_stage(option_env!("HV_BOOT_STOP_STAGE"));
 
 fn hypervisor_initializing() -> *mut Hypervisor {
     usize::MAX as *mut Hypervisor
+}
+
+fn failed_entry_may_clear_hypervisor(current: *mut Hypervisor) -> bool {
+    current == hypervisor_initializing()
+}
+
+const fn parse_boot_stop_stage(value: Option<&str>) -> u64 {
+    let Some(value) = value else {
+        return 0;
+    };
+
+    let bytes = value.as_bytes();
+    let mut i = 0;
+    let mut parsed = 0u64;
+    while i < bytes.len() {
+        let byte = bytes[i];
+        if byte < b'0' || byte > b'9' {
+            return 0;
+        }
+        parsed = parsed * 10 + (byte - b'0') as u64;
+        i += 1;
+    }
+    parsed
+}
+
+fn stage_stop_status(stage: u64) -> NTSTATUS {
+    (STAGE_STOP_STATUS_BASE | (stage as u32 & 0xffff)) as NTSTATUS
+}
+
+fn boot_stage(stage: u64) -> Option<NTSTATUS> {
+    diag::set_boot_stage(stage);
+    log::info!("hv stage {}", stage);
+    if BOOT_STOP_STAGE != 0 && stage >= BOOT_STOP_STAGE {
+        log::info!("hv stop stage {}", stage);
+        Some(stage_stop_status(stage))
+    } else {
+        None
+    }
 }
 
 #[repr(C)]
@@ -75,7 +116,13 @@ unsafe fn register_driver_unload(driver_object: PDRIVER_OBJECT) {
 unsafe extern "C" fn driver_unload(_driver_object: PDRIVER_OBJECT) {
     let hv = HYPERVISOR.swap(null_mut(), Ordering::AcqRel);
     if !hv.is_null() && hv != hypervisor_initializing() {
-        drop(Box::from_raw(hv));
+        let mut hv_box = Box::from_raw(hv);
+        if let Err(error) = hv_box.devirtualize_system() {
+            log::error!("Failed to devirtualize during unload: {}", error);
+            HYPERVISOR.store(Box::into_raw(hv_box), Ordering::Release);
+            return;
+        }
+        drop(hv_box);
     }
 }
 
@@ -146,6 +193,7 @@ fn hv_err_to_code(base: u32, e: HypervisorError) -> NTSTATUS {
         HypervisorError::FailedToCreateCString(_) => 0x31,
         HypervisorError::GetKernelBaseFailed => 0x32,
         HypervisorError::HexParseError => 0x33,
+        HypervisorError::BootStageStop => 0x34,
     };
     (base | (sub << 8)) as NTSTATUS
 }
@@ -159,15 +207,24 @@ pub unsafe extern "system" fn driver_entry(
         .base(0x2f8)
         .filter(LevelFilter::Info)
         .setup();
+    if let Some(status) = boot_stage(100) {
+        return status;
+    }
 
     if !driver_object.is_null() {
         register_driver_unload(driver_object);
+        if let Some(status) = boot_stage(110) {
+            return status;
+        }
     }
 
     with_expanded_stack(|| virtualize_system())
 }
 
 fn virtualize_system() -> NTSTATUS {
+    if let Some(status) = boot_stage(120) {
+        return status;
+    }
     if HYPERVISOR
         .compare_exchange(
             null_mut(),
@@ -177,31 +234,57 @@ fn virtualize_system() -> NTSTATUS {
         )
         .is_err()
     {
+        let _ = boot_stage(121);
         return STATUS_SUCCESS;
     }
 
+    if let Some(status) = boot_stage(130) {
+        HYPERVISOR.store(null_mut(), Ordering::Release);
+        return status;
+    }
     let status = virtualize_system_claimed();
     if status != STATUS_SUCCESS {
-        HYPERVISOR.store(null_mut(), Ordering::Release);
+        let _ = boot_stage(131);
+        if failed_entry_may_clear_hypervisor(HYPERVISOR.load(Ordering::Acquire)) {
+            let _ = HYPERVISOR.compare_exchange(
+                hypervisor_initializing(),
+                null_mut(),
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            );
+        }
     }
 
     status
 }
 
 fn virtualize_system_claimed() -> NTSTATUS {
+    if let Some(status) = boot_stage(200) {
+        return status;
+    }
     let primary_ept: Box<Ept, PhysicalAllocator> = match Box::try_new_zeroed_in(PhysicalAllocator) {
         Ok(b) => unsafe { b.assume_init() },
-        Err(_) => return 0xE0020000u32 as NTSTATUS,
+        Err(_) => {
+            let _ = boot_stage(201);
+            return 0xE0020000u32 as NTSTATUS;
+        }
     };
 
     let mut primary_ept = primary_ept;
+    if let Some(status) = boot_stage(210) {
+        return status;
+    }
     if primary_ept
         .identity_2mb(AccessType::READ_WRITE_EXECUTE)
         .is_err()
     {
+        let _ = boot_stage(211);
         return 0xE0030000u32 as NTSTATUS;
     }
 
+    if let Some(status) = boot_stage(220) {
+        return status;
+    }
     let hook_manager = HookManager::new(vec![]);
     let mut hv = match Hypervisor::builder()
         .primary_ept(primary_ept)
@@ -209,17 +292,68 @@ fn virtualize_system_claimed() -> NTSTATUS {
         .build()
     {
         Ok(h) => h,
-        Err(e) => return hv_err_to_code(0xE0040000, e),
+        Err(e) => {
+            let _ = boot_stage(221);
+            return hv_err_to_code(0xE0040000, e);
+        }
     };
 
+    if let Some(status) = boot_stage(230) {
+        return status;
+    }
     update_ntoskrnl_cr3();
 
+    if let Some(status) = boot_stage(240) {
+        return status;
+    }
     match hv.virtualize_core() {
-        Ok(_) => {}
-        Err(e) => return hv_err_to_code(0xE0050000, e),
+        Ok(_) => {
+            let _ = boot_stage(250);
+        }
+        Err(e) => {
+            let _ = boot_stage(241);
+            let status = hv_err_to_code(0xE0050000, e);
+            if let Err(error) = hv.devirtualize_system() {
+                log::error!(
+                    "Failed to cleanup after partial virtualization failure: {}",
+                    error
+                );
+                let hv = Box::new(hv);
+                HYPERVISOR.store(Box::into_raw(hv), Ordering::Release);
+            }
+            return status;
+        }
     }
 
     let hv = Box::new(hv);
     HYPERVISOR.store(Box::into_raw(hv), Ordering::Release);
+    let _ = boot_stage(260);
     STATUS_SUCCESS
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn failed_entry_only_clears_initializing_sentinel() {
+        assert!(failed_entry_may_clear_hypervisor(hypervisor_initializing()));
+        assert!(!failed_entry_may_clear_hypervisor(null_mut()));
+        assert!(!failed_entry_may_clear_hypervisor(
+            0x1000usize as *mut Hypervisor
+        ));
+    }
+
+    #[test]
+    fn boot_stop_stage_parser_accepts_decimal_only() {
+        assert_eq!(parse_boot_stop_stage(None), 0);
+        assert_eq!(parse_boot_stop_stage(Some("")), 0);
+        assert_eq!(parse_boot_stop_stage(Some("230")), 230);
+        assert_eq!(parse_boot_stop_stage(Some("23x")), 0);
+    }
+
+    #[test]
+    fn stage_stop_status_keeps_low_stage_bits() {
+        assert_eq!(stage_stop_status(240) as u32, STAGE_STOP_STATUS_BASE | 240);
+    }
 }

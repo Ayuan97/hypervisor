@@ -6,6 +6,8 @@ members = ["driver", "hypervisor"]
 lto = "thin"
 panic = "abort"
 debug-assertions = false
+debug = 0
+strip = "symbols"
 
 [profile.dev]
 lto = false

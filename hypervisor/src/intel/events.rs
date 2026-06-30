@@ -78,7 +78,7 @@ impl EventInjection {
         let mut event = EventInjection(0);
 
         event.set_vector(ExceptionInterrupt::Breakpoint as u32);
-        event.set_type(InterruptionType::HardwareException as u32);
+        event.set_type(InterruptionType::SoftwareException as u32);
         event.set_valid(VALID);
 
         event.0
@@ -185,5 +185,27 @@ impl EventInjection {
             vmcs::control::VMENTRY_INTERRUPTION_INFO_FIELD,
             interruption_info,
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn breakpoint_injection_uses_software_exception_type() {
+        let event = EventInjection::breakpoint();
+
+        assert_eq!(
+            event & 0xff,
+            ExceptionInterrupt::Breakpoint as u32,
+            "#BP vector must remain 3"
+        );
+        assert_eq!(
+            (event >> 8) & 0x7,
+            InterruptionType::SoftwareException as u32,
+            "#BP from INT3 should be injected as a software exception"
+        );
+        assert_ne!(event & (1 << 31), 0, "event must be valid");
     }
 }

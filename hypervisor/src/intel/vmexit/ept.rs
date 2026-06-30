@@ -3,7 +3,9 @@ use {
         intel::{
             events::EventInjection,
             support::{vmread_checked, vmwrite_checked},
-            vmerror::EptViolationExitQualification, vmexit::ExitType, vmx::Vmx,
+            vmerror::EptViolationExitQualification,
+            vmexit::ExitType,
+            vmx::Vmx,
         },
         utils::capture::GuestRegisters,
     },
@@ -140,7 +142,10 @@ pub fn handle_mtf(vmx: &mut Vmx) -> ExitType {
     let proc_ctl = match vmread_checked(vmcs::control::PRIMARY_PROCBASED_EXEC_CONTROLS) {
         Ok(value) => value,
         Err(error) => {
-            log::error!("Failed to read primary processor controls on MTF: {:?}", error);
+            log::error!(
+                "Failed to read primary processor controls on MTF: {:?}",
+                error
+            );
             EventInjection::vmentry_inject_gp(0);
             return ExitType::Continue;
         }
@@ -161,7 +166,10 @@ pub fn handle_ept_misconfiguration() -> ExitType {
     let guest_physical_address = match vmread_checked(vmcs::ro::GUEST_PHYSICAL_ADDR_FULL) {
         Ok(value) => value,
         Err(error) => {
-            log::error!("Failed to read EPT misconfiguration guest physical address: {:?}", error);
+            log::error!(
+                "Failed to read EPT misconfiguration guest physical address: {:?}",
+                error
+            );
             0
         }
     };

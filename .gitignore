@@ -5,5 +5,6 @@
 *.pdb
 *.sys
 tools/monitor_log.txt
+logs/
 .claude/
 .mcp.json

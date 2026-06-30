@@ -10,6 +10,12 @@ use {
     x86::msr::{IA32_MTRRCAP, IA32_MTRR_DEF_TYPE, IA32_MTRR_PHYSBASE0, IA32_MTRR_PHYSMASK0},
 };
 
+#[cfg(not(test))]
+use {
+    core::ptr::null_mut,
+    wdk_sys::ntddk::{ExFreePool, MmGetPhysicalMemoryRanges},
+};
+
 /// Represents the different types of memory as defined by MTRRs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MemoryType {
@@ -29,6 +35,8 @@ pub enum MemoryType {
 pub struct Mtrr {
     descriptors: Vec<MtrrRangeDescriptor>,
     default_type: MemoryType,
+    ram_ranges: Vec<PhysicalMemoryRange>,
+    ram_ranges_known: bool,
 }
 
 impl Mtrr {
@@ -65,9 +73,14 @@ impl Mtrr {
         }
 
         log::trace!("Total MTRR Ranges Committed: {}", descriptors.len());
+        let ram_ranges = Self::physical_memory_ranges();
+        log::trace!("Physical RAM ranges committed: {}", ram_ranges.len());
+
         Self {
             descriptors,
             default_type,
+            ram_ranges_known: !ram_ranges.is_empty(),
+            ram_ranges,
         }
     }
 
@@ -76,6 +89,24 @@ impl Mtrr {
         Self {
             descriptors: descriptors.to_vec(),
             default_type,
+            ram_ranges: Vec::new(),
+            ram_ranges_known: false,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test_with_ram_ranges(
+        default_type: MemoryType,
+        descriptors: &[MtrrRangeDescriptor],
+        ram_ranges: &[PhysicalMemoryRange],
+    ) -> Self {
+        let mut ram_ranges = ram_ranges.to_vec();
+        ram_ranges.sort_by_key(|range| range.base_address);
+        Self {
+            descriptors: descriptors.to_vec(),
+            default_type,
+            ram_ranges,
+            ram_ranges_known: true,
         }
     }
 
@@ -91,8 +122,12 @@ impl Mtrr {
     /// * `range` - The physical address range for which to find the memory type.
     ///
     /// # Returns
-    /// The memory type for the given address range, or a default of WriteBack if no matching range is found.
+    /// The memory type for the given address range, or the default MTRR type if no MTRR range matches.
     pub fn find(&self, range: core::ops::Range<u64>) -> Option<MemoryType> {
+        if !self.range_is_backed_by_ram(range.clone()) {
+            return Some(MemoryType::Uncacheable);
+        }
+
         let mut memory_type: Option<MemoryType> = None;
         let range_last = range.end.saturating_sub(1);
 
@@ -109,6 +144,69 @@ impl Mtrr {
         }
 
         memory_type.or(Some(self.default_type))
+    }
+
+    fn range_is_backed_by_ram(&self, range: core::ops::Range<u64>) -> bool {
+        if !self.ram_ranges_known {
+            return true;
+        }
+        if range.start >= range.end {
+            return false;
+        }
+
+        let mut cursor = range.start;
+        for ram_range in self.ram_ranges.iter() {
+            if cursor < ram_range.base_address {
+                return false;
+            }
+            if cursor >= ram_range.base_address && cursor < ram_range.end_address {
+                cursor = cursor.max(ram_range.end_address);
+                if cursor >= range.end {
+                    return true;
+                }
+            }
+        }
+
+        false
+    }
+
+    #[cfg(not(test))]
+    fn physical_memory_ranges() -> Vec<PhysicalMemoryRange> {
+        let ranges = unsafe { MmGetPhysicalMemoryRanges() };
+        if ranges == null_mut() {
+            return Vec::new();
+        }
+
+        let mut result = Vec::new();
+        let mut index = 0usize;
+        loop {
+            let item = unsafe { *ranges.add(index) };
+            let base = unsafe { item.BaseAddress.QuadPart };
+            let bytes = unsafe { item.NumberOfBytes.QuadPart };
+            if base == 0 && bytes == 0 {
+                break;
+            }
+            if base >= 0 && bytes > 0 {
+                let base = base as u64;
+                let end = base.saturating_add(bytes as u64);
+                result.push(PhysicalMemoryRange {
+                    base_address: base,
+                    end_address: end,
+                });
+            }
+            index += 1;
+        }
+
+        result.sort_by_key(|range| range.base_address);
+        unsafe {
+            ExFreePool(ranges as _);
+        }
+        result
+    }
+
+    #[cfg(test)]
+    fn physical_memory_ranges() -> Vec<PhysicalMemoryRange> {
+        Vec::new()
     }
 
     /// Calculates the end address of an MTRR memory range.
@@ -230,6 +328,12 @@ pub struct MtrrRangeDescriptor {
     pub memory_type: MemoryType,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct PhysicalMemoryRange {
+    pub base_address: u64,
+    pub end_address: u64,
+}
+
 /// Represents the configuration of a single MTRR.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MtrrItem {
@@ -283,5 +387,39 @@ mod tests {
         );
 
         assert_eq!(mtrr.find(0x000000..0x200000), Some(MemoryType::Uncacheable));
+    }
+
+    #[test]
+    fn find_uses_uncacheable_for_non_ram_range_when_ram_map_is_known() {
+        let mtrr = Mtrr::for_test_with_ram_ranges(
+            MemoryType::WriteBack,
+            &[],
+            &[PhysicalMemoryRange {
+                base_address: 0x1000_0000,
+                end_address: 0x1020_0000,
+            }],
+        );
+
+        assert_eq!(
+            mtrr.find(0x9000_0000..0x9020_0000),
+            Some(MemoryType::Uncacheable)
+        );
+    }
+
+    #[test]
+    fn find_uses_default_type_for_ram_range_when_no_mtrr_matches() {
+        let mtrr = Mtrr::for_test_with_ram_ranges(
+            MemoryType::WriteBack,
+            &[],
+            &[PhysicalMemoryRange {
+                base_address: 0x1000_0000,
+                end_address: 0x1020_0000,
+            }],
+        );
+
+        assert_eq!(
+            mtrr.find(0x1000_0000..0x1020_0000),
+            Some(MemoryType::WriteBack)
+        );
     }
 }

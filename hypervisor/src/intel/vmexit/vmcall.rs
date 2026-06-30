@@ -7,14 +7,14 @@ use {
         utils::capture::GuestRegisters,
     },
     wdk_sys::{
-        ntddk::MmCopyMemory, _MM_COPY_ADDRESS__bindgen_ty_1, MM_COPY_ADDRESS,
+        _MM_COPY_ADDRESS__bindgen_ty_1, ntddk::MmCopyMemory, MM_COPY_ADDRESS,
         MM_COPY_MEMORY_PHYSICAL, NT_SUCCESS, PHYSICAL_ADDRESS,
     },
     x86::vmx::vmcs::guest,
 };
 
 pub const VMCALL_MAGIC: u64 = 0xA3B7_E291_4F6D_8C15;
-pub const CPUID_COMM_LEAF: u32 = 0x7A3F_E1D9;
+pub const CPUID_COMM_LEAF: u32 = 0x4000_0000;
 const STATUS_ACCESS_DENIED: u64 = u64::MAX - 1;
 const STATUS_UNSUPPORTED_COMMAND: u64 = u64::MAX - 2;
 
@@ -25,18 +25,35 @@ const CMD_TRANSLATE_VA: u64 = 0x12;
 const CMD_GET_GUEST_CR3: u64 = 0x13;
 const CMD_GET_COUNTER: u64 = 0x14;
 const CMD_GET_CTL: u64 = 0x15;
+const CMD_SEAL_DIAGNOSTICS: u64 = 0x16;
 const CMD_CLOAK_PAGE: u64 = 0x20;
-const CMD_DEVIRTUALIZE: u64 = 0xFF;
+pub const CMD_DEVIRTUALIZE: u64 = 0xFF;
 
 fn cs_selector_is_ring0(selector: u64) -> bool {
     selector & 0x3 == 0
 }
 
-fn command_requires_ring0(cmd: u64) -> bool {
+fn command_requires_ring0(cmd: u64, arg1: u64) -> bool {
     matches!(
         cmd,
-        CMD_READ_PHYS | CMD_WRITE_PHYS | CMD_TRANSLATE_VA | CMD_CLOAK_PAGE | CMD_DEVIRTUALIZE
-    )
+        CMD_READ_PHYS
+            | CMD_WRITE_PHYS
+            | CMD_TRANSLATE_VA
+            | CMD_GET_GUEST_CR3
+            | CMD_CLOAK_PAGE
+            | CMD_DEVIRTUALIZE
+    ) || (cmd == CMD_GET_CTL && matches!(arg1, 5 | 7))
+}
+
+fn diagnostic_command_allowed(cmd: u64, _arg1: u64, sealed: bool) -> bool {
+    !sealed || matches!(cmd, CMD_SEAL_DIAGNOSTICS | CMD_DEVIRTUALIZE)
+}
+
+fn command_exit_type(cmd: u64) -> ExitType {
+    match cmd {
+        CMD_DEVIRTUALIZE => ExitType::ExitHypervisor,
+        _ => ExitType::IncrementRIP,
+    }
 }
 
 fn physical_access_size_is_valid(size: usize) -> bool {
@@ -86,7 +103,12 @@ pub fn dispatch_command(guest_registers: &mut GuestRegisters, vmx: &mut Vmx) -> 
     let arg1 = guest_registers.rdx;
     let arg2 = guest_registers.r8;
 
-    if command_requires_ring0(cmd) {
+    if !diagnostic_command_allowed(cmd, arg1, crate::intel::diag::diagnostics_sealed()) {
+        guest_registers.rax = STATUS_ACCESS_DENIED;
+        return ExitType::IncrementRIP;
+    }
+
+    if command_requires_ring0(cmd, arg1) {
         let guest_cs = match vmread_checked(guest::CS_SELECTOR) {
             Ok(value) => value,
             Err(error) => {
@@ -115,7 +137,9 @@ pub fn dispatch_command(guest_registers: &mut GuestRegisters, vmx: &mut Vmx) -> 
         }
         CMD_WRITE_PHYS => {
             if physical_writes_are_enabled() {
-                log::error!("Physical write VMCALL is enabled without a safe writer implementation");
+                log::error!(
+                    "Physical write VMCALL is enabled without a safe writer implementation"
+                );
             }
             guest_registers.rax = STATUS_UNSUPPORTED_COMMAND;
             ExitType::IncrementRIP
@@ -142,6 +166,11 @@ pub fn dispatch_command(guest_registers: &mut GuestRegisters, vmx: &mut Vmx) -> 
         }
         CMD_GET_CTL => {
             guest_registers.rax = crate::intel::diag::control(arg1);
+            ExitType::IncrementRIP
+        }
+        CMD_SEAL_DIAGNOSTICS => {
+            crate::intel::diag::seal_diagnostics();
+            guest_registers.rax = 0;
             ExitType::IncrementRIP
         }
         CMD_CLOAK_PAGE => {
@@ -172,8 +201,8 @@ pub fn dispatch_command(guest_registers: &mut GuestRegisters, vmx: &mut Vmx) -> 
             ExitType::IncrementRIP
         }
         CMD_DEVIRTUALIZE => {
-            guest_registers.rax = u64::MAX;
-            ExitType::IncrementRIP
+            guest_registers.rax = 0;
+            command_exit_type(cmd)
         }
         _ => {
             guest_registers.rax = u64::MAX;
@@ -223,10 +252,31 @@ fn translate_va_to_pa(cr3: u64, va: u64) -> Option<u64> {
 }
 
 pub fn handle_vmcall(guest_registers: &mut GuestRegisters, vmx: &mut Vmx) -> Option<ExitType> {
-    if guest_registers.rax != VMCALL_MAGIC {
+    let guest_cpl = match vmread_checked(guest::CS_SELECTOR) {
+        Ok(selector) => selector & 0x3,
+        Err(error) => {
+            log::error!(
+                "Failed to read guest CS selector for VMCALL auth: {:?}",
+                error
+            );
+            return None;
+        }
+    };
+
+    if !vmcall_authorized_for_cpl(guest_registers, guest_cpl) {
         return None;
     }
     Some(dispatch_command(guest_registers, vmx))
+}
+
+fn vmcall_authorized(guest_registers: &GuestRegisters) -> bool {
+    guest_registers.rax == VMCALL_MAGIC
+        && guest_registers.r10 == VMCALL_MAGIC
+        && guest_registers.r11 == VMCALL_MAGIC
+}
+
+fn vmcall_authorized_for_cpl(guest_registers: &GuestRegisters, guest_cpl: u64) -> bool {
+    guest_cpl == 0 && vmcall_authorized(guest_registers)
 }
 
 #[cfg(test)]
@@ -254,13 +304,62 @@ mod tests {
 
     #[test]
     fn dangerous_commands_require_ring0() {
-        assert!(!command_requires_ring0(CMD_PING));
-        assert!(!command_requires_ring0(CMD_GET_COUNTER));
-        assert!(!command_requires_ring0(CMD_GET_CTL));
-        assert!(command_requires_ring0(CMD_READ_PHYS));
-        assert!(command_requires_ring0(CMD_WRITE_PHYS));
-        assert!(command_requires_ring0(CMD_TRANSLATE_VA));
-        assert!(command_requires_ring0(CMD_CLOAK_PAGE));
-        assert!(command_requires_ring0(CMD_DEVIRTUALIZE));
+        assert!(!command_requires_ring0(CMD_PING, 0));
+        assert!(!command_requires_ring0(CMD_GET_COUNTER, 0));
+        assert!(!command_requires_ring0(CMD_GET_CTL, 0));
+        assert!(command_requires_ring0(CMD_GET_GUEST_CR3, 0));
+        assert!(command_requires_ring0(CMD_GET_CTL, 5));
+        assert!(command_requires_ring0(CMD_GET_CTL, 7));
+        assert!(command_requires_ring0(CMD_READ_PHYS, 0));
+        assert!(command_requires_ring0(CMD_WRITE_PHYS, 0));
+        assert!(command_requires_ring0(CMD_TRANSLATE_VA, 0));
+        assert!(command_requires_ring0(CMD_CLOAK_PAGE, 0));
+        assert!(command_requires_ring0(CMD_DEVIRTUALIZE, 0));
+    }
+
+    #[test]
+    fn vmcall_requires_auth_token() {
+        let mut regs = GuestRegisters::default();
+        regs.rax = VMCALL_MAGIC;
+        assert!(!vmcall_authorized(&regs));
+
+        regs.r10 = VMCALL_MAGIC;
+        assert!(!vmcall_authorized(&regs));
+
+        regs.r11 = VMCALL_MAGIC;
+        assert!(vmcall_authorized(&regs));
+    }
+
+    #[test]
+    fn vmcall_requires_ring0_even_with_auth_token() {
+        let mut regs = GuestRegisters::default();
+        regs.rax = VMCALL_MAGIC;
+        regs.r10 = VMCALL_MAGIC;
+        regs.r11 = VMCALL_MAGIC;
+
+        assert!(!vmcall_authorized_for_cpl(&regs, 3));
+        assert!(vmcall_authorized_for_cpl(&regs, 0));
+    }
+
+    #[test]
+    fn sealed_diagnostics_deny_user_visible_ping_magic() {
+        assert!(!diagnostic_command_allowed(CMD_PING, 0, true));
+        assert!(diagnostic_command_allowed(CMD_SEAL_DIAGNOSTICS, 0, true));
+        assert!(diagnostic_command_allowed(CMD_DEVIRTUALIZE, 0, true));
+        assert!(!diagnostic_command_allowed(CMD_GET_COUNTER, 0, true));
+        assert!(!diagnostic_command_allowed(CMD_GET_CTL, 1, true));
+        assert!(!diagnostic_command_allowed(CMD_GET_CTL, 8, true));
+
+        assert!(diagnostic_command_allowed(CMD_GET_COUNTER, 0, false));
+        assert!(diagnostic_command_allowed(CMD_GET_CTL, 1, false));
+    }
+
+    #[test]
+    fn devirtualize_command_exits_hypervisor() {
+        assert_eq!(
+            command_exit_type(CMD_DEVIRTUALIZE),
+            ExitType::ExitHypervisor
+        );
+        assert_eq!(command_exit_type(CMD_PING), ExitType::IncrementRIP);
     }
 }

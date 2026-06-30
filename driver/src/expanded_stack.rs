@@ -4,7 +4,9 @@
 //! kernel stack and execute closures with extended stack space.
 
 use alloc::boxed::Box;
-use wdk_sys::{ntddk::KeExpandKernelStackAndCallout, NTSTATUS, PVOID, STATUS_SUCCESS};
+use wdk_sys::{
+    ntddk::KeExpandKernelStackAndCallout, NTSTATUS, PVOID, STATUS_INVALID_PARAMETER, STATUS_SUCCESS,
+};
 
 /// Represents a context for closure execution with expanded stack space.
 struct ClosureContext {
@@ -71,7 +73,15 @@ where
 ///
 /// * `context` - A raw pointer to `ClosureContext`.
 unsafe extern "C" fn call_closure(context: PVOID) {
+    if context.is_null() {
+        return;
+    }
+
     let context = &mut *(context as *mut ClosureContext);
-    let closure = context.closure.take().unwrap(); // Take the closure out of the context
-    context.status = closure(); // Execute the closure and store the returned status
+    let Some(closure) = context.closure.take() else {
+        context.status = STATUS_INVALID_PARAMETER;
+        return;
+    };
+
+    context.status = closure();
 }

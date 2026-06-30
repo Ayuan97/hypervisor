@@ -9,8 +9,11 @@ use {
     crate::{
         error::HypervisorError,
         intel::{
-            invept::invept_all_contexts, invvpid::invvpid_all_contexts, shared_data::SharedData,
-            support,
+            diag,
+            invept::try_invept_all_contexts,
+            invvpid::try_invvpid_all_contexts,
+            shared_data::SharedData,
+            vmexit::vmcall::{CMD_DEVIRTUALIZE, VMCALL_MAGIC},
         },
         utils::{
             capture::CONTEXT,
@@ -18,8 +21,7 @@ use {
         },
     },
     alloc::boxed::Box,
-    core::cell::OnceCell,
-    core::mem::MaybeUninit,
+    core::{arch::asm, cell::OnceCell, mem::MaybeUninit},
     wdk_sys::ntddk::RtlCaptureContext,
 };
 
@@ -61,6 +63,7 @@ impl Vcpu {
     /// A `Result` indicating the success or failure of the virtualization process.
     pub fn virtualize_cpu(&mut self, shared_data: &mut SharedData) -> Result<(), HypervisorError> {
         log::info!("Virtualizing processor {}", self.index);
+        diag::boot_stage(400 + self.index as u64)?;
 
         // Capture the current processor's context. The Guest will resume from this point since we capture and write this context to the guest state for each vcpu.
         log::trace!("Capturing context");
@@ -74,24 +77,51 @@ impl Vcpu {
         if !is_virtualized() {
             // If we are here as Guest (non-root) then that will lead to undefined behavior (UB).
             log::trace!("Preparing for virtualization");
+            diag::boot_stage(410 + self.index as u64)?;
 
+            diag::boot_stage(420 + self.index as u64)?;
             self.vmx
                 .get_or_try_init(|| Vmx::new(shared_data, &context))?;
 
             let vmx = match self.vmx.get_mut() {
                 Some(vmx) => vmx,
-                None => return Err(HypervisorError::VmxNotInitialized),
+                None => {
+                    let _ = diag::boot_stage(421 + self.index as u64);
+                    return Err(HypervisorError::VmxNotInitialized);
+                }
             };
 
+            if let Err(error) = diag::boot_stage(430 + self.index as u64) {
+                vmx.teardown_vmx_operation("boot-stage stop");
+                return Err(error);
+            }
             set_virtualized();
             log::info!("Virtualization complete for processor {}", self.index);
 
-            vmx.run(self.index);
+            let run_result = vmx.run(self.index);
 
-            // We should never reach this point as the VM should have been launched.
             clear_virtualized();
-            return Err(HypervisorError::VMLAUNCHFailed);
+            let _ = diag::boot_stage(440 + self.index as u64);
+            return run_result;
         }
+
+        let guest_return_stage = 750 + self.index as u64;
+        if diag::stop_requested_at(guest_return_stage) {
+            diag::set_boot_stage(guest_return_stage);
+            let status = request_devirtualize_current_cpu();
+            clear_virtualized();
+            return if devirtualize_status_is_success(status) {
+                Err(HypervisorError::BootStageStop)
+            } else {
+                log::error!(
+                    "Boot-stage guest return devirtualize failed with status {:#x}",
+                    status
+                );
+                Err(HypervisorError::VMXOFFFailed)
+            };
+        }
+
+        diag::boot_stage(guest_return_stage)?;
 
         Ok(())
     }
@@ -117,9 +147,11 @@ impl Vcpu {
             return Ok(());
         }
 
-        // Attempt to devirtualize the processor using the VMXOFF instruction.
-        support::vmxoff()?;
-        clear_virtualized();
+        let status = request_devirtualize_current_cpu();
+        if !devirtualize_status_is_success(status) {
+            log::error!("Devirtualize VMCALL failed with status {:#x}", status);
+            return Err(HypervisorError::VMXOFFFailed);
+        }
         log::trace!("Processor {} has been devirtualized", self.index);
 
         Ok(())
@@ -139,7 +171,7 @@ impl Vcpu {
     /// This function handles the invalidation of TLB and paging-structure caches using the INVVPID and INVEPT
     /// instructions. It ensures that any cached translations are consistent with the current state of the virtual
     /// processor and EPT configurations.
-    pub fn invalidate_contexts() {
+    pub fn invalidate_contexts() -> Result<(), HypervisorError> {
         log::debug!("Invalidating processor contexts");
 
         // Invalidate all contexts (broad operation, typically used in specific scenarios)
@@ -150,7 +182,7 @@ impl Vcpu {
         // operation.
         //
         // Reference: 29.4.3.4 Guidelines for Use of the INVEPT Instruction
-        invept_all_contexts();
+        try_invept_all_contexts()?;
 
         // Invalidate all contexts
         //
@@ -159,8 +191,41 @@ impl Vcpu {
         // undesired retention of information cached from paging structures between separate uses of VMX operation.
         //
         // Reference: 29.4.3.3 Guidelines for Use of the INVVPID Instruction
-        invvpid_all_contexts();
+        try_invvpid_all_contexts()?;
 
         log::debug!("Processor contexts invalidation successfully!");
+        Ok(())
+    }
+}
+
+fn devirtualize_status_is_success(status: u64) -> bool {
+    status == 0
+}
+
+fn request_devirtualize_current_cpu() -> u64 {
+    let status: u64;
+    unsafe {
+        asm!(
+            "vmcall",
+            inlateout("rax") VMCALL_MAGIC => status,
+            inlateout("rcx") CMD_DEVIRTUALIZE => _,
+            inlateout("rdx") 0u64 => _,
+            inlateout("r8") 0u64 => _,
+            inlateout("r9") 0u64 => _,
+            inlateout("r10") VMCALL_MAGIC => _,
+            inlateout("r11") VMCALL_MAGIC => _,
+        );
+    }
+    status
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn devirtualize_vmcall_status_zero_is_success() {
+        assert!(devirtualize_status_is_success(0));
+        assert!(!devirtualize_status_is_success(u64::MAX));
     }
 }
