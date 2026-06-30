@@ -5,7 +5,7 @@
 
 use {
     crate::intel::{
-        support::vmwrite,
+        support::vmwrite_checked,
         vmerror::{ExceptionInterrupt, InterruptionType},
     },
     bitfield::bitfield,
@@ -47,6 +47,16 @@ bitfield! {
 const VALID: u32 = 1;
 const INVALID: u32 = 0;
 
+fn write_vm_entry_field<T>(field: u32, value: T)
+where
+    T: Into<u64>,
+    u64: From<T>,
+{
+    if let Err(error) = vmwrite_checked(field, value) {
+        log::error!("Failed to write VM-entry field {:#x}: {:?}", field, error);
+    }
+}
+
 /// Provides methods for event injection in VMX.
 ///
 /// Reference: Intel® 64 and IA-32 Architectures Software Developer's Manual: 27.6 EVENT INJECTION
@@ -80,6 +90,7 @@ impl EventInjection {
 
         event.set_vector(ExceptionInterrupt::PageFault as u32);
         event.set_type(InterruptionType::HardwareException as u32);
+        event.set_deliver_error_code(1);
         event.set_valid(VALID);
 
         event.0
@@ -108,8 +119,8 @@ impl EventInjection {
     /// Reference: Intel® 64 and IA-32 Architectures Software Developer's Manual: 25.8.3 VM-Entry Controls for Event Injection
     /// and Table 25-17. Format of the VM-Entry Interruption-Information Field.
     pub fn vmentry_inject_gp(error_code: u32) {
-        vmwrite(vmcs::control::VMENTRY_EXCEPTION_ERR_CODE, error_code);
-        vmwrite(
+        write_vm_entry_field(vmcs::control::VMENTRY_EXCEPTION_ERR_CODE, error_code);
+        write_vm_entry_field(
             vmcs::control::VMENTRY_INTERRUPTION_INFO_FIELD,
             EventInjection::general_protection(),
         );
@@ -127,8 +138,8 @@ impl EventInjection {
     /// Reference: Intel® 64 and IA-32 Architectures Software Developer's Manual: 25.8.3 VM-Entry Controls for Event Injection
     /// and Table 25-17. Format of the VM-Entry Interruption-Information Field.
     pub fn vmentry_inject_pf(error_code: u32) {
-        vmwrite(vmcs::control::VMENTRY_EXCEPTION_ERR_CODE, error_code);
-        vmwrite(
+        write_vm_entry_field(vmcs::control::VMENTRY_EXCEPTION_ERR_CODE, error_code);
+        write_vm_entry_field(
             vmcs::control::VMENTRY_INTERRUPTION_INFO_FIELD,
             EventInjection::page_fault(),
         );
@@ -142,23 +153,37 @@ impl EventInjection {
     /// Reference: Intel® 64 and IA-32 Architectures Software Developer's Manual: 25.8.3 VM-Entry Controls for Event Injection
     /// and Table 25-17. Format of the VM-Entry Interruption-Information Field.
     pub fn vmentry_inject_bp() {
-        vmwrite(
+        write_vm_entry_field(
             vmcs::control::VMENTRY_INTERRUPTION_INFO_FIELD,
             EventInjection::breakpoint(),
         );
     }
 
     /// Injects an undefined opcode exception into the guest.
-    ///
-    /// This function is used to signal to the guest that an invalid or undefined opcode
-    /// has been encountered, typically indicating an error in the guest's execution.
-    ///
-    /// Reference: Intel® 64 and IA-32 Architectures Software Developer's Manual: 25.8.3 VM-Entry Controls for Event Injection
-    /// and Table 25-17. Format of the VM-Entry Interruption-Information Field.
     pub fn vmentry_inject_ud() {
-        vmwrite(
+        write_vm_entry_field(
             vmcs::control::VMENTRY_INTERRUPTION_INFO_FIELD,
             EventInjection::undefined_opcode(),
+        );
+    }
+
+    /// Injects an NMI into the guest.
+    pub fn vmentry_inject_nmi() {
+        let mut event = EventInjection(0);
+        event.set_vector(ExceptionInterrupt::NonMaskableInterrupt as u32);
+        event.set_type(InterruptionType::NonMaskableInterrupt as u32);
+        event.set_valid(VALID);
+        write_vm_entry_field(vmcs::control::VMENTRY_INTERRUPTION_INFO_FIELD, event.0);
+    }
+
+    /// Re-injects an event using the raw VM-exit interruption info and error code.
+    pub fn vmentry_reinject(interruption_info: u32, error_code: u32) {
+        if (interruption_info & (1 << 11)) != 0 {
+            write_vm_entry_field(vmcs::control::VMENTRY_EXCEPTION_ERR_CODE, error_code);
+        }
+        write_vm_entry_field(
+            vmcs::control::VMENTRY_INTERRUPTION_INFO_FIELD,
+            interruption_info,
         );
     }
 }

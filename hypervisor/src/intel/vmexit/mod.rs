@@ -4,14 +4,18 @@
 //! The handlers interpret and respond to different VM exit reasons, ensuring the safe and correct execution of the virtual machine.
 
 use {
-    super::{support::vmwrite, vmerror::VmxBasicExitReason},
+    super::{
+        diag,
+        support::{vmread_checked, vmwrite_checked},
+        vmerror::VmxBasicExitReason,
+    },
     crate::{
         error::HypervisorError,
         intel::{
-            support::vmread,
             vmexit::{
                 cpuid::handle_cpuid,
-                ept::{handle_ept_misconfiguration, handle_ept_violation},
+                cr::handle_cr_access,
+                ept::{handle_ept_misconfiguration, handle_ept_violation, handle_mtf},
                 exception::{handle_exception, handle_undefined_opcode_exception},
                 invd::handle_invd,
                 invept::handle_invept,
@@ -29,6 +33,7 @@ use {
 };
 
 pub mod cpuid;
+pub mod cr;
 pub mod ept;
 pub mod exception;
 pub mod invd;
@@ -47,10 +52,6 @@ pub enum ExitType {
     Continue,
 }
 
-/// Represents a VM exit, which can be caused by various reasons.
-///
-/// A VM exit transfers control from the guest to the host (hypervisor).
-/// The `VmExit` structure provides methods to handle various VM exit reasons and ensures the correct and safe continuation of the guest's execution.
 pub struct VmExit;
 
 impl VmExit {
@@ -81,11 +82,11 @@ impl VmExit {
         log::debug!("Handling VMEXIT...");
 
         // Upon VM-exit, transfer the guest register values from VMCS to `self.registers` to ensure it reflects the latest and complete state.
-        guest_registers.rip = vmread(guest::RIP);
-        guest_registers.rsp = vmread(guest::RSP);
-        guest_registers.rflags = vmread(guest::RFLAGS);
+        guest_registers.rip = vmread_checked(guest::RIP)?;
+        guest_registers.rsp = vmread_checked(guest::RSP)?;
+        guest_registers.rflags = vmread_checked(guest::RFLAGS)?;
 
-        let exit_reason = vmread(ro::EXIT_REASON) as u32;
+        let exit_reason = vmread_checked(ro::EXIT_REASON)? as u32;
 
         let Some(basic_exit_reason) = VmxBasicExitReason::from_u32(exit_reason) else {
             log::error!("Unknown exit reason: {:#x}", exit_reason);
@@ -104,15 +105,32 @@ impl VmExit {
         // - This is also true of instructions introduced with VMX, which include: INVEPT, INVVPID, VMCALL, VMCLEAR, VMLAUNCH, VMPTRLD, VMPTRST, VMRESUME, VMXOFF, and VMXON.
         //
         // 26.1.3 Instructions That Cause VM Exits Conditionally: Certain instructions cause VM exits in VMX non-root operation depending on the setting of the VM-execution controls.
-        let exit_type = match basic_exit_reason {
-            VmxBasicExitReason::ExceptionOrNmi => handle_exception(guest_registers, vmx),
-            VmxBasicExitReason::Cpuid => handle_cpuid(guest_registers),
+        use core::sync::atomic::Ordering::Relaxed;
+        diag::EXIT_TOTAL.fetch_add(1, Relaxed);
+        diag::LAST_EXIT_REASON.store(exit_reason as u64, Relaxed);
 
-            VmxBasicExitReason::Vmcall => {
-                match handle_vmcall(guest_registers) {
-                    Some(exit) => exit,
-                    None => handle_undefined_opcode_exception(),
-                }
+        let exit_type = match basic_exit_reason {
+            VmxBasicExitReason::ExceptionOrNmi => {
+                diag::EXIT_EXCEPTION.fetch_add(1, Relaxed);
+                handle_exception(guest_registers, vmx)
+            }
+            VmxBasicExitReason::ExternalInterrupt => {
+                diag::EXIT_EXT_INT.fetch_add(1, Relaxed);
+                ExitType::Continue
+            }
+            VmxBasicExitReason::Cpuid => {
+                diag::EXIT_CPUID.fetch_add(1, Relaxed);
+                handle_cpuid(guest_registers, vmx)
+            }
+
+            VmxBasicExitReason::Vmcall => match handle_vmcall(guest_registers, vmx) {
+                Some(exit) => exit,
+                None => handle_undefined_opcode_exception(),
+            },
+
+            VmxBasicExitReason::ControlRegisterAccesses => {
+                diag::EXIT_CR_ACCESS.fetch_add(1, Relaxed);
+                handle_cr_access(guest_registers)
             }
 
             VmxBasicExitReason::Getsec
@@ -124,21 +142,44 @@ impl VmExit {
             | VmxBasicExitReason::Vmxon
             | VmxBasicExitReason::Vmxoff => handle_undefined_opcode_exception(),
 
-            VmxBasicExitReason::Rdmsr => handle_msr_access(guest_registers, MsrAccessType::Read),
-            VmxBasicExitReason::Wrmsr => handle_msr_access(guest_registers, MsrAccessType::Write),
+            VmxBasicExitReason::MonitorTrapFlag => handle_mtf(vmx),
+
+            VmxBasicExitReason::Rdmsr => {
+                diag::EXIT_MSR.fetch_add(1, Relaxed);
+                handle_msr_access(guest_registers, MsrAccessType::Read)
+            }
+            VmxBasicExitReason::Wrmsr => {
+                diag::EXIT_MSR.fetch_add(1, Relaxed);
+                handle_msr_access(guest_registers, MsrAccessType::Write)
+            }
             VmxBasicExitReason::Invd => handle_invd(guest_registers),
             VmxBasicExitReason::Rdtsc => handle_rdtsc(guest_registers),
-            VmxBasicExitReason::EptViolation => handle_ept_violation(guest_registers, vmx),
-            VmxBasicExitReason::EptMisconfiguration => handle_ept_misconfiguration(),
+            VmxBasicExitReason::EptViolation => {
+                diag::EXIT_EPT_VIOLATION.fetch_add(1, Relaxed);
+                handle_ept_violation(guest_registers, vmx)
+            }
+            VmxBasicExitReason::EptMisconfiguration => {
+                diag::EXIT_EPT_MISCONFIG.fetch_add(1, Relaxed);
+                handle_ept_misconfiguration()
+            }
             VmxBasicExitReason::Invept => handle_invept(),
             VmxBasicExitReason::Invvpid => handle_invvpid(),
-            VmxBasicExitReason::Xsetbv => handle_xsetbv(guest_registers),
-            _ => return Err(HypervisorError::UnhandledVmExit),
+            VmxBasicExitReason::Xsetbv => {
+                diag::EXIT_XSETBV.fetch_add(1, Relaxed);
+                handle_xsetbv(guest_registers)
+            }
+            _ => {
+                diag::EXIT_OTHER.fetch_add(1, Relaxed);
+                log::error!("Unhandled VM exit reason: {}", basic_exit_reason);
+                handle_undefined_opcode_exception()
+            }
         };
 
         if exit_type == ExitType::IncrementRIP {
-            self.advance_guest_rip(guest_registers);
+            self.advance_guest_rip(guest_registers)?;
         }
+
+        super::host_idt::check_pending_nmi();
 
         log::debug!(
             "Guest registers after handling vmexit: {:#x?}",
@@ -155,11 +196,12 @@ impl VmExit {
     /// to the hypervisor. To ensure that the guest does not re-execute the instruction that
     /// caused the VM exit, the hypervisor needs to advance the guest's RIP to the next instruction.
     #[rustfmt::skip]
-    fn advance_guest_rip(&self, guest_registers: &mut GuestRegisters) {
+    fn advance_guest_rip(&self, guest_registers: &mut GuestRegisters) -> Result<(), HypervisorError> {
         log::trace!("Advancing guest RIP...");
-        let len = vmread(ro::VMEXIT_INSTRUCTION_LEN);
+        let len = vmread_checked(ro::VMEXIT_INSTRUCTION_LEN)?;
         guest_registers.rip += len;
-        vmwrite(guest::RIP, guest_registers.rip);
-        log::trace!("Guest RIP advanced to: {:#x}", vmread(guest::RIP));
+        vmwrite_checked(guest::RIP, guest_registers.rip)?;
+        log::trace!("Guest RIP advanced to: {:#x}", guest_registers.rip);
+        Ok(())
     }
 }

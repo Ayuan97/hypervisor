@@ -73,6 +73,7 @@ impl Hook {
     /// * `Option<Box<[u8]>>` - A boxed slice containing the copied page data.
     ///
     /// Reference: https://docs.microsoft.com/en-us/windows-hardware/drivers/kernel/when-should-code-and-data-be-pageable-
+    #[cfg_attr(not(feature = "shellcode-hook"), allow(dead_code))]
     fn copy_page(address: u64) -> Option<Box<[u8]>> {
         let page_address = PAddr::from(address).align_down_to_base_page();
         if page_address.is_zero() {
@@ -105,6 +106,7 @@ impl Hook {
     /// # Returns
     ///
     /// * `u64` - The adjusted address of the function within the new page.
+    #[cfg_attr(not(feature = "shellcode-hook"), allow(dead_code))]
     fn address_in_page(page_start: u64, address: u64) -> u64 {
         let base_offset = VAddr::from(address).base_page_offset();
         page_start + base_offset
@@ -124,41 +126,54 @@ impl Hook {
     ///
     /// * `Option<Self>` - An instance of `Hook` if successful, or `None` if an error occurred.
     pub fn hook_function_ptr(function_ptr: u64, handler: *const ()) -> Option<Self> {
-        let original_pa = PhysicalAddress::from_va(function_ptr);
+        #[cfg(not(feature = "shellcode-hook"))]
+        {
+            log::warn!(
+                "Function hook request for {:#x} ignored; enable the shellcode-hook feature",
+                function_ptr
+            );
+            let _ = handler;
+            return None;
+        }
 
-        // Copy the page where the function resides to prevent modifying the original page.
-        let page = Self::copy_page(function_ptr)?;
-        let page_va = page.as_ptr() as *mut u64 as u64;
-        let page_pa = PhysicalAddress::from_va(page_va);
+        #[cfg(feature = "shellcode-hook")]
+        {
+            let original_pa = PhysicalAddress::from_va(function_ptr);
 
-        // Calculate the virtual and physical address of the function in the copied page.
-        let hook_va = Self::address_in_page(page_va, function_ptr);
-        let hook_pa = PhysicalAddress::from_va(hook_va);
+            // Copy the page where the function resides to prevent modifying the original page.
+            let page = Self::copy_page(function_ptr)?;
+            let page_va = page.as_ptr() as *mut u64 as u64;
+            let page_pa = PhysicalAddress::from_va(page_va);
 
-        log::debug!("Handler address: {:#x}", handler as u64);
+            // Calculate the virtual and physical address of the function in the copied page.
+            let hook_va = Self::address_in_page(page_va, function_ptr);
+            let hook_pa = PhysicalAddress::from_va(hook_va);
 
-        log::debug!("Original virtual address: {:#x}", function_ptr);
-        log::debug!("Original physical address: {:#x}", original_pa.as_u64());
+            log::debug!("Handler address: {:#x}", handler as u64);
 
-        log::debug!("Page virtual address: {:#x}", page_va);
-        log::debug!("Page physical address: {:#x}", page_pa.as_u64());
+            log::debug!("Original virtual address: {:#x}", function_ptr);
+            log::debug!("Original physical address: {:#x}", original_pa.as_u64());
 
-        log::debug!("Hook virtual address: {:#x}", hook_va);
-        log::debug!("Hook physical address: {:#x}", hook_pa.as_u64());
+            log::debug!("Page virtual address: {:#x}", page_va);
+            log::debug!("Page physical address: {:#x}", page_pa.as_u64());
 
-        // Create an inline hook at the new address in the copied page.
-        let inline_hook = FunctionHook::new(function_ptr, hook_va, handler)?;
+            log::debug!("Hook virtual address: {:#x}", hook_va);
+            log::debug!("Hook physical address: {:#x}", hook_pa.as_u64());
 
-        Some(Self {
-            original_va: function_ptr,
-            original_pa,
-            hook_va,
-            hook_pa,
-            page,
-            page_va,
-            page_pa,
-            hook_type: HookType::Function { inline_hook },
-        })
+            // Create an inline hook at the new address in the copied page.
+            let inline_hook = FunctionHook::new(function_ptr, hook_va, handler)?;
+
+            Some(Self {
+                original_va: function_ptr,
+                original_pa,
+                hook_va,
+                hook_pa,
+                page,
+                page_va,
+                page_pa,
+                hook_type: HookType::Function { inline_hook },
+            })
+        }
     }
 
     /// Creates a hook on a function by its name.
@@ -202,24 +217,48 @@ impl Hook {
     ///
     /// * `Option<Self>` - An instance of `Hook` if successful, or `None` if an error occurred.
     pub fn hook_page(address: u64) -> Option<Self> {
-        let original_pa = PhysicalAddress::from_va(address);
+        #[cfg(not(feature = "shellcode-hook"))]
+        {
+            log::warn!(
+                "Page hook request for {:#x} ignored; enable the shellcode-hook feature",
+                address
+            );
+            return None;
+        }
 
-        // Copy the target page for hooking.
-        let page = Self::copy_page(address)?;
-        let page_va = page.as_ptr() as *mut u64 as u64;
-        let page_pa = PhysicalAddress::from_va(page_va);
+        #[cfg(feature = "shellcode-hook")]
+        {
+            let original_pa = PhysicalAddress::from_va(address);
 
-        // In case of a page hook, the virtual and physical addresses are the same as the copied page.
-        Some(Self {
-            original_va: address,
-            original_pa,
-            page_va,
-            page_pa,
-            hook_va: page_va,
-            hook_pa: page_pa,
-            page,
-            hook_type: HookType::Page,
-        })
+            // Copy the target page for hooking.
+            let page = Self::copy_page(address)?;
+            let page_va = page.as_ptr() as *mut u64 as u64;
+            let page_pa = PhysicalAddress::from_va(page_va);
+
+            // In case of a page hook, the virtual and physical addresses are the same as the copied page.
+            Some(Self {
+                original_va: address,
+                original_pa,
+                page_va,
+                page_pa,
+                hook_va: page_va,
+                hook_pa: page_pa,
+                page,
+                hook_type: HookType::Page,
+            })
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[cfg(not(feature = "shellcode-hook"))]
+    #[test]
+    fn hook_creation_is_disabled_without_shellcode_feature() {
+        assert!(Hook::hook_function_ptr(0x1000, core::ptr::null()).is_none());
+        assert!(Hook::hook_page(0x1000).is_none());
     }
 }
 

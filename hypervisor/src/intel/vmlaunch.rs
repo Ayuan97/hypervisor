@@ -10,7 +10,13 @@
 //! Drew: https://github.com/drew-gpf
 
 use crate::{
-    intel::{support::vmread, vmerror::VmInstructionError, vmexit::VmExit, vmx::Vmx},
+    intel::{
+        events::EventInjection,
+        support::{vmread_checked, vmxoff},
+        vmerror::VmInstructionError,
+        vmexit::VmExit,
+        vmx::Vmx,
+    },
     utils::capture::GuestRegisters,
 };
 
@@ -205,6 +211,10 @@ vmexit_stub:
     // Restore stack pointer after VM exit handling.
     add rsp, 0x20
 
+    // Recovery entry point for host IDT fault handlers (#GP, NMI).
+    // They set RSP = HOST_RSP and jump here.
+.global vmexit_restore
+vmexit_restore:
     // Retrieve pointer to guest registers for restoration.
     mov     r15, [rsp]
 
@@ -261,16 +271,15 @@ vmexit_stub:
 ///
 /// * `registers` - A pointer to `GuestRegisters` representing the guest's state at VM exit.
 ///
-/// # Panics
-///
-/// Panics if `registers` is a null pointer.
 #[no_mangle]
 pub unsafe extern "C" fn vmexit_handler(registers: *mut GuestRegisters, vmx: *mut u64) {
     if registers.is_null() {
-        panic!("vmexit_handler received a null pointer for registers.");
+        log::error!("vmexit_handler received a null pointer for registers");
+        fatal_vmx_failure_loop();
     }
     if vmx.is_null() {
-        panic!("vmexit_handler received a null pointer for vmx.");
+        log::error!("vmexit_handler received a null pointer for vmx");
+        fatal_vmx_failure_loop();
     }
 
     let registers = &mut *registers;
@@ -278,7 +287,8 @@ pub unsafe extern "C" fn vmexit_handler(registers: *mut GuestRegisters, vmx: *mu
     let vmexit = VmExit::new();
 
     if let Err(e) = vmexit.handle_vmexit(registers, vmx) {
-        panic!("Failed to handle VMEXIT: {:?}", e);
+        log::error!("Failed to handle VMEXIT: {:?}", e);
+        EventInjection::vmentry_inject_ud();
     }
 }
 
@@ -287,21 +297,11 @@ pub unsafe extern "C" fn vmexit_handler(registers: *mut GuestRegisters, vmx: *mu
 /// This function is invoked when `VMLAUNCH` fails, and it retrieves and reports
 /// the specific VM instruction error.
 ///
-/// # Panics
-///
-/// Panics with the specific VM instruction error or an unknown error code.
-///
 /// Note: This can be handled with IDT later instead.
 #[no_mangle]
 pub extern "C" fn vmlaunch_failed() {
-    //unsafe { core::arch::asm!("int3") };
-    let instruction_error = vmread(x86::vmx::vmcs::ro::VM_INSTRUCTION_ERROR) as u32;
-
-    if let Some(error) = VmInstructionError::from_u32(instruction_error) {
-        panic!("VMLAUNCH instruction error: {}", error);
-    } else {
-        panic!("Unknown instruction error: {:#x}", instruction_error);
-    };
+    log_vm_instruction_failure("VMLAUNCH");
+    fatal_vmx_failure_loop();
 }
 
 /// Handles the failure of the `VMRESUME` instruction.
@@ -309,19 +309,43 @@ pub extern "C" fn vmlaunch_failed() {
 /// This function is invoked when `VMRESUME` fails, retrieving and reporting
 /// the specific VM instruction error.
 ///
-/// # Panics
-///
-/// Panics with the specific VM instruction error or an unknown error code.
-///
 /// Note: This can be handled with IDT later instead.
 #[no_mangle]
 pub extern "C" fn vmresume_failed() {
-    //unsafe { core::arch::asm!("int3") };
-    let instruction_error = vmread(x86::vmx::vmcs::ro::VM_INSTRUCTION_ERROR) as u32;
+    log_vm_instruction_failure("VMRESUME");
+    fatal_vmx_failure_loop();
+}
+
+fn log_vm_instruction_failure(instruction: &str) {
+    let instruction_error = match vmread_checked(x86::vmx::vmcs::ro::VM_INSTRUCTION_ERROR) {
+        Ok(value) => value as u32,
+        Err(error) => {
+            log::error!(
+                "{} failed and VM instruction error could not be read: {:?}",
+                instruction,
+                error
+            );
+            return;
+        }
+    };
 
     if let Some(error) = VmInstructionError::from_u32(instruction_error) {
-        panic!("VMRESUME instruction error: {}", error);
+        log::error!("{} instruction error: {}", instruction, error);
     } else {
-        panic!("Unknown instruction error: {:#x}", instruction_error);
-    };
+        log::error!(
+            "{} failed with unknown VM instruction error: {:#x}",
+            instruction,
+            instruction_error
+        );
+    }
+}
+
+fn fatal_vmx_failure_loop() -> ! {
+    if let Err(error) = vmxoff() {
+        log::error!("Failed to leave VMX operation after fatal VMX failure: {:?}", error);
+    }
+
+    loop {
+        core::hint::spin_loop();
+    }
 }

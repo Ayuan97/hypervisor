@@ -1,7 +1,9 @@
 pub mod controls;
 pub mod descriptor;
+pub mod diag;
 pub mod ept;
 pub mod events;
+pub mod host_idt;
 pub mod invept;
 pub mod invvpid;
 pub mod msr_bitmap;

@@ -57,7 +57,7 @@ impl HypervisorBuilder {
             .ok_or(HypervisorError::PrimaryEPTNotProvided)?;
 
         #[cfg(not(feature = "secondary-ept"))]
-        let mut shared_data = SharedData::new(primary_ept, hook_manager)?;
+        let shared_data = SharedData::new(primary_ept, hook_manager)?;
 
         #[cfg(feature = "secondary-ept")]
         let shared_data = {
@@ -222,6 +222,9 @@ impl Drop for Hypervisor {
         match self.devirtualize_system() {
             Ok(_) => log::trace!("Devirtualized successfully!"),
             Err(err) => log::trace!("Failed to devirtualize {}", err),
+        }
+        unsafe {
+            crate::utils::nt::IDENTITY_CR3 = 0;
         }
     }
 }

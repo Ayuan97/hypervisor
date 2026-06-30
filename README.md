@@ -35,7 +35,7 @@ hypervisor/      VT-x 核心逻辑
 
 | RAX (magic) | RCX (cmd) | RDX | R8 | R9 | 返回 |
 |---|---|---|---|---|---|
-| `0x4879706572564D00` | `0x01` PING | - | - | - | RAX = magic |
+| `0xA3B7E2914F6D8C15` | `0x01` PING | - | - | - | RAX = magic |
 | | `0x10` READ_PHYS | phys addr | len | out buf | RAX = 0 (ok) |
 | | `0x11` WRITE_PHYS | phys addr | len | in buf | RAX = 0 (ok) |
 | | `0x12` TRANSLATE_VA | CR3 | VA | - | RAX = PA |

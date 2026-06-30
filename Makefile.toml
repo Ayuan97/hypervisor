@@ -1,7 +1,7 @@
 [env]
 CARGO_MAKE_EXTEND_WORKSPACE_MAKEFILE = true
 WDK_VERSION = "10.0.26100.0"
-WDK_INF2CAT_OS = "10_X64,Server2022_X64"
+WDK_INF2CAT_OS = "10_X64,ServerFE_X64"
 
 [env.development]
 CARGO_PROFILE = "dev"
@@ -26,12 +26,13 @@ args = [
 dependencies = ["build"]
 script = [
     "copy /Y ${TARGET_DIR}\\matrix.dll ${TARGET_DIR}\\matrix.sys",
+    "copy /Y driver\\matrix.inf ${TARGET_DIR}\\matrix.inf",
 ]
 
 [tasks.stampinf]
 dependencies = ["rename"]
 script = [
-    "stampinf.exe -f driver\\matrix.inf -d * -a amd64 -v * -k 1.33",
+    "stampinf.exe -f ${TARGET_DIR}\\matrix.inf -d * -a amd64 -v * -k 1.33",
 ]
 
 [tasks.inf2cat]
@@ -43,7 +44,7 @@ script = [
 [tasks.infverif]
 dependencies = ["inf2cat"]
 script = [
-    "infverif.exe /v /w driver\\matrix.inf",
+    "infverif.exe /v /w ${TARGET_DIR}\\matrix.inf",
 ]
 
 [tasks.makecert]

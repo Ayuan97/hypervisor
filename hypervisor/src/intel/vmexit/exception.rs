@@ -7,10 +7,8 @@ use {
         intel::{
             ept::hooks::HookType,
             events::EventInjection,
-            support::{vmread, vmwrite},
-            vmerror::{
-                EptViolationExitQualification, ExceptionInterrupt, VmExitInterruptionInformation,
-            },
+            support::{vmread_checked, vmwrite_checked},
+            vmerror::{ExceptionInterrupt, InterruptionType, VmExitInterruptionInformation},
             vmexit::ExitType,
             vmx::Vmx,
         },
@@ -37,39 +35,60 @@ use {
 pub fn handle_exception(guest_registers: &mut GuestRegisters, vmx: &mut Vmx) -> ExitType {
     log::debug!("Handling ExceptionOrNmi VM exit...");
 
-    let interruption_info_value = vmread(vmcs::ro::VMEXIT_INTERRUPTION_INFO);
-    let interruption_error_code_value = vmread(vmcs::ro::VMEXIT_INTERRUPTION_ERR_CODE);
-
-    if let Some(interruption_info) = VmExitInterruptionInformation::from_u32(interruption_info_value as u32) {
-        if let Some(exception_interrupt) = ExceptionInterrupt::from_u32(interruption_info.vector.into()) {
-            match exception_interrupt {
-                ExceptionInterrupt::PageFault => {
-                    let exit_qualification_value = vmread(vmcs::ro::EXIT_QUALIFICATION);
-                    let ept_violation_qualification = EptViolationExitQualification::from_exit_qualification(exit_qualification_value);
-                    log::trace!("Exit Qualification for EPT Violations: {}", ept_violation_qualification);
-                    EventInjection::vmentry_inject_pf(interruption_error_code_value as u32);
-                },
-                ExceptionInterrupt::GeneralProtectionFault => {
-                    EventInjection::vmentry_inject_gp(interruption_error_code_value as u32);
-                },
-                ExceptionInterrupt::Breakpoint => {
-                    handle_breakpoint_exception(guest_registers, vmx);
-                },
-                ExceptionInterrupt::InvalidOpcode => {
-                    EventInjection::vmentry_inject_ud();
-                },
-                _ => {
-                    panic!("Unhandled exception: {:?}", exception_interrupt);
-                }
-            }
-        } else {
-            panic!("Invalid Exception Interrupt Vector: {}", interruption_info.vector);
+    let interruption_info_value = match vmread_checked(vmcs::ro::VMEXIT_INTERRUPTION_INFO) {
+        Ok(value) => value as u32,
+        Err(error) => {
+            log::error!("Failed to read VM-exit interruption info: {:?}", error);
+            EventInjection::vmentry_inject_ud();
+            return ExitType::Continue;
         }
-    } else {
-        panic!("Invalid VM Exit Interruption Information");
-    }
+    };
 
-    log::debug!("Exception Handled successfully!");
+    let interruption_error_code_value = match vmread_checked(vmcs::ro::VMEXIT_INTERRUPTION_ERR_CODE) {
+        Ok(value) => value as u32,
+        Err(error) => {
+            log::error!("Failed to read VM-exit interruption error code: {:?}", error);
+            EventInjection::vmentry_inject_ud();
+            return ExitType::Continue;
+        }
+    };
+
+    let Some(interruption_info) = VmExitInterruptionInformation::from_u32(interruption_info_value) else {
+        EventInjection::vmentry_reinject(interruption_info_value, interruption_error_code_value);
+        return ExitType::Continue;
+    };
+
+    match interruption_info.interruption_type {
+        InterruptionType::NonMaskableInterrupt => {
+            EventInjection::vmentry_inject_nmi();
+        },
+        InterruptionType::HardwareException => {
+            if let Some(exception_interrupt) = ExceptionInterrupt::from_u32(interruption_info.vector.into()) {
+                match exception_interrupt {
+                    ExceptionInterrupt::PageFault => {
+                        EventInjection::vmentry_inject_pf(interruption_error_code_value);
+                    },
+                    ExceptionInterrupt::GeneralProtectionFault => {
+                        EventInjection::vmentry_inject_gp(interruption_error_code_value);
+                    },
+                    ExceptionInterrupt::Breakpoint => {
+                        handle_breakpoint_exception(guest_registers, vmx);
+                    },
+                    ExceptionInterrupt::InvalidOpcode => {
+                        EventInjection::vmentry_inject_ud();
+                    },
+                    _ => {
+                        EventInjection::vmentry_reinject(interruption_info_value, interruption_error_code_value);
+                    }
+                }
+            } else {
+                EventInjection::vmentry_reinject(interruption_info_value, interruption_error_code_value);
+            }
+        },
+        _ => {
+            EventInjection::vmentry_reinject(interruption_info_value, interruption_error_code_value);
+        }
+    }
 
     ExitType::Continue
 }
@@ -111,7 +130,11 @@ fn handle_breakpoint_exception(guest_registers: &mut GuestRegisters, vmx: &mut V
         // Call our hook handle function (it will automatically call trampoline).
         log::trace!("Transferring execution to handler: {:#x}", handler);
         guest_registers.rip = handler;
-        vmwrite(vmcs::guest::RIP, guest_registers.rip);
+        if let Err(error) = vmwrite_checked(vmcs::guest::RIP, guest_registers.rip) {
+            log::error!("Failed to redirect guest RIP for breakpoint hook: {:?}", error);
+            EventInjection::vmentry_inject_bp();
+            return;
+        }
 
         log::debug!("Breakpoint (int3) hook handled successfully!");
     } else {

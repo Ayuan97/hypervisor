@@ -1,5 +1,9 @@
 /target
 *.cer
+*.exe
 *.log
+*.pdb
+*.sys
+tools/monitor_log.txt
 .claude/
 .mcp.json

@@ -11,12 +11,13 @@ use {
         intel::ept::mtrr::{MemoryType, Mtrr},
         utils::addresses::PhysicalAddress,
     },
+    alloc::boxed::Box,
     bitfield::bitfield,
     bitflags::bitflags,
-    core::ptr::addr_of,
+    core::ptr::{addr_of, null_mut},
     x86::bits64::paging::{
         pd_index, pdpt_index, pml4_index, pt_index, VAddr, BASE_PAGE_SHIFT, BASE_PAGE_SIZE,
-        LARGE_PAGE_SIZE, PAGE_SIZE_ENTRIES,
+        PAGE_SIZE_ENTRIES,
     },
 };
 
@@ -45,6 +46,7 @@ pub const _512GB: u64 = 512 * 1024 * 1024 * 1024;
 pub const _1GB: u64 = 1024 * 1024 * 1024;
 pub const _2MB: usize = 2 * 1024 * 1024;
 pub const _4KB: usize = 4 * 1024;
+const MAX_SPLIT_PTS: usize = 128;
 
 /// Represents the entire Extended Page Table structure.
 ///
@@ -60,8 +62,7 @@ pub struct Ept {
     pdpt: Pdpt,
     /// Array of Page Directory Table (PDT).
     pd: [Pd; 512],
-    /// A two-dimensional array of Page Tables (PT).
-    pt: [[Pt; 512]; 512],
+    split_pts: [SplitPt; MAX_SPLIT_PTS],
 }
 
 impl Ept {
@@ -99,16 +100,9 @@ impl Ept {
     /// # Returns
     ///
     /// A `Result<(), HypervisorError>` indicating if the operation was successful.
-    pub fn identity_4kb(&mut self, access_type: AccessType) -> Result<(), HypervisorError> {
-        log::trace!("Creating identity map for 4KB pages");
-
-        let mut mtrr = Mtrr::new();
-
-        for pa in (0.._512GB).step_by(BASE_PAGE_SIZE) {
-            self.map_4kb(pa, pa, access_type, &mut mtrr)?;
-        }
-
-        Ok(())
+    pub fn identity_4kb(&mut self, _access_type: AccessType) -> Result<(), HypervisorError> {
+        log::error!("Full 512GB 4KB identity EPT is not supported by the bounded split table");
+        Err(HypervisorError::OutOfMemory)
     }
 
     /// Maps a single 2MB page in the EPT.
@@ -181,9 +175,7 @@ impl Ept {
             pml4_entry.set_readable(access_type.contains(AccessType::READ));
             pml4_entry.set_writable(access_type.contains(AccessType::WRITE));
             pml4_entry.set_executable(access_type.contains(AccessType::EXECUTE));
-            pml4_entry.set_pfn(
-                PhysicalAddress::pa_from_va(addr_of!(self.pdpt) as u64) >> BASE_PAGE_SHIFT,
-            );
+            pml4_entry.set_pfn(table_pa_from_va(addr_of!(self.pdpt) as u64) >> BASE_PAGE_SHIFT);
         }
 
         Ok(())
@@ -206,10 +198,8 @@ impl Ept {
             pdpt_entry.set_readable(access_type.contains(AccessType::READ));
             pdpt_entry.set_writable(access_type.contains(AccessType::WRITE));
             pdpt_entry.set_executable(access_type.contains(AccessType::EXECUTE));
-            pdpt_entry.set_pfn(
-                PhysicalAddress::pa_from_va(addr_of!(self.pd[pdpt_index]) as u64)
-                    >> BASE_PAGE_SHIFT,
-            );
+            pdpt_entry
+                .set_pfn(table_pa_from_va(addr_of!(self.pd[pdpt_index]) as u64) >> BASE_PAGE_SHIFT);
         }
 
         Ok(())
@@ -228,17 +218,28 @@ impl Ept {
     fn map_pdt(&mut self, guest_pa: u64, access_type: AccessType) -> Result<(), HypervisorError> {
         let pdpt_index = pdpt_index(VAddr::from(guest_pa));
         let pd_index = pd_index(VAddr::from(guest_pa));
-        let pd_entry = &mut self.pd[pdpt_index].0.entries[pd_index];
 
-        if !pd_entry.readable() {
-            pd_entry.set_readable(access_type.contains(AccessType::READ));
-            pd_entry.set_writable(access_type.contains(AccessType::WRITE));
-            pd_entry.set_executable(access_type.contains(AccessType::EXECUTE));
-            pd_entry.set_pfn(
-                PhysicalAddress::pa_from_va(addr_of!(self.pt[pdpt_index][pd_index]) as u64)
-                    >> BASE_PAGE_SHIFT,
-            );
+        if self.pd[pdpt_index].0.entries[pd_index].large() {
+            return Err(HypervisorError::AlreadySplitError);
         }
+
+        if self.find_split_pt(pdpt_index, pd_index).is_some() {
+            return Ok(());
+        }
+
+        let pt = allocate_pt()?;
+        if self.record_split_pt(pdpt_index, pd_index, pt).is_err() {
+            unsafe {
+                free_pt(pt);
+            }
+            return Err(HypervisorError::OutOfMemory);
+        }
+
+        let pd_entry = &mut self.pd[pdpt_index].0.entries[pd_index];
+        set_entry_access(pd_entry, access_type);
+        pd_entry.set_memory_type(0);
+        pd_entry.set_large(false);
+        pd_entry.set_pfn(table_pa_from_va(pt as u64) >> BASE_PAGE_SHIFT);
 
         Ok(())
     }
@@ -265,15 +266,11 @@ impl Ept {
         let pd_index = pd_index(VAddr::from(guest_pa));
         let pd_entry = &mut self.pd[pdpt_index].0.entries[pd_index];
 
-        let memory_type = mtrr
-            .find(guest_pa..guest_pa + LARGE_PAGE_SIZE as u64)
-            .unwrap_or(MemoryType::Uncacheable);
-
         if !pd_entry.readable() {
             pd_entry.set_readable(access_type.contains(AccessType::READ));
             pd_entry.set_writable(access_type.contains(AccessType::WRITE));
             pd_entry.set_executable(access_type.contains(AccessType::EXECUTE));
-            pd_entry.set_memory_type(memory_type as u64);
+            pd_entry.set_memory_type(mtrr_memory_type_for_2mb(host_pa, mtrr) as u64);
             pd_entry.set_large(true);
             pd_entry.set_pfn(host_pa >> BASE_PAGE_SHIFT);
         } else {
@@ -304,29 +301,13 @@ impl Ept {
         access_type: AccessType,
         mtrr: &mut Mtrr,
     ) -> Result<(), HypervisorError> {
-        let pdpt_index = pdpt_index(VAddr::from(guest_pa));
-        let pd_index = pd_index(VAddr::from(guest_pa));
-        let pt_index = pt_index(VAddr::from(guest_pa));
-        let pt_entry = &mut self.pt[pdpt_index][pd_index].0.entries[pt_index];
-
-        let memory_type = mtrr
-            .find(guest_pa..guest_pa + BASE_PAGE_SIZE as u64)
-            .unwrap_or(MemoryType::Uncacheable);
-
-        if !pt_entry.readable() {
-            pt_entry.set_readable(access_type.contains(AccessType::READ));
-            pt_entry.set_writable(access_type.contains(AccessType::WRITE));
-            pt_entry.set_executable(access_type.contains(AccessType::EXECUTE));
-            pt_entry.set_memory_type(memory_type as u64);
-            pt_entry.set_pfn(host_pa >> BASE_PAGE_SHIFT);
-        } else {
-            log::warn!(
-                "Attempted to map an already-mapped 4KB page: {:x}",
-                guest_pa
-            );
-        }
-
-        Ok(())
+        self.map_split_4kb(
+            guest_pa,
+            host_pa,
+            access_type,
+            mtrr.find(host_pa..host_pa + BASE_PAGE_SIZE as u64)
+                .unwrap_or(MemoryType::WriteBack),
+        )
     }
 
     /// Modifies the access permissions for a page within the extended page table (EPT).
@@ -355,27 +336,7 @@ impl Ept {
             return Err(HypervisorError::UnalignedAddressError);
         }
 
-        let pdpt_index = pdpt_index(guest_pa);
-        let pd_index = pd_index(guest_pa);
-        let pt_index = pt_index(guest_pa);
-
-        let pd_entry = &mut self.pd[pdpt_index].0.entries[pd_index];
-
-        if pd_entry.large() {
-            log::trace!("Changing the permissions of a 2mb page");
-            pd_entry.set_readable(access_type.contains(AccessType::READ));
-            pd_entry.set_writable(access_type.contains(AccessType::WRITE));
-            pd_entry.set_executable(access_type.contains(AccessType::EXECUTE));
-        } else {
-            log::trace!("Changing the permissions of a 4kb page");
-
-            let pt_entry = &mut self.pt[pdpt_index][pd_index].0.entries[pt_index];
-            pt_entry.set_readable(access_type.contains(AccessType::READ));
-            pt_entry.set_writable(access_type.contains(AccessType::WRITE));
-            pt_entry.set_executable(access_type.contains(AccessType::EXECUTE));
-        }
-
-        Ok(())
+        self.set_page_access(guest_pa.as_u64(), access_type)
     }
 
     /// Splits a large 2MB page into 512 smaller 4KB pages for a given guest physical address.
@@ -396,32 +357,42 @@ impl Ept {
         guest_pa: u64,
         access_type: AccessType,
     ) -> Result<(), HypervisorError> {
-        log::trace!("Splitting 2mb page into 4kb pages: {:x}", guest_pa);
-
         let guest_pa = VAddr::from(guest_pa);
-
         let pdpt_index = pdpt_index(guest_pa);
         let pd_index = pd_index(guest_pa);
-        let pd_entry = &mut self.pd[pdpt_index].0.entries[pd_index];
+        let (host_base, memory_type) = {
+            let pd_entry = &self.pd[pdpt_index].0.entries[pd_index];
+            if !pd_entry.readable() {
+                return Err(HypervisorError::InvalidPdEntry);
+            }
+            if !pd_entry.large() {
+                return Err(HypervisorError::PageAlreadySplit);
+            }
+            (pd_entry.pfn() << BASE_PAGE_SHIFT, pd_entry.memory_type())
+        };
+        let pt = allocate_pt()?;
 
-        // We can only split large pages and not page directories.
-        // If it's a page directory, it is already split.
-        //
-        if !pd_entry.large() {
-            log::trace!("Page is already split: {:x}.", guest_pa);
-            return Err(HypervisorError::PageAlreadySplit);
-        }
-
-        // Unmap the 2MB page by resetting the page directory entry.
-        Self::unmap_2mb(pd_entry);
-
-        let mut mtrr = Mtrr::new();
-
-        // Map the unmapped physical memory again to 4KB pages.
         for i in 0..PAGE_SIZE_ENTRIES {
-            let pa = (guest_pa.as_usize() + i * BASE_PAGE_SIZE) as u64;
-            self.map_4kb(pa, pa, access_type, &mut mtrr)?;
+            let pa = host_base + (i * BASE_PAGE_SIZE) as u64;
+            let entry = unsafe { &mut (*pt).0.entries[i] };
+            set_entry_access(entry, access_type);
+            entry.set_memory_type(memory_type);
+            entry.set_large(false);
+            entry.set_pfn(pa >> BASE_PAGE_SHIFT);
         }
+
+        if self.record_split_pt(pdpt_index, pd_index, pt).is_err() {
+            unsafe {
+                free_pt(pt);
+            }
+            return Err(HypervisorError::OutOfMemory);
+        }
+
+        let pd_entry = &mut self.pd[pdpt_index].0.entries[pd_index];
+        set_entry_access(pd_entry, access_type);
+        pd_entry.set_memory_type(0);
+        pd_entry.set_large(false);
+        pd_entry.set_pfn(table_pa_from_va(pt as u64) >> BASE_PAGE_SHIFT);
 
         Ok(())
     }
@@ -441,10 +412,35 @@ impl Ept {
         host_pa: u64,
         access_type: AccessType,
     ) -> Result<(), HypervisorError> {
-        let mut mtrr = Mtrr::new();
+        self.map_split_4kb(guest_pa, host_pa, access_type, memory_type_for_4kb(host_pa))
+    }
 
-        self.map_pt(guest_pa, host_pa, access_type, &mut mtrr)?;
+    pub fn set_page_access(
+        &mut self,
+        guest_pa: u64,
+        access_type: AccessType,
+    ) -> Result<(), HypervisorError> {
+        let guest_pa = VAddr::from(guest_pa);
 
+        if !guest_pa.is_large_page_aligned() && !guest_pa.is_base_page_aligned() {
+            return Err(HypervisorError::UnalignedAddressError);
+        }
+
+        let pdpt_index = pdpt_index(guest_pa);
+        let pd_index = pd_index(guest_pa);
+        let pt_index = pt_index(guest_pa);
+        let pd_entry = &mut self.pd[pdpt_index].0.entries[pd_index];
+
+        if pd_entry.large() {
+            set_entry_access(pd_entry, access_type);
+            return Ok(());
+        }
+
+        let Some(pt) = self.find_split_pt_mut(pdpt_index, pd_index) else {
+            return Err(HypervisorError::InvalidPml1Entry);
+        };
+
+        set_entry_access(&mut pt.0.entries[pt_index], access_type);
         Ok(())
     }
 
@@ -518,6 +514,77 @@ impl Ept {
             Err(HypervisorError::InvalidEptPml4BaseAddress)
         }
     }
+
+    fn find_split_pt(&self, pdpt_index: usize, pd_index: usize) -> Option<&Pt> {
+        self.split_pts
+            .iter()
+            .find(|slot| slot.matches(pdpt_index, pd_index))
+            .map(|slot| unsafe { &*slot.pt })
+    }
+
+    fn find_split_pt_mut(&mut self, pdpt_index: usize, pd_index: usize) -> Option<&mut Pt> {
+        self.split_pts
+            .iter_mut()
+            .find(|slot| slot.matches(pdpt_index, pd_index))
+            .map(|slot| unsafe { &mut *slot.pt })
+    }
+
+    fn map_split_4kb(
+        &mut self,
+        guest_pa: u64,
+        host_pa: u64,
+        access_type: AccessType,
+        memory_type: MemoryType,
+    ) -> Result<(), HypervisorError> {
+        let guest_pa = VAddr::from(guest_pa);
+        let pdpt_index = pdpt_index(guest_pa);
+        let pd_index = pd_index(guest_pa);
+        let pt_index = pt_index(guest_pa);
+        let Some(pt) = self.find_split_pt_mut(pdpt_index, pd_index) else {
+            return Err(HypervisorError::InvalidPml1Entry);
+        };
+
+        let pt_entry = &mut pt.0.entries[pt_index];
+        set_entry_access(pt_entry, access_type);
+        pt_entry.set_memory_type(memory_type as u64);
+        pt_entry.set_large(false);
+        pt_entry.set_pfn(host_pa >> BASE_PAGE_SHIFT);
+
+        Ok(())
+    }
+
+    fn record_split_pt(
+        &mut self,
+        pdpt_index: usize,
+        pd_index: usize,
+        pt: *mut Pt,
+    ) -> Result<(), ()> {
+        if self.find_split_pt(pdpt_index, pd_index).is_some() {
+            return Ok(());
+        }
+
+        let Some(slot) = self.split_pts.iter_mut().find(|slot| slot.pt.is_null()) else {
+            return Err(());
+        };
+
+        slot.pdpt_index = pdpt_index as u16;
+        slot.pd_index = pd_index as u16;
+        slot.pt = pt;
+        Ok(())
+    }
+}
+
+impl Drop for Ept {
+    fn drop(&mut self) {
+        for slot in self.split_pts.iter_mut() {
+            if !slot.pt.is_null() {
+                unsafe {
+                    free_pt(slot.pt);
+                }
+                slot.pt = null_mut();
+            }
+        }
+    }
 }
 
 /// Represents an EPT PML4 Entry (PML4E) that references a Page-Directory-Pointer Table.
@@ -551,7 +618,24 @@ struct Pd(Table);
 ///
 /// Reference: Intel® 64 and IA-32 Architectures Software Developer's Manual: Format of an EPT Page-Table Entry that Maps a 4-KByte Page
 #[derive(Debug, Clone, Copy)]
+#[allow(dead_code)]
 struct Pt(Table);
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct SplitPt {
+    pdpt_index: u16,
+    pd_index: u16,
+    pt: *mut Pt,
+}
+
+impl SplitPt {
+    fn matches(&self, pdpt_index: usize, pd_index: usize) -> bool {
+        !self.pt.is_null()
+            && self.pdpt_index as usize == pdpt_index
+            && self.pd_index as usize == pd_index
+    }
+}
 
 /// General struct to represent a table in the EPT paging structure.
 ///
@@ -594,4 +678,176 @@ bitfield! {
     pub pfn, set_pfn: 51, 12;
     pub verify_guest_paging, set_verify_guest_paging: 57;
     pub paging_write_access, set_paging_write_access: 58;
+}
+
+fn set_entry_access(entry: &mut Entry, access_type: AccessType) {
+    entry.set_readable(access_type.contains(AccessType::READ));
+    entry.set_writable(access_type.contains(AccessType::WRITE));
+    entry.set_executable(access_type.contains(AccessType::EXECUTE));
+}
+
+#[cfg(not(test))]
+fn table_pa_from_va(va: u64) -> u64 {
+    PhysicalAddress::pa_from_va(va)
+}
+
+#[cfg(test)]
+fn table_pa_from_va(va: u64) -> u64 {
+    va
+}
+
+#[cfg(not(test))]
+fn allocate_pt() -> Result<*mut Pt, HypervisorError> {
+    let pt = unsafe {
+        Box::<Pt, crate::utils::alloc::PhysicalAllocator>::try_new_zeroed_in(
+            crate::utils::alloc::PhysicalAllocator,
+        )?
+        .assume_init()
+    };
+    let (pt, _) = Box::into_raw_with_allocator(pt);
+    Ok(pt)
+}
+
+#[cfg(test)]
+fn allocate_pt() -> Result<*mut Pt, HypervisorError> {
+    let pt = unsafe { Box::<Pt>::new_zeroed().assume_init() };
+    Ok(Box::into_raw(pt))
+}
+
+#[cfg(not(test))]
+unsafe fn free_pt(pt: *mut Pt) {
+    drop(Box::from_raw_in(pt, crate::utils::alloc::PhysicalAllocator));
+}
+
+#[cfg(test)]
+unsafe fn free_pt(pt: *mut Pt) {
+    drop(Box::from_raw(pt));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::intel::ept::mtrr::{MemoryType, MtrrRangeDescriptor};
+    use alloc::boxed::Box;
+
+    fn large_mapped_ept(guest_pa: u64, host_pa: u64) -> Box<Ept> {
+        let mut ept = unsafe { Box::<Ept>::new_zeroed().assume_init() };
+        let mut mtrr = Mtrr::for_test(MemoryType::WriteBack, &[]);
+        ept.map_pde(guest_pa, host_pa, AccessType::READ_WRITE_EXECUTE, &mut mtrr)
+            .unwrap();
+        ept
+    }
+
+    fn split_pt_for_test(ept: &Ept, pdpt_index: usize, pd_index: usize) -> &Pt {
+        let pd_entry = &ept.pd[pdpt_index].0.entries[pd_index];
+        assert!(!pd_entry.large());
+        assert_ne!(pd_entry.pfn(), 0);
+        unsafe { &*((pd_entry.pfn() << BASE_PAGE_SHIFT) as *const Pt) }
+    }
+
+    #[test]
+    fn memory_type_comes_from_matching_mtrr_range() {
+        let mtrr = Mtrr::for_test(
+            MemoryType::WriteBack,
+            &[MtrrRangeDescriptor {
+                base_address: 0x1000_0000,
+                end_address: 0x101F_FFFF,
+                memory_type: MemoryType::Uncacheable,
+            }],
+        );
+
+        assert_eq!(
+            mtrr_memory_type_for_2mb(0x1000_0000, &mtrr),
+            MemoryType::Uncacheable
+        );
+    }
+
+    #[test]
+    fn memory_type_falls_back_to_default_mtrr_type() {
+        let mtrr = Mtrr::for_test(MemoryType::WriteCombining, &[]);
+
+        assert_eq!(
+            mtrr_memory_type_for_2mb(0x2000_0000, &mtrr),
+            MemoryType::WriteCombining
+        );
+    }
+
+    #[test]
+    fn split_2mb_page_creates_4kb_entries_with_original_mapping() {
+        let mut ept = large_mapped_ept(0, 0);
+
+        ept.split_2mb_to_4kb(0x1234, AccessType::READ_WRITE_EXECUTE)
+            .unwrap();
+
+        let pd_entry = &ept.pd[0].0.entries[0];
+        assert!(!pd_entry.large());
+        assert!(pd_entry.readable());
+        assert!(pd_entry.writable());
+        assert!(pd_entry.executable());
+
+        let pt = split_pt_for_test(&ept, 0, 0);
+        let first_entry = pt.0.entries[0];
+        assert!(first_entry.readable());
+        assert!(first_entry.writable());
+        assert!(first_entry.executable());
+        assert_eq!(first_entry.memory_type(), MemoryType::WriteBack as u64);
+        assert_eq!(first_entry.pfn(), 0);
+
+        let last_entry = pt.0.entries[511];
+        assert_eq!(last_entry.pfn(), ((_2MB - _4KB) as u64) >> BASE_PAGE_SHIFT);
+    }
+
+    #[test]
+    fn remap_page_updates_one_split_4kb_mapping() {
+        let mut ept = large_mapped_ept(0, 0);
+        ept.split_2mb_to_4kb(0, AccessType::READ_WRITE_EXECUTE)
+            .unwrap();
+
+        ept.remap_page(0x3000, 0xABC0_0000, AccessType::EXECUTE)
+            .unwrap();
+
+        let pt = split_pt_for_test(&ept, 0, 0);
+        let remapped = pt.0.entries[3];
+        assert!(!remapped.readable());
+        assert!(!remapped.writable());
+        assert!(remapped.executable());
+        assert_eq!(remapped.pfn(), 0xABC0_0000 >> BASE_PAGE_SHIFT);
+    }
+
+    #[test]
+    fn set_page_access_updates_one_split_4kb_entry() {
+        let mut ept = large_mapped_ept(0, 0);
+        ept.split_2mb_to_4kb(0, AccessType::READ_WRITE_EXECUTE)
+            .unwrap();
+
+        ept.set_page_access(0x2000, AccessType::empty()).unwrap();
+
+        let pt = split_pt_for_test(&ept, 0, 0);
+        let hidden = pt.0.entries[2];
+        assert!(!hidden.readable());
+        assert!(!hidden.writable());
+        assert!(!hidden.executable());
+
+        let neighbor = pt.0.entries[1];
+        assert!(neighbor.readable());
+        assert!(neighbor.writable());
+        assert!(neighbor.executable());
+    }
+}
+
+fn mtrr_memory_type_for_2mb(host_pa: u64, mtrr: &Mtrr) -> MemoryType {
+    let end = host_pa.saturating_add(_2MB as u64);
+    mtrr.find(host_pa..end).unwrap_or(MemoryType::WriteBack)
+}
+
+#[cfg(not(test))]
+fn memory_type_for_4kb(host_pa: u64) -> MemoryType {
+    let mtrr = Mtrr::new();
+    mtrr.find(host_pa..host_pa + BASE_PAGE_SIZE as u64)
+        .unwrap_or(MemoryType::WriteBack)
+}
+
+#[cfg(test)]
+fn memory_type_for_4kb(_host_pa: u64) -> MemoryType {
+    MemoryType::WriteBack
 }

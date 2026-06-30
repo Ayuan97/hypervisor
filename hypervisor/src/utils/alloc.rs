@@ -17,14 +17,15 @@ use {
     core::ptr::NonNull,
     wdk_sys::{
         ntddk::{
-            ExAllocatePool, ExFreePool, MmAllocateContiguousMemorySpecifyCacheNode,
+            ExAllocatePool2, ExFreePool, MmAllocateContiguousMemorySpecifyCacheNode,
             MmFreeContiguousMemory,
         },
-        MM_ANY_NODE_OK, PHYSICAL_ADDRESS,
         _MEMORY_CACHING_TYPE::MmCached,
-        _POOL_TYPE::NonPagedPool,
+        MM_ANY_NODE_OK, PHYSICAL_ADDRESS, POOL_FLAG_NON_PAGED, POOL_FLAG_UNINITIALIZED,
     },
 };
+
+const POOL_TAG: u32 = u32::from_ne_bytes(*b"FMfn");
 
 /// Physical memory allocator for kernel space.
 ///
@@ -99,7 +100,13 @@ unsafe impl Allocator for KernelAlloc {
     /// A result containing a non-null pointer to the memory block if successful.
     /// Returns an `AllocError` if the allocation fails.
     fn allocate(&self, layout: Layout) -> Result<NonNull<[u8]>, AllocError> {
-        let memory = unsafe { ExAllocatePool(NonPagedPool, layout.size() as _) } as *mut u8;
+        let memory = unsafe {
+            ExAllocatePool2(
+                POOL_FLAG_NON_PAGED | POOL_FLAG_UNINITIALIZED,
+                layout.size() as _,
+                POOL_TAG,
+            )
+        } as *mut u8;
 
         if memory.is_null() {
             Err(AllocError)
@@ -139,7 +146,13 @@ unsafe impl GlobalAlloc for KernelAlloc {
     ///
     /// A raw pointer to the allocated block of memory.
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        let memory = unsafe { ExAllocatePool(NonPagedPool, layout.size() as _) } as *mut u8;
+        let memory = unsafe {
+            ExAllocatePool2(
+                POOL_FLAG_NON_PAGED | POOL_FLAG_UNINITIALIZED,
+                layout.size() as _,
+                POOL_TAG,
+            )
+        } as *mut u8;
 
         if memory.is_null() {
             handle_alloc_error(layout);

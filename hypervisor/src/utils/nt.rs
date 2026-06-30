@@ -9,7 +9,7 @@ use {
         ntddk::{
             KeLowerIrql, KeStackAttachProcess, KeUnstackDetachProcess, MmGetSystemRoutineAddress,
         },
-        KIRQL, PEPROCESS, PRKPROCESS, PVOID, UNICODE_STRING, _KAPC_STATE,
+        _KAPC_STATE, KIRQL, PEPROCESS, PRKPROCESS, PVOID, UNICODE_STRING,
     },
 };
 
@@ -75,6 +75,10 @@ pub fn lower_irql_to_old_level(old_irql: KIRQL) {
 /// This is typically used to store the page table root physical address
 /// of the system process for use in virtual-to-physical address translation.
 pub static mut NTOSKRNL_CR3: u64 = 0;
+
+/// Physical address of the identity-mapped PML4, for temporary CR3 switching
+/// in VMX root mode when accessing arbitrary physical memory.
+pub static mut IDENTITY_CR3: u64 = 0;
 
 /// Updates the `NTOSKRNL_CR3` static with the CR3 of the system process.
 ///

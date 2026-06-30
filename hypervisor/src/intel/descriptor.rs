@@ -33,6 +33,16 @@ pub struct DescriptorTables {
 }
 
 impl DescriptorTables {
+    /// Creates descriptor table storage with valid empty vectors and empty GDTR/IDTR pointers.
+    pub fn new() -> Self {
+        Self {
+            global_descriptor_table: Vec::new(),
+            gdtr: DescriptorTablePointer::default(),
+            interrupt_descriptor_table: Vec::new(),
+            idtr: DescriptorTablePointer::default(),
+        }
+    }
+
     /// Captures the currently loaded GDT and IDT for the guest.
     pub fn initialize_for_guest(
         descriptor_tables: &mut Box<DescriptorTables, KernelAlloc>,
@@ -59,6 +69,8 @@ impl DescriptorTables {
 
         descriptor_tables.copy_current_gdt();
         descriptor_tables.copy_current_idt();
+
+        super::host_idt::patch_host_idt(&mut descriptor_tables.interrupt_descriptor_table);
 
         log::trace!("Initialized descriptor tables for host");
         Ok(())
@@ -116,5 +128,28 @@ impl DescriptorTables {
                 (pointer.limit + 1) as usize / core::mem::size_of::<u64>(),
             )
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn constructor_initializes_valid_empty_vectors() {
+        let tables = DescriptorTables::new();
+
+        assert!(tables.global_descriptor_table.is_empty());
+        assert!(tables.interrupt_descriptor_table.is_empty());
+
+        let gdtr_base = tables.gdtr.base;
+        let gdtr_limit = tables.gdtr.limit;
+        let idtr_base = tables.idtr.base;
+        let idtr_limit = tables.idtr.limit;
+
+        assert!(gdtr_base.is_null());
+        assert_eq!(gdtr_limit, 0);
+        assert!(idtr_base.is_null());
+        assert_eq!(idtr_limit, 0);
     }
 }

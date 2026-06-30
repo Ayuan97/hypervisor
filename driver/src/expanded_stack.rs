@@ -52,7 +52,9 @@ where
         KeExpandKernelStackAndCallout(Some(call_closure), &mut context as *mut _ as PVOID, 0x10000)
     };
 
-    context.status = status;
+    if status != STATUS_SUCCESS {
+        return status;
+    }
 
     context.status
 }

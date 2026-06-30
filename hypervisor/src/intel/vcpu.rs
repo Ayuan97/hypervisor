@@ -14,7 +14,7 @@ use {
         },
         utils::{
             capture::CONTEXT,
-            processor::{is_virtualized, set_virtualized},
+            processor::{clear_virtualized, is_virtualized, set_virtualized},
         },
     },
     alloc::boxed::Box,
@@ -74,7 +74,6 @@ impl Vcpu {
         if !is_virtualized() {
             // If we are here as Guest (non-root) then that will lead to undefined behavior (UB).
             log::trace!("Preparing for virtualization");
-            set_virtualized();
 
             self.vmx
                 .get_or_try_init(|| Vmx::new(shared_data, &context))?;
@@ -84,11 +83,14 @@ impl Vcpu {
                 None => return Err(HypervisorError::VmxNotInitialized),
             };
 
+            set_virtualized();
             log::info!("Virtualization complete for processor {}", self.index);
 
             vmx.run(self.index);
 
             // We should never reach this point as the VM should have been launched.
+            clear_virtualized();
+            return Err(HypervisorError::VMLAUNCHFailed);
         }
 
         Ok(())
@@ -117,6 +119,7 @@ impl Vcpu {
 
         // Attempt to devirtualize the processor using the VMXOFF instruction.
         support::vmxoff()?;
+        clear_virtualized();
         log::trace!("Processor {} has been devirtualized", self.index);
 
         Ok(())

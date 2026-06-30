@@ -61,7 +61,7 @@ impl Vmxon {
         vmxon_region.as_mut().revision_id.set_bit(31, false);
 
         // Enable VMX operation.
-        vmxon(vmxon_region_physical_address);
+        vmxon(vmxon_region_physical_address)?;
 
         log::debug!("VMXON setup successfully!");
 

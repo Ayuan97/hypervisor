@@ -53,9 +53,10 @@ impl PageTables {
 
         // Copy system PML4 entries to hypervisor PML4
         unsafe {
-            self.pml4.0.entries[256..].copy_from_slice(
-                core::slice::from_raw_parts((system_pml4_va as *const Entry).add(256), 256)
-            );
+            self.pml4.0.entries[256..].copy_from_slice(core::slice::from_raw_parts(
+                (system_pml4_va as *const Entry).add(256),
+                256,
+            ));
         }
 
         // Reserve the lower 255 entries for hypervisor use

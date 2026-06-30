@@ -3,6 +3,7 @@
 //! Credits to Matthias for their insightful assistance in the initial implementation using winapi, now adapted for wdk-sys:
 //! https://github.com/not-matthias/amd_hypervisor/blob/main/hypervisor/src/utils/processor.rs
 
+use core::sync::atomic::{AtomicU64, Ordering::Relaxed};
 use wdk_sys::NTSTATUS;
 use {
     core::mem::MaybeUninit,
@@ -23,7 +24,23 @@ extern "system" {
 }
 
 /// Atomic bitset used to track which processors have been virtualized.
-static VIRTUALIZED_BITSET: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+const VIRTUALIZED_WORDS: usize = 16;
+static VIRTUALIZED_BITSET: [AtomicU64; VIRTUALIZED_WORDS] =
+    [const { AtomicU64::new(0) }; VIRTUALIZED_WORDS];
+
+pub(crate) fn bit_location(index: u32) -> Option<(usize, u64)> {
+    let index = index as usize;
+    let word = index / 64;
+    if word >= VIRTUALIZED_WORDS {
+        return None;
+    }
+
+    Some((word, 1u64 << (index % 64)))
+}
+
+pub(crate) const fn processor_index_in_range(index: u32, count: u32) -> bool {
+    index < count
+}
 
 /// Determines if the current processor is already virtualized.
 ///
@@ -31,16 +48,29 @@ static VIRTUALIZED_BITSET: core::sync::atomic::AtomicU64 = core::sync::atomic::A
 ///
 /// `true` if the processor is virtualized, otherwise `false`.
 pub fn is_virtualized() -> bool {
-    let bit = 1 << current_processor_index();
+    let Some((word, bit)) = bit_location(current_processor_index()) else {
+        return false;
+    };
 
-    VIRTUALIZED_BITSET.load(core::sync::atomic::Ordering::Relaxed) & bit != 0
+    VIRTUALIZED_BITSET[word].load(Relaxed) & bit != 0
 }
 
 /// Marks the current processor as virtualized.
 pub fn set_virtualized() {
-    let bit = 1 << current_processor_index();
+    let Some((word, bit)) = bit_location(current_processor_index()) else {
+        return;
+    };
 
-    VIRTUALIZED_BITSET.fetch_or(bit, core::sync::atomic::Ordering::Relaxed);
+    VIRTUALIZED_BITSET[word].fetch_or(bit, Relaxed);
+}
+
+/// Marks the current processor as no longer virtualized.
+pub fn clear_virtualized() {
+    let Some((word, bit)) = bit_location(current_processor_index()) else {
+        return;
+    };
+
+    VIRTUALIZED_BITSET[word].fetch_and(!bit, Relaxed);
 }
 
 /// Returns the number of active logical processors in a specified group in a multiprocessor system or in the entire system.
@@ -89,7 +119,7 @@ impl ProcessorExecutor {
     ///
     /// An `Option` containing the `ProcessorExecutor` if the switch was successful, or `None` if not.
     pub fn switch_to_processor(i: u32) -> Option<Self> {
-        if i > processor_count() {
+        if !processor_index_in_range(i, processor_count()) {
             log::trace!("Invalid processor index: {}", i);
             return None;
         }
@@ -110,6 +140,9 @@ impl ProcessorExecutor {
 
         log::trace!("Yielding execution");
         if !NT_SUCCESS(unsafe { ZwYieldExecution() }) {
+            unsafe {
+                KeRevertToUserGroupAffinityThread(old_affinity.as_mut_ptr());
+            }
             return None;
         }
 
@@ -124,5 +157,27 @@ impl Drop for ProcessorExecutor {
         unsafe {
             KeRevertToUserGroupAffinityThread(self.old_affinity.as_mut_ptr());
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bit_location_spans_multiple_words() {
+        assert_eq!(bit_location(0), Some((0, 1)));
+        assert_eq!(bit_location(63), Some((0, 1u64 << 63)));
+        assert_eq!(bit_location(64), Some((1, 1)));
+        assert_eq!(bit_location(1023), Some((15, 1u64 << 63)));
+        assert_eq!(bit_location(1024), None);
+    }
+
+    #[test]
+    fn processor_index_equal_to_count_is_invalid() {
+        assert!(processor_index_in_range(0, 1));
+        assert!(processor_index_in_range(7, 8));
+        assert!(!processor_index_in_range(8, 8));
+        assert!(!processor_index_in_range(0, 0));
     }
 }

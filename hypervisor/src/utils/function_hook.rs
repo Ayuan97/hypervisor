@@ -10,8 +10,15 @@ use {
         BlockEncoder, BlockEncoderOptions, Decoder, DecoderOptions, FlowControl, InstructionBlock,
     },
     wdk_sys::{
-        ntddk::{IoAllocateMdl, IoFreeMdl, MmProbeAndLockPages, MmUnlockPages},
+        ntddk::{IoFreeMdl, MmUnlockPages},
         PMDL,
+    },
+};
+
+#[cfg(feature = "shellcode-hook")]
+use {
+    wdk_sys::{
+        ntddk::{IoAllocateMdl, MmProbeAndLockPages},
         _LOCK_OPERATION::IoReadAccess,
         _MODE::KernelMode,
     },
@@ -51,6 +58,7 @@ pub struct FunctionHook {
     hook_type: HookType,
 }
 
+#[cfg_attr(not(feature = "shellcode-hook"), allow(dead_code))]
 impl FunctionHook {
     /// Creates a new inline hook for a given function. It prepares the necessary trampoline and other components but doesn't enable the hook.
     ///
@@ -65,44 +73,57 @@ impl FunctionHook {
     /// ## Safety
     /// This function allocates memory and manipulates page table entries. Incorrect use may lead to system instability.
     pub fn new(original_address: u64, hook_address: u64, handler: *const ()) -> Option<Self> {
-        log::debug!("Setting up hooks");
-
-        let (hook_type, trampoline) = {
-            let trampoline =
-                Self::trampoline_shellcode(original_address, hook_address, BP_SHELLCODE_LEN)
-                    .map_err(|e| {
-                        log::warn!("Failed to create bp trampoline: {:?}", e);
-                        e
-                    })
-                    .ok()?;
-
-            (HookType::Breakpoint, trampoline)
-        };
-
-        // Allocate and lock the memory descriptor list for the page where the hook is installed.
-        // This ensures the memory doesn't get paged out and is accessible when needed.
-        let mdl = unsafe {
-            IoAllocateMdl(
-                original_address as _,
-                BASE_PAGE_SIZE as _,
-                false as _,
-                false as _,
-                0 as _,
-            )
-        };
-        if mdl.is_null() {
-            log::warn!("Failed to allocate mdl");
+        #[cfg(not(feature = "shellcode-hook"))]
+        {
+            log::warn!(
+                "Inline hook request for {:#x} ignored; enable the shellcode-hook feature",
+                original_address
+            );
+            let _ = (hook_address, handler);
             return None;
         }
-        unsafe { MmProbeAndLockPages(mdl, KernelMode as _, IoReadAccess) };
 
-        Some(Self {
-            trampoline,
-            hook_type,
-            hook_address,
-            mdl,
-            handler: handler as u64,
-        })
+        #[cfg(feature = "shellcode-hook")]
+        {
+            log::debug!("Setting up hooks");
+
+            let (hook_type, trampoline) = {
+                let trampoline =
+                    Self::trampoline_shellcode(original_address, hook_address, BP_SHELLCODE_LEN)
+                        .map_err(|e| {
+                            log::warn!("Failed to create bp trampoline: {:?}", e);
+                            e
+                        })
+                        .ok()?;
+
+                (HookType::Breakpoint, trampoline)
+            };
+
+            // Allocate and lock the memory descriptor list for the page where the hook is installed.
+            // This ensures the memory doesn't get paged out and is accessible when needed.
+            let mdl = unsafe {
+                IoAllocateMdl(
+                    original_address as _,
+                    BASE_PAGE_SIZE as _,
+                    false as _,
+                    false as _,
+                    0 as _,
+                )
+            };
+            if mdl.is_null() {
+                log::warn!("Failed to allocate mdl");
+                return None;
+            }
+            unsafe { MmProbeAndLockPages(mdl, KernelMode as _, IoReadAccess) };
+
+            Some(Self {
+                trampoline,
+                hook_type,
+                hook_address,
+                mdl,
+                handler: handler as u64,
+            })
+        }
     }
 
     /// Enables the hook by writing the jmp or breakpoint shellcode at the hook address.
@@ -329,5 +350,16 @@ impl Drop for FunctionHook {
                 IoFreeMdl(self.mdl);
             };
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[cfg(not(feature = "shellcode-hook"))]
+    #[test]
+    fn inline_hook_creation_is_disabled_without_shellcode_feature() {
+        assert!(FunctionHook::new(0x1000, 0x2000, core::ptr::null()).is_none());
     }
 }
