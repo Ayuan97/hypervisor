@@ -40,6 +40,19 @@ if exist "D:\hello\code\hypervisor\tools\cpuid_ping.exe" (
 
 echo.
 echo ============================================
-echo   Done. You can now start the game.
+echo   Hypervisor test session is active.
 echo ============================================
+echo.
+echo [!] Do NOT start anti-cheat protected games in this boot session.
+echo [!] The mapped hypervisor is not safely unloadable in-place.
+echo [!] Reboot before launching games or other protected software.
+echo.
+choice /C YN /N /M "Reboot now to restore normal game mode? [Y/N] "
+if errorlevel 2 (
+    echo.
+    echo [!] Leaving this machine in hypervisor test mode until reboot.
+    pause
+    exit /b 0
+)
+shutdown /r /t 0 /c "Rebooting to leave the hypervisor test session."
 pause
