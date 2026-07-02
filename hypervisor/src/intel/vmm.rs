@@ -18,6 +18,9 @@ use {
     core::mem::ManuallyDrop,
 };
 
+const NO_SKIP_CPU: u32 = u32::MAX;
+const SKIP_CPU_INDEX: u32 = parse_skip_cpu(option_env!("HV_SKIP_CPU"));
+
 #[derive(Default)]
 pub struct HypervisorBuilder {
     /// The primary extended page table.
@@ -121,6 +124,12 @@ impl Hypervisor {
         log::trace!("Virtualizing processors");
 
         for processor in self.processors.iter_mut() {
+            if cpu_virtualization_is_skipped(processor.id()) {
+                log::warn!("Skipping virtualization for processor {}", processor.id());
+                diag::boot_stage(330 + processor.id() as u64)?;
+                continue;
+            }
+
             diag::boot_stage(300 + processor.id() as u64)?;
             log::info!("hv stage 300 cpu={}", processor.id());
             let Some(executor) = ProcessorExecutor::switch_to_processor(processor.id()) else {
@@ -240,6 +249,39 @@ impl Hypervisor {
     }
 }
 
+const fn parse_skip_cpu(value: Option<&str>) -> u32 {
+    let Some(value) = value else {
+        return NO_SKIP_CPU;
+    };
+
+    let bytes = value.as_bytes();
+    if bytes.is_empty() {
+        return NO_SKIP_CPU;
+    }
+
+    let mut i = 0;
+    let mut parsed = 0u32;
+    while i < bytes.len() {
+        let byte = bytes[i];
+        if byte < b'0' || byte > b'9' {
+            return NO_SKIP_CPU;
+        }
+        parsed = parsed
+            .saturating_mul(10)
+            .saturating_add((byte - b'0') as u32);
+        i += 1;
+    }
+    parsed
+}
+
+fn cpu_virtualization_is_skipped(index: u32) -> bool {
+    cpu_virtualization_is_skipped_with_config(SKIP_CPU_INDEX, index)
+}
+
+fn cpu_virtualization_is_skipped_with_config(skip_cpu: u32, index: u32) -> bool {
+    skip_cpu != NO_SKIP_CPU && skip_cpu == index
+}
+
 fn drop_should_release_owned_resources(devirtualized: bool, cleanup_succeeded: bool) -> bool {
     devirtualized || cleanup_succeeded
 }
@@ -288,5 +330,20 @@ mod tests {
         assert!(drop_should_release_owned_resources(true, false));
         assert!(drop_should_release_owned_resources(false, true));
         assert!(!drop_should_release_owned_resources(false, false));
+    }
+
+    #[test]
+    fn skip_cpu_parser_accepts_decimal_only() {
+        assert_eq!(parse_skip_cpu(None), NO_SKIP_CPU);
+        assert_eq!(parse_skip_cpu(Some("")), NO_SKIP_CPU);
+        assert_eq!(parse_skip_cpu(Some("8")), 8);
+        assert_eq!(parse_skip_cpu(Some("8x")), NO_SKIP_CPU);
+    }
+
+    #[test]
+    fn skip_cpu_matches_only_selected_processor() {
+        assert!(!cpu_virtualization_is_skipped_with_config(NO_SKIP_CPU, 8));
+        assert!(cpu_virtualization_is_skipped_with_config(8, 8));
+        assert!(!cpu_virtualization_is_skipped_with_config(8, 7));
     }
 }

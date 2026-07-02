@@ -277,7 +277,8 @@ impl Vmcs {
         let requested_entry_ctl = requested_entry_controls();
         let exit_ctl = required_exit_controls();
         let requested_exit_ctl = requested_exit_controls();
-        const PINBASED_CTL: u64 = 0;
+        const PINBASED_CTL: u64 =
+            vmcs::control::PinbasedControls::NMI_EXITING.bits() as u64;
 
         let ctl_pin = adjust_vmx_controls(VmxControl::PinBased, PINBASED_CTL)?;
         let ctl_pri = adjust_vmx_controls(VmxControl::ProcessorBased, primary_ctl)?;

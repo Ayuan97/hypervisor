@@ -10,6 +10,7 @@ use {
         utils::capture::GuestRegisters,
     },
     bitfield::BitMut,
+    core::sync::atomic::{AtomicBool, AtomicU64, Ordering},
     x86::{
         cpuid::{cpuid, CpuIdResult},
         vmx::vmcs,
@@ -19,6 +20,9 @@ use {
 const CPUID_TSC_COMPENSATION_CYCLES: u64 = 600;
 const MAX_CPUID_TSC_COMPENSATION_CYCLES: u64 = 5_000_000;
 const ENABLE_DYNAMIC_CPUID_TSC_COMPENSATION: bool = false;
+static LEAF7_SUBLEAF0_LOW: AtomicU64 = AtomicU64::new(0);
+static LEAF7_SUBLEAF0_HIGH: AtomicU64 = AtomicU64::new(0);
+static LEAF7_SUBLEAF0_READY: AtomicBool = AtomicBool::new(false);
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 /// Enum representing the various CPUID leaves for feature and interface discovery.
@@ -107,14 +111,9 @@ pub fn handle_cpuid(guest_registers: &mut GuestRegisters, vmx: &mut Vmx) -> Exit
 
     let sub_leaf = guest_registers.rcx as u32;
 
-    // Execute CPUID instruction on the host and retrieve the result
-    let mut cpuid_result = cpuid!(leaf, sub_leaf);
+    let cpuid_result = guest_cpuid_result(leaf, sub_leaf, |leaf, sub_leaf| cpuid!(leaf, sub_leaf));
 
-    log::trace!("Before modification: CPUID Leaf: {:#x}, EAX: {:#x}, EBX: {:#x}, ECX: {:#x}, EDX: {:#x}", leaf, cpuid_result.eax, cpuid_result.ebx, cpuid_result.ecx, cpuid_result.edx);
-
-    mask_cpuid_result(leaf, sub_leaf, &mut cpuid_result);
-
-    log::trace!("After modification: CPUID Leaf: {:#x}, EAX: {:#x}, EBX: {:#x}, ECX: {:#x}, EDX: {:#x}", leaf, cpuid_result.eax, cpuid_result.ebx, cpuid_result.ecx, cpuid_result.edx);
+    log::trace!("CPUID result: Leaf: {:#x}, Subleaf: {:#x}, EAX: {:#x}, EBX: {:#x}, ECX: {:#x}, EDX: {:#x}", leaf, sub_leaf, cpuid_result.eax, cpuid_result.ebx, cpuid_result.ecx, cpuid_result.edx);
 
     // Update the guest registers
     guest_registers.rax = cpuid_result.eax as u64;
@@ -125,6 +124,81 @@ pub fn handle_cpuid(guest_registers: &mut GuestRegisters, vmx: &mut Vmx) -> Exit
     log::trace!("CPUID VMEXIT handled successfully!");
 
     ExitType::IncrementRIP
+}
+
+fn guest_cpuid_result(
+    leaf: u32,
+    sub_leaf: u32,
+    mut host_cpuid: impl FnMut(u32, u32) -> CpuIdResult,
+) -> CpuIdResult {
+    if cpuid_leaf_is_zeroed_without_host(leaf) {
+        return zero_cpuid_result();
+    }
+
+    if leaf == CpuidLeaf::ExtendedFeatureInformation as u32 && sub_leaf == 0 {
+        return cached_leaf7_subleaf0(&mut host_cpuid);
+    }
+
+    let mut cpuid_result = host_cpuid(leaf, sub_leaf);
+    mask_cpuid_result(leaf, sub_leaf, &mut cpuid_result);
+    cpuid_result
+}
+
+fn cached_leaf7_subleaf0(host_cpuid: &mut impl FnMut(u32, u32) -> CpuIdResult) -> CpuIdResult {
+    if LEAF7_SUBLEAF0_READY.load(Ordering::Acquire) {
+        return unpack_cpuid_result(
+            LEAF7_SUBLEAF0_LOW.load(Ordering::Relaxed),
+            LEAF7_SUBLEAF0_HIGH.load(Ordering::Relaxed),
+        );
+    }
+
+    let mut cpuid_result = host_cpuid(CpuidLeaf::ExtendedFeatureInformation as u32, 0);
+    mask_cpuid_result(
+        CpuidLeaf::ExtendedFeatureInformation as u32,
+        0,
+        &mut cpuid_result,
+    );
+    let (low, high) = pack_cpuid_result(cpuid_result);
+    LEAF7_SUBLEAF0_LOW.store(low, Ordering::Relaxed);
+    LEAF7_SUBLEAF0_HIGH.store(high, Ordering::Relaxed);
+    LEAF7_SUBLEAF0_READY.store(true, Ordering::Release);
+    cpuid_result
+}
+
+fn cpuid_leaf_is_zeroed_without_host(leaf: u32) -> bool {
+    matches!(leaf, 0x4000_0000..=0x4000_00ff) || leaf == CpuidLeaf::SgxCapabilities as u32
+}
+
+const fn zero_cpuid_result() -> CpuIdResult {
+    CpuIdResult {
+        eax: 0,
+        ebx: 0,
+        ecx: 0,
+        edx: 0,
+    }
+}
+
+const fn pack_cpuid_result(result: CpuIdResult) -> (u64, u64) {
+    (
+        result.eax as u64 | ((result.ebx as u64) << 32),
+        result.ecx as u64 | ((result.edx as u64) << 32),
+    )
+}
+
+const fn unpack_cpuid_result(low: u64, high: u64) -> CpuIdResult {
+    CpuIdResult {
+        eax: low as u32,
+        ebx: (low >> 32) as u32,
+        ecx: high as u32,
+        edx: (high >> 32) as u32,
+    }
+}
+
+#[cfg(test)]
+fn reset_cpuid_cache_for_test() {
+    LEAF7_SUBLEAF0_LOW.store(0, Ordering::Relaxed);
+    LEAF7_SUBLEAF0_HIGH.store(0, Ordering::Relaxed);
+    LEAF7_SUBLEAF0_READY.store(false, Ordering::Relaxed);
 }
 
 fn mask_cpuid_result(leaf: u32, sub_leaf: u32, cpuid_result: &mut CpuIdResult) {
@@ -354,5 +428,44 @@ mod tests {
     #[test]
     fn dynamic_cpuid_tsc_compensation_is_disabled_by_default() {
         assert!(!ENABLE_DYNAMIC_CPUID_TSC_COMPENSATION);
+    }
+
+    #[test]
+    fn hidden_hypervisor_leaf_bypasses_host_cpuid() {
+        let result = guest_cpuid_result(CPUID_COMM_LEAF, 0, |_, _| {
+            panic!("hidden leaf must not execute host cpuid")
+        });
+
+        assert_eq!(result.eax, 0);
+        assert_eq!(result.ebx, 0);
+        assert_eq!(result.ecx, 0);
+        assert_eq!(result.edx, 0);
+    }
+
+    #[test]
+    fn leaf7_subleaf0_uses_masked_cache() {
+        use core::cell::Cell;
+
+        reset_cpuid_cache_for_test();
+        let calls = Cell::new(0);
+        let host = |_, _| {
+            calls.set(calls.get() + 1);
+            CpuIdResult {
+                eax: 0x1234,
+                ebx: (1 << 2) | (1 << 25) | 0x40,
+                ecx: (1 << 5) | (1 << 30) | 0x80,
+                edx: 0x55aa,
+            }
+        };
+
+        let first = guest_cpuid_result(CpuidLeaf::ExtendedFeatureInformation as u32, 0, host);
+        let second = guest_cpuid_result(CpuidLeaf::ExtendedFeatureInformation as u32, 0, host);
+
+        assert_eq!(calls.get(), 1);
+        assert_eq!(first, second);
+        assert_eq!(first.ebx & (1 << 2), 0);
+        assert_eq!(first.ebx & (1 << 25), 0);
+        assert_eq!(first.ecx & (1 << 5), 0);
+        assert_eq!(first.ecx & (1 << 30), 0);
     }
 }

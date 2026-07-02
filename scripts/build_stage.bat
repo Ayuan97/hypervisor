@@ -15,11 +15,13 @@ if %errorlevel% neq 0 (
 
 set "STAGE=%~1"
 set "HV_BOOT_STOP_STAGE=%STAGE%"
+set "HV_USER_CLIENT_READS=0"
 set "DRIVER_PATH=%~dp0..\target\release\matrix_stage_%STAGE%.sys"
 set "DLL_PATH=%~dp0..\target\release\matrix.dll"
 
 echo [*] Building stage-gated driver, stop stage %HV_BOOT_STOP_STAGE%...
 cd /d "%~dp0.."
+cargo clean -p matrix -p hypervisor >nul 2>&1
 cargo build -p matrix --release
 if %errorlevel% neq 0 (
     echo [-] Build failed.

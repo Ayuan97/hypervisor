@@ -26,33 +26,120 @@ const CMD_GET_GUEST_CR3: u64 = 0x13;
 const CMD_GET_COUNTER: u64 = 0x14;
 const CMD_GET_CTL: u64 = 0x15;
 const CMD_SEAL_DIAGNOSTICS: u64 = 0x16;
+const CMD_ARM_CLIENT_READS: u64 = 0x17;
+const CMD_READ_PHYS_RESULT: u64 = 0x18;
+const CMD_GET_BREADCRUMB: u64 = 0x19;
+const CMD_GET_CLIENT_READ_STATE: u64 = 0x1A;
+const CMD_READ_VIRT: u64 = 0x1B;
+const CMD_READ_RESULT_INFO: u64 = 0x1C;
+const CMD_READ_RESULT_WORD: u64 = 0x1D;
+const CMD_RELEASE_READ_RESULT: u64 = 0x1E;
 const CMD_CLOAK_PAGE: u64 = 0x20;
 pub const CMD_DEVIRTUALIZE: u64 = 0xFF;
+const CLIENT_READ_ARM_TOKEN: u64 = 0xC17E_A2D5_90B4_6F31;
+
+const USER_CLIENT_READS_ENABLED: bool =
+    user_client_read_flag_enabled(option_env!("HV_USER_CLIENT_READS"));
 
 fn cs_selector_is_ring0(selector: u64) -> bool {
     selector & 0x3 == 0
 }
 
-fn command_requires_ring0(cmd: u64, arg1: u64) -> bool {
+const fn user_client_read_flag_enabled(value: Option<&str>) -> bool {
+    let Some(value) = value else {
+        return false;
+    };
+    let bytes = value.as_bytes();
+    bytes.len() == 1 && bytes[0] == b'1'
+}
+
+fn user_client_reads_are_enabled() -> bool {
+    USER_CLIENT_READS_ENABLED
+}
+
+fn user_client_reads_are_armed() -> bool {
+    crate::intel::diag::client_reads_armed()
+}
+
+fn user_client_read_command(cmd: u64) -> bool {
     matches!(
         cmd,
         CMD_READ_PHYS
-            | CMD_WRITE_PHYS
-            | CMD_TRANSLATE_VA
+            | CMD_READ_PHYS_RESULT
             | CMD_GET_GUEST_CR3
-            | CMD_CLOAK_PAGE
-            | CMD_DEVIRTUALIZE
-    ) || (cmd == CMD_GET_CTL && matches!(arg1, 5 | 7))
+            | CMD_READ_VIRT
+            | CMD_READ_RESULT_INFO
+            | CMD_READ_RESULT_WORD
+            | CMD_RELEASE_READ_RESULT
+    )
 }
 
-fn diagnostic_command_allowed(cmd: u64, _arg1: u64, sealed: bool) -> bool {
-    !sealed || matches!(cmd, CMD_SEAL_DIAGNOSTICS | CMD_DEVIRTUALIZE)
+fn client_read_arm_token_is_valid(token: u64) -> bool {
+    token == CLIENT_READ_ARM_TOKEN
+}
+
+fn command_requires_ring0(cmd: u64, arg1: u64) -> bool {
+    command_requires_ring0_with_client_read_state(
+        cmd,
+        arg1,
+        user_client_reads_are_enabled(),
+        user_client_reads_are_armed(),
+    )
+}
+
+fn command_requires_ring0_with_client_read_state(
+    cmd: u64,
+    arg1: u64,
+    user_client_reads_enabled: bool,
+    user_client_reads_armed: bool,
+) -> bool {
+    (user_client_read_command(cmd) && !(user_client_reads_enabled && user_client_reads_armed))
+        || matches!(
+            cmd,
+            CMD_WRITE_PHYS | CMD_TRANSLATE_VA | CMD_CLOAK_PAGE | CMD_DEVIRTUALIZE
+        )
+        || (cmd == CMD_GET_CTL && matches!(arg1, 5 | 7))
+}
+
+fn diagnostic_command_allowed(cmd: u64, arg1: u64, sealed: bool) -> bool {
+    diagnostic_command_allowed_with_client_read_state(
+        cmd,
+        arg1,
+        sealed,
+        user_client_reads_are_enabled(),
+        user_client_reads_are_armed(),
+    )
+}
+
+fn diagnostic_command_allowed_with_client_read_state(
+    cmd: u64,
+    arg1: u64,
+    sealed: bool,
+    user_client_reads_enabled: bool,
+    user_client_reads_armed: bool,
+) -> bool {
+    !sealed
+        || matches!(cmd, CMD_SEAL_DIAGNOSTICS | CMD_DEVIRTUALIZE)
+        || (user_client_reads_enabled
+            && cmd == CMD_ARM_CLIENT_READS
+            && client_read_arm_token_is_valid(arg1))
+        || (user_client_reads_enabled
+            && user_client_reads_armed
+            && (matches!(cmd, CMD_PING) || user_client_read_command(cmd)))
 }
 
 fn command_exit_type(cmd: u64) -> ExitType {
     match cmd {
         CMD_DEVIRTUALIZE => ExitType::ExitHypervisor,
         _ => ExitType::IncrementRIP,
+    }
+}
+
+fn arm_client_reads_result(user_client_reads_enabled: bool, worker_started: bool) -> u64 {
+    if user_client_reads_enabled && worker_started {
+        0
+    } else {
+        STATUS_UNSUPPORTED_COMMAND
     }
 }
 
@@ -102,6 +189,7 @@ pub fn dispatch_command(guest_registers: &mut GuestRegisters, vmx: &mut Vmx) -> 
     let cmd = guest_registers.rcx;
     let arg1 = guest_registers.rdx;
     let arg2 = guest_registers.r8;
+    let arg3 = guest_registers.r9;
 
     if !diagnostic_command_allowed(cmd, arg1, crate::intel::diag::diagnostics_sealed()) {
         guest_registers.rax = STATUS_ACCESS_DENIED;
@@ -132,7 +220,35 @@ pub fn dispatch_command(guest_registers: &mut GuestRegisters, vmx: &mut Vmx) -> 
         CMD_READ_PHYS => {
             let pa = arg1;
             let size = arg2 as usize;
-            guest_registers.rax = read_phys_sized(pa, size).unwrap_or(0);
+            guest_registers.rax =
+                if user_client_reads_are_enabled() && user_client_reads_are_armed() {
+                    crate::intel::client_read::submit_physical_read(pa, size)
+                } else {
+                    read_phys_sized(pa, size).unwrap_or(0)
+                };
+            ExitType::IncrementRIP
+        }
+        CMD_READ_PHYS_RESULT => {
+            guest_registers.rax = crate::intel::client_read::poll_physical_read(arg1);
+            ExitType::IncrementRIP
+        }
+        CMD_READ_RESULT_INFO => {
+            guest_registers.rax = crate::intel::client_read::poll_read_info(arg1);
+            ExitType::IncrementRIP
+        }
+        CMD_READ_RESULT_WORD => {
+            guest_registers.rax = crate::intel::client_read::read_result_word(arg1, arg2);
+            ExitType::IncrementRIP
+        }
+        CMD_RELEASE_READ_RESULT => {
+            guest_registers.rax = crate::intel::client_read::release_read_result(arg1);
+            ExitType::IncrementRIP
+        }
+        CMD_READ_VIRT => {
+            let cr3 = arg1;
+            let va = arg2;
+            let size = arg3 as usize;
+            guest_registers.rax = crate::intel::client_read::submit_virtual_read(cr3, va, size);
             ExitType::IncrementRIP
         }
         CMD_WRITE_PHYS => {
@@ -168,9 +284,28 @@ pub fn dispatch_command(guest_registers: &mut GuestRegisters, vmx: &mut Vmx) -> 
             guest_registers.rax = crate::intel::diag::control(arg1);
             ExitType::IncrementRIP
         }
+        CMD_GET_BREADCRUMB => {
+            guest_registers.rax = crate::intel::diag::breadcrumb(arg1, arg2);
+            ExitType::IncrementRIP
+        }
+        CMD_GET_CLIENT_READ_STATE => {
+            guest_registers.rax = crate::intel::client_read::debug_state(arg1);
+            ExitType::IncrementRIP
+        }
         CMD_SEAL_DIAGNOSTICS => {
             crate::intel::diag::seal_diagnostics();
             guest_registers.rax = 0;
+            ExitType::IncrementRIP
+        }
+        CMD_ARM_CLIENT_READS => {
+            let arm_result = arm_client_reads_result(
+                user_client_reads_are_enabled(),
+                crate::intel::client_read::worker_started(),
+            );
+            if arm_result == 0 {
+                crate::intel::diag::arm_client_reads();
+            }
+            guest_registers.rax = arm_result;
             ExitType::IncrementRIP
         }
         CMD_CLOAK_PAGE => {
@@ -303,18 +438,100 @@ mod tests {
     }
 
     #[test]
+    fn user_client_reads_are_disabled_by_default() {
+        assert!(!user_client_reads_are_enabled());
+    }
+
+    #[test]
+    fn user_client_read_flag_accepts_only_one() {
+        assert!(user_client_read_flag_enabled(Some("1")));
+        assert!(!user_client_read_flag_enabled(None));
+        assert!(!user_client_read_flag_enabled(Some("")));
+        assert!(!user_client_read_flag_enabled(Some("0")));
+        assert!(!user_client_read_flag_enabled(Some("true")));
+    }
+
+    #[test]
     fn dangerous_commands_require_ring0() {
         assert!(!command_requires_ring0(CMD_PING, 0));
         assert!(!command_requires_ring0(CMD_GET_COUNTER, 0));
         assert!(!command_requires_ring0(CMD_GET_CTL, 0));
         assert!(command_requires_ring0(CMD_GET_GUEST_CR3, 0));
+        assert!(command_requires_ring0(CMD_READ_PHYS, 0));
+        assert!(command_requires_ring0(CMD_TRANSLATE_VA, 0));
         assert!(command_requires_ring0(CMD_GET_CTL, 5));
         assert!(command_requires_ring0(CMD_GET_CTL, 7));
-        assert!(command_requires_ring0(CMD_READ_PHYS, 0));
         assert!(command_requires_ring0(CMD_WRITE_PHYS, 0));
-        assert!(command_requires_ring0(CMD_TRANSLATE_VA, 0));
         assert!(command_requires_ring0(CMD_CLOAK_PAGE, 0));
         assert!(command_requires_ring0(CMD_DEVIRTUALIZE, 0));
+    }
+
+    #[test]
+    fn client_read_build_allows_user_read_commands_only() {
+        assert!(!command_requires_ring0_with_client_read_state(
+            CMD_READ_PHYS,
+            0,
+            true,
+            true
+        ));
+        assert!(!command_requires_ring0_with_client_read_state(
+            CMD_READ_PHYS_RESULT,
+            0,
+            true,
+            true
+        ));
+        assert!(!command_requires_ring0_with_client_read_state(
+            CMD_READ_VIRT,
+            0,
+            true,
+            true
+        ));
+        assert!(command_requires_ring0_with_client_read_state(
+            CMD_TRANSLATE_VA,
+            0,
+            true,
+            true
+        ));
+        assert!(!command_requires_ring0_with_client_read_state(
+            CMD_GET_GUEST_CR3,
+            0,
+            true,
+            true
+        ));
+        assert!(command_requires_ring0_with_client_read_state(
+            CMD_WRITE_PHYS,
+            0,
+            true,
+            true
+        ));
+        assert!(command_requires_ring0_with_client_read_state(
+            CMD_CLOAK_PAGE,
+            0,
+            true,
+            true
+        ));
+        assert!(command_requires_ring0_with_client_read_state(
+            CMD_DEVIRTUALIZE,
+            0,
+            true,
+            true
+        ));
+    }
+
+    #[test]
+    fn client_read_build_requires_runtime_arm() {
+        assert!(command_requires_ring0_with_client_read_state(
+            CMD_READ_PHYS,
+            0,
+            true,
+            false
+        ));
+        assert!(!command_requires_ring0_with_client_read_state(
+            CMD_READ_PHYS,
+            0,
+            true,
+            true
+        ));
     }
 
     #[test]
@@ -344,6 +561,9 @@ mod tests {
     #[test]
     fn sealed_diagnostics_deny_user_visible_ping_magic() {
         assert!(!diagnostic_command_allowed(CMD_PING, 0, true));
+        assert!(!diagnostic_command_allowed(CMD_GET_GUEST_CR3, 0, true));
+        assert!(!diagnostic_command_allowed(CMD_READ_PHYS, 0, true));
+        assert!(!diagnostic_command_allowed(CMD_TRANSLATE_VA, 0, true));
         assert!(diagnostic_command_allowed(CMD_SEAL_DIAGNOSTICS, 0, true));
         assert!(diagnostic_command_allowed(CMD_DEVIRTUALIZE, 0, true));
         assert!(!diagnostic_command_allowed(CMD_GET_COUNTER, 0, true));
@@ -352,6 +572,134 @@ mod tests {
 
         assert!(diagnostic_command_allowed(CMD_GET_COUNTER, 0, false));
         assert!(diagnostic_command_allowed(CMD_GET_CTL, 1, false));
+    }
+
+    #[test]
+    fn breadcrumb_command_is_diagnostic_only() {
+        assert!(diagnostic_command_allowed(CMD_GET_BREADCRUMB, 0, false));
+        assert!(!diagnostic_command_allowed(CMD_GET_BREADCRUMB, 0, true));
+        assert!(!command_requires_ring0(CMD_GET_BREADCRUMB, 0));
+    }
+
+    #[test]
+    fn client_read_state_command_is_diagnostic_only() {
+        assert!(diagnostic_command_allowed(
+            CMD_GET_CLIENT_READ_STATE,
+            0,
+            false
+        ));
+        assert!(!diagnostic_command_allowed(
+            CMD_GET_CLIENT_READ_STATE,
+            0,
+            true
+        ));
+        assert!(!command_requires_ring0(CMD_GET_CLIENT_READ_STATE, 0));
+    }
+
+    #[test]
+    fn arm_client_reads_requires_worker_started() {
+        assert_eq!(arm_client_reads_result(true, true), 0);
+        assert_eq!(
+            arm_client_reads_result(true, false),
+            STATUS_UNSUPPORTED_COMMAND
+        );
+        assert_eq!(
+            arm_client_reads_result(false, true),
+            STATUS_UNSUPPORTED_COMMAND
+        );
+    }
+
+    #[test]
+    fn sealed_client_read_build_keeps_user_client_channel_available() {
+        assert!(diagnostic_command_allowed_with_client_read_state(
+            CMD_PING, 0, true, true, true
+        ));
+        assert!(diagnostic_command_allowed_with_client_read_state(
+            CMD_GET_GUEST_CR3,
+            0,
+            true,
+            true,
+            true
+        ));
+        assert!(diagnostic_command_allowed_with_client_read_state(
+            CMD_READ_PHYS,
+            0,
+            true,
+            true,
+            true
+        ));
+        assert!(diagnostic_command_allowed_with_client_read_state(
+            CMD_READ_PHYS_RESULT,
+            0,
+            true,
+            true,
+            true
+        ));
+        assert!(diagnostic_command_allowed_with_client_read_state(
+            CMD_READ_VIRT,
+            0,
+            true,
+            true,
+            true
+        ));
+        assert!(!diagnostic_command_allowed_with_client_read_state(
+            CMD_TRANSLATE_VA,
+            0,
+            true,
+            true,
+            true
+        ));
+        assert!(!diagnostic_command_allowed_with_client_read_state(
+            CMD_GET_COUNTER,
+            0,
+            true,
+            true,
+            true
+        ));
+        assert!(!diagnostic_command_allowed_with_client_read_state(
+            CMD_GET_CTL,
+            1,
+            true,
+            true,
+            true
+        ));
+    }
+
+    #[test]
+    fn sealed_client_read_build_matches_stable_until_armed() {
+        assert!(!diagnostic_command_allowed_with_client_read_state(
+            CMD_ARM_CLIENT_READS,
+            0,
+            true,
+            true,
+            false
+        ));
+        assert!(!diagnostic_command_allowed_with_client_read_state(
+            CMD_PING, 0, true, true, false
+        ));
+        assert!(diagnostic_command_allowed_with_client_read_state(
+            CMD_PING, 0, true, true, true
+        ));
+        assert!(diagnostic_command_allowed_with_client_read_state(
+            CMD_READ_PHYS,
+            0,
+            true,
+            true,
+            true
+        ));
+    }
+
+    #[test]
+    fn sealed_client_read_build_allows_tokened_arm_after_startup() {
+        const TEST_ARM_TOKEN: u64 = 0xC17E_A2D5_90B4_6F31;
+
+        assert!(diagnostic_command_allowed_with_client_read_state(
+            CMD_ARM_CLIENT_READS,
+            TEST_ARM_TOKEN,
+            true,
+            true,
+            false
+        ));
     }
 
     #[test]

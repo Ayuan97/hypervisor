@@ -114,6 +114,7 @@ unsafe fn register_driver_unload(driver_object: PDRIVER_OBJECT) {
 }
 
 unsafe extern "C" fn driver_unload(_driver_object: PDRIVER_OBJECT) {
+    hypervisor::intel::client_read::stop_worker();
     let hv = HYPERVISOR.swap(null_mut(), Ordering::AcqRel);
     if !hv.is_null() && hv != hypervisor_initializing() {
         let mut hv_box = Box::from_raw(hv);
@@ -323,6 +324,19 @@ fn virtualize_system_claimed() -> NTSTATUS {
             }
             return status;
         }
+    }
+
+    if !hypervisor::intel::client_read::start_worker_if_enabled() {
+        log::error!("Failed to start client read worker");
+        if let Err(error) = hv.devirtualize_system() {
+            log::error!(
+                "Failed to cleanup after client read worker failure: {}",
+                error
+            );
+            let hv = Box::new(hv);
+            HYPERVISOR.store(Box::into_raw(hv), Ordering::Release);
+        }
+        return 0xE0053600u32 as NTSTATUS;
     }
 
     let hv = Box::new(hv);

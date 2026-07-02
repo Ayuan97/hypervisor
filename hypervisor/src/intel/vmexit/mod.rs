@@ -92,6 +92,23 @@ impl VmExit {
         guest_registers.rflags = vmread_checked(guest::RFLAGS)?;
 
         let exit_reason = vmread_checked(ro::EXIT_REASON)? as u32;
+        let guest_cr3 = vmread_checked(guest::CR3).unwrap_or(0);
+        let exit_qualification = vmread_checked(ro::EXIT_QUALIFICATION).unwrap_or(0);
+        let breadcrumb_detail = vmexit_breadcrumb_detail(exit_reason, guest_registers);
+        if vmexit_should_record_breadcrumb(exit_reason, guest_registers) {
+            diag::record_current_vmexit(
+                exit_reason as u64,
+                guest_registers.rip,
+                guest_registers.rsp,
+                guest_cr3,
+                guest_registers.rflags,
+                exit_qualification,
+                guest_registers.rax,
+                guest_registers.rcx,
+                guest_registers.rdx,
+                breadcrumb_detail,
+            );
+        }
 
         let Some(basic_exit_reason) = decode_basic_exit_reason(exit_reason) else {
             log::error!("Unknown exit reason: {:#x}", exit_reason);
@@ -306,6 +323,29 @@ fn decode_basic_exit_reason(raw_exit_reason: u32) -> Option<VmxBasicExitReason> 
     VmxBasicExitReason::from_u32(raw_exit_reason & 0xffff)
 }
 
+fn vmexit_should_record_breadcrumb(exit_reason: u32, guest_registers: &GuestRegisters) -> bool {
+    !(decode_basic_exit_reason(exit_reason) == Some(VmxBasicExitReason::Cpuid)
+        && guest_registers.rax as u32 == vmcall::CPUID_COMM_LEAF
+        && guest_registers.r10 == vmcall::VMCALL_MAGIC
+        && guest_registers.r11 == vmcall::VMCALL_MAGIC)
+}
+
+fn vmexit_breadcrumb_detail(exit_reason: u32, guest_registers: &GuestRegisters) -> u64 {
+    match decode_basic_exit_reason(exit_reason) {
+        Some(VmxBasicExitReason::Cpuid) => {
+            ((guest_registers.rcx as u32 as u64) << 32) | guest_registers.rax as u32 as u64
+        }
+        Some(VmxBasicExitReason::Rdmsr) | Some(VmxBasicExitReason::Wrmsr) => guest_registers.rcx,
+        Some(VmxBasicExitReason::ExceptionOrNmi) => {
+            vmread_checked(ro::VMEXIT_INTERRUPTION_INFO).unwrap_or(0)
+        }
+        Some(VmxBasicExitReason::EptViolation) | Some(VmxBasicExitReason::EptMisconfiguration) => {
+            vmread_checked(ro::GUEST_PHYSICAL_ADDR_FULL).unwrap_or(0)
+        }
+        _ => 0,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -343,6 +383,48 @@ mod tests {
         assert_eq!(
             decode_basic_exit_reason(raw),
             Some(VmxBasicExitReason::Cpuid)
+        );
+    }
+
+    #[test]
+    fn breadcrumb_skips_authenticated_diagnostic_cpuid() {
+        let mut regs = GuestRegisters::default();
+        regs.rax = super::vmcall::CPUID_COMM_LEAF as u64;
+        regs.r10 = super::vmcall::VMCALL_MAGIC;
+        regs.r11 = super::vmcall::VMCALL_MAGIC;
+
+        assert!(!vmexit_should_record_breadcrumb(
+            VmxBasicExitReason::Cpuid as u32,
+            &regs
+        ));
+
+        regs.r10 = 0;
+        assert!(vmexit_should_record_breadcrumb(
+            VmxBasicExitReason::Cpuid as u32,
+            &regs
+        ));
+    }
+
+    #[test]
+    fn cpuid_breadcrumb_detail_packs_leaf_and_subleaf() {
+        let mut regs = GuestRegisters::default();
+        regs.rax = 0x12;
+        regs.rcx = 0x34;
+
+        assert_eq!(
+            vmexit_breadcrumb_detail(VmxBasicExitReason::Cpuid as u32, &regs),
+            0x34_0000_0012
+        );
+    }
+
+    #[test]
+    fn msr_breadcrumb_detail_records_msr_index() {
+        let mut regs = GuestRegisters::default();
+        regs.rcx = 0x570;
+
+        assert_eq!(
+            vmexit_breadcrumb_detail(VmxBasicExitReason::Rdmsr as u32, &regs),
+            0x570
         );
     }
 }

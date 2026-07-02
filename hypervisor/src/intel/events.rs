@@ -107,6 +107,16 @@ impl EventInjection {
         event.0
     }
 
+    fn machine_check() -> u32 {
+        let mut event = EventInjection(0);
+
+        event.set_vector(ExceptionInterrupt::MachineCheck as u32);
+        event.set_type(InterruptionType::HardwareException as u32);
+        event.set_valid(VALID);
+
+        event.0
+    }
+
     /// Injects a general protection fault into the guest.
     ///
     /// This function is used to signal to the guest that a protection violation
@@ -176,6 +186,13 @@ impl EventInjection {
         write_vm_entry_field(vmcs::control::VMENTRY_INTERRUPTION_INFO_FIELD, event.0);
     }
 
+    pub fn vmentry_inject_machine_check() {
+        write_vm_entry_field(
+            vmcs::control::VMENTRY_INTERRUPTION_INFO_FIELD,
+            EventInjection::machine_check(),
+        );
+    }
+
     /// Re-injects an event using the raw VM-exit interruption info and error code.
     pub fn vmentry_reinject(interruption_info: u32, error_code: u32) {
         if (interruption_info & (1 << 11)) != 0 {
@@ -206,6 +223,19 @@ mod tests {
             InterruptionType::SoftwareException as u32,
             "#BP from INT3 should be injected as a software exception"
         );
+        assert_ne!(event & (1 << 31), 0, "event must be valid");
+    }
+
+    #[test]
+    fn machine_check_injection_uses_hardware_exception_without_error_code() {
+        let event = EventInjection::machine_check();
+
+        assert_eq!(event & 0xff, ExceptionInterrupt::MachineCheck as u32);
+        assert_eq!(
+            (event >> 8) & 0x7,
+            InterruptionType::HardwareException as u32
+        );
+        assert_eq!(event & (1 << 11), 0, "#MC must not deliver an error code");
         assert_ne!(event & (1 << 31), 0, "event must be valid");
     }
 }

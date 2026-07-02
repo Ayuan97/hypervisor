@@ -2,7 +2,11 @@
 setlocal EnableExtensions EnableDelayedExpansion
 set ROOT=%~dp0..
 set KDMAPPER=D:\hello\code\kdmapper\x64\Release\kdmapper_Release.exe
-set DRIVER=%ROOT%\target\release\matrix.sys
+if "%HV_DRIVER%"=="" (
+    set "DRIVER=%ROOT%\target\release\matrix.sys"
+) else (
+    set "DRIVER=%HV_DRIVER%"
+)
 set PING=%ROOT%\tools\cpuid_ping.exe
 set PROBE=%ROOT%\tools\probe_test.exe
 

@@ -2,11 +2,12 @@
 setlocal
 
 set "HV_BOOT_STOP_STAGE="
-set "HV_USER_CLIENT_READS=0"
-set "DRIVER_PATH=%~dp0..\target\release\matrix.sys"
+set "HV_USER_CLIENT_READS=1"
+set "DRIVER_PATH=%~dp0..\target\release\matrix_client.sys"
 set "DLL_PATH=%~dp0..\target\release\matrix.dll"
 
-echo [*] Building release driver...
+echo [*] Building client-read driver...
+echo [*] Build flags: HV_USER_CLIENT_READS=%HV_USER_CLIENT_READS%
 cd /d "%~dp0.."
 cargo clean -p matrix -p hypervisor >nul 2>&1
 cargo build -p matrix --release
@@ -29,4 +30,4 @@ if %errorlevel% neq 0 (
     exit /b 1
 )
 
-echo [+] Release driver ready: %DRIVER_PATH%
+echo [+] Client-read driver ready: %DRIVER_PATH%

@@ -71,6 +71,11 @@ impl DescriptorTables {
         descriptor_tables.copy_current_idt();
 
         super::host_idt::patch_host_idt(&mut descriptor_tables.interrupt_descriptor_table);
+        super::host_idt::record_host_idt_descriptor(
+            &descriptor_tables.interrupt_descriptor_table,
+            descriptor_tables.idtr.base as u64,
+            descriptor_tables.idtr.limit as u64,
+        );
 
         log::trace!("Initialized descriptor tables for host");
         Ok(())
