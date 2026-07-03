@@ -255,6 +255,15 @@ pub fn read_result_word(seq: u64, offset: u64) -> u64 {
     read_result_word_unchecked(offset)
 }
 
+pub fn read_result_quad(seq: u64, offset: u64) -> [u64; 4] {
+    [
+        read_result_word(seq, offset),
+        read_result_word(seq, offset.saturating_add(8)),
+        read_result_word(seq, offset.saturating_add(16)),
+        read_result_word(seq, offset.saturating_add(24)),
+    ]
+}
+
 pub fn release_read_result(seq: u64) -> u64 {
     if REQUEST_SEQ.load(Ordering::Acquire) != seq || DONE_SEQ.load(Ordering::Acquire) != seq {
         return STATUS_FAILED;
@@ -713,6 +722,34 @@ mod tests {
         let next = submit_virtual_read(0x1234_5000, 0x7ff6_1234_5688, 8);
         assert_ne!(next, 0);
         assert_ne!(next, seq);
+    }
+
+    #[test]
+    fn bulk_result_quad_returns_four_words_without_releasing_slot() {
+        let _guard = test_lock();
+        reset_for_test();
+
+        let seq = submit_virtual_read(0x1234_5000, 0x7ff6_1234_5678, 32);
+        assert_ne!(seq, 0);
+
+        let bytes = [
+            1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24,
+            25, 26, 27, 28, 29, 30, 31, 32,
+        ];
+        complete_bytes_for_test(seq, &bytes, true);
+
+        assert_eq!(poll_read_info(seq), 32);
+        assert_eq!(
+            read_result_quad(seq, 0),
+            [
+                0x0807_0605_0403_0201,
+                0x100f_0e0d_0c0b_0a09,
+                0x1817_1615_1413_1211,
+                0x201f_1e1d_1c1b_1a19,
+            ]
+        );
+        assert_eq!(submit_virtual_read(0x1234_5000, 0x7ff6_1234_5688, 8), 0);
+        assert_eq!(release_read_result(seq), 0);
     }
 
     #[test]

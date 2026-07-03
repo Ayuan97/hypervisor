@@ -602,6 +602,7 @@ fn pt_vmx_concealment_mask_from_env(mask: Option<&str>, legacy_enable: Option<&s
     }
 
     match mask {
+        Some("0") => 0,
         Some("1") => PT_CONCEAL_SECONDARY,
         Some("2") => PT_CONCEAL_EXIT,
         Some("3") => PT_CONCEAL_SECONDARY | PT_CONCEAL_EXIT,
@@ -609,7 +610,7 @@ fn pt_vmx_concealment_mask_from_env(mask: Option<&str>, legacy_enable: Option<&s
         Some("5") => PT_CONCEAL_SECONDARY | PT_CONCEAL_ENTRY,
         Some("6") => PT_CONCEAL_EXIT | PT_CONCEAL_ENTRY,
         Some("7") => PT_CONCEAL_ALL,
-        _ => 0,
+        _ => PT_CONCEAL_ALL,
     }
 }
 
@@ -801,22 +802,35 @@ mod tests {
     }
 
     #[test]
-    fn requested_controls_do_not_enable_pt_vmx_concealment_by_default() {
+    fn pt_vmx_concealment_can_be_disabled_by_env() {
         let secondary_pt = vmcs::control::SecondaryControls::CONCEAL_VMX_FROM_PT.bits() as u64;
         let entry_pt = vmcs::control::EntryControls::CONCEAL_VMX_FROM_PT.bits() as u64;
         let exit_pt = vmcs::control::ExitControls::CONCEAL_VMX_FROM_PT.bits() as u64;
 
-        assert_eq!(requested_secondary_controls() & secondary_pt, 0);
-        assert_eq!(requested_entry_controls() & entry_pt, 0);
-        assert_eq!(requested_exit_controls() & exit_pt, 0);
+        assert_eq!(pt_vmx_concealment_mask_from_env(Some("0"), None), 0);
+        assert_eq!(optional_secondary_controls_for_pt_mask(0) & secondary_pt, 0);
+        assert_eq!(optional_entry_controls_for_pt_mask(0) & entry_pt, 0);
+        assert_eq!(optional_exit_controls_for_pt_mask(0) & exit_pt, 0);
+    }
+
+    #[test]
+    fn requested_controls_enable_pt_vmx_concealment_by_default() {
+        let secondary_pt = vmcs::control::SecondaryControls::CONCEAL_VMX_FROM_PT.bits() as u64;
+        let entry_pt = vmcs::control::EntryControls::CONCEAL_VMX_FROM_PT.bits() as u64;
+        let exit_pt = vmcs::control::ExitControls::CONCEAL_VMX_FROM_PT.bits() as u64;
+
+        assert_eq!(pt_vmx_concealment_mask_from_env(None, None), PT_CONCEAL_ALL);
+        assert_eq!(requested_secondary_controls() & secondary_pt, secondary_pt);
+        assert_eq!(requested_entry_controls() & entry_pt, entry_pt);
+        assert_eq!(requested_exit_controls() & exit_pt, exit_pt);
     }
 
     #[test]
     fn intel_pt_hosts_do_not_require_vmx_concealment_when_not_requested() {
         let intel_pt = 1 << 25;
 
-        assert!(pt_vmx_concealment_ready(0, 0, 0, 0));
-        assert!(pt_vmx_concealment_ready(intel_pt, 0, 0, 0));
+        assert!(pt_vmx_concealment_ready_for_mask(0, 0, 0, 0, 0));
+        assert!(pt_vmx_concealment_ready_for_mask(0, intel_pt, 0, 0, 0));
     }
 
     #[test]
@@ -825,7 +839,8 @@ mod tests {
         let entry_pt = vmcs::control::EntryControls::CONCEAL_VMX_FROM_PT.bits() as u64;
         let exit_pt = vmcs::control::ExitControls::CONCEAL_VMX_FROM_PT.bits() as u64;
 
-        assert_eq!(pt_vmx_concealment_mask_from_env(None, None), 0);
+        assert_eq!(pt_vmx_concealment_mask_from_env(None, None), PT_CONCEAL_ALL);
+        assert_eq!(pt_vmx_concealment_mask_from_env(Some("0"), None), 0);
         assert_eq!(pt_vmx_concealment_mask_from_env(Some("1"), None), 1);
         assert_eq!(pt_vmx_concealment_mask_from_env(Some("2"), None), 2);
         assert_eq!(pt_vmx_concealment_mask_from_env(Some("4"), None), 4);

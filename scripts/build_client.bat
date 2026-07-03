@@ -3,11 +3,12 @@ setlocal
 
 set "HV_BOOT_STOP_STAGE="
 set "HV_USER_CLIENT_READS=1"
+set "HV_PT_CONCEAL_MASK=7"
 set "DRIVER_PATH=%~dp0..\target\release\matrix_client.sys"
 set "DLL_PATH=%~dp0..\target\release\matrix.dll"
 
 echo [*] Building client-read driver...
-echo [*] Build flags: HV_USER_CLIENT_READS=%HV_USER_CLIENT_READS%
+echo [*] Build flags: HV_USER_CLIENT_READS=%HV_USER_CLIENT_READS% HV_PT_CONCEAL_MASK=%HV_PT_CONCEAL_MASK%
 cd /d "%~dp0.."
 cargo clean -p matrix -p hypervisor >nul 2>&1
 cargo build -p matrix --release

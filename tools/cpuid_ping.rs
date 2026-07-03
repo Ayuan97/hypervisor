@@ -43,6 +43,12 @@ mod tests {
     }
 
     #[test]
+    fn cpuid_zero_check_requires_all_registers_zero() {
+        assert!(cpuid_result_is_zero((0, 0, 0, 0)));
+        assert!(!cpuid_result_is_zero((0, 0, 1, 0)));
+    }
+
+    #[test]
     fn host_idt_patch_check_requires_all_runtime_evidence() {
         assert!(host_idt_patch_ok(
             24,
@@ -90,8 +96,8 @@ mod tests {
             0x5000,
         ));
         assert!(!host_idt_patch_ok(
-            24, 24, 0x1f, 0x1000, 0x1000, 0x2000, 0x2000, 0x3000, 0x3000, 0x4000,
-            0x4000, 0x5000, 0x5000,
+            24, 24, 0x1f, 0x1000, 0x1000, 0x2000, 0x2000, 0x3000, 0x3000, 0x4000, 0x4000, 0x5000,
+            0x5000,
         ));
         assert!(!host_idt_patch_ok(
             24,
@@ -216,6 +222,10 @@ fn host_idt_patch_ok(
         && pf_target == pf_expected
 }
 
+fn cpuid_result_is_zero(result: (u32, u32, u32, u32)) -> bool {
+    result.0 == 0 && result.1 == 0 && result.2 == 0 && result.3 == 0
+}
+
 fn cpuid_cmd(leaf: u64, cmd: u64, arg1: u64, token: u64) -> u64 {
     let result: u64;
     unsafe {
@@ -337,6 +347,11 @@ fn main() {
         "  Leaf 40000000   = eax={:#010x} ebx={:#010x} ecx={:#010x} edx={:#010x}",
         hv_max, hv_ebx, hv_ecx, hv_edx
     );
+    let hidden_hv_ext = guest_cpuid(0x4000_0100, 0);
+    println!(
+        "  Leaf 40000100   = eax={:#010x} ebx={:#010x} ecx={:#010x} edx={:#010x}",
+        hidden_hv_ext.0, hidden_hv_ext.1, hidden_hv_ext.2, hidden_hv_ext.3
+    );
     let (sgx_eax, sgx_ebx, sgx_ecx, sgx_edx) = guest_cpuid(0x12, 0);
     println!(
         "  Leaf 12         = eax={:#010x} ebx={:#010x} ecx={:#010x} edx={:#010x}",
@@ -353,6 +368,7 @@ fn main() {
         && hv_ebx == 0
         && hv_ecx == 0
         && hv_edx == 0
+        && cpuid_result_is_zero(hidden_hv_ext)
         && sgx_eax == 0
         && sgx_ebx == 0
         && sgx_ecx == 0
@@ -510,10 +526,7 @@ fn main() {
         println!("  Status         = unsupported by loaded HV");
         checks_ok = false;
     } else {
-        println!(
-            "  Calls          = {} ok={}",
-            patch_calls, patch_ok_calls
-        );
+        println!("  Calls          = {} ok={}", patch_calls, patch_ok_calls);
         println!(
             "  Current CPU    = {} mask={:#x} required={:#x}",
             current_cpu, current_mask, HOST_IDT_PATCH_ALL

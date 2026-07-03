@@ -34,6 +34,7 @@ const CMD_READ_VIRT: u64 = 0x1B;
 const CMD_READ_RESULT_INFO: u64 = 0x1C;
 const CMD_READ_RESULT_WORD: u64 = 0x1D;
 const CMD_RELEASE_READ_RESULT: u64 = 0x1E;
+const CMD_READ_RESULT_QUAD: u64 = 0x1F;
 const CMD_CLOAK_PAGE: u64 = 0x20;
 pub const CMD_DEVIRTUALIZE: u64 = 0xFF;
 const CLIENT_READ_ARM_TOKEN: u64 = 0xC17E_A2D5_90B4_6F31;
@@ -71,6 +72,7 @@ fn user_client_read_command(cmd: u64) -> bool {
             | CMD_READ_RESULT_INFO
             | CMD_READ_RESULT_WORD
             | CMD_RELEASE_READ_RESULT
+            | CMD_READ_RESULT_QUAD
     )
 }
 
@@ -238,6 +240,14 @@ pub fn dispatch_command(guest_registers: &mut GuestRegisters, vmx: &mut Vmx) -> 
         }
         CMD_READ_RESULT_WORD => {
             guest_registers.rax = crate::intel::client_read::read_result_word(arg1, arg2);
+            ExitType::IncrementRIP
+        }
+        CMD_READ_RESULT_QUAD => {
+            let words = crate::intel::client_read::read_result_quad(arg1, arg2);
+            guest_registers.rax = words[0];
+            guest_registers.rbx = words[1];
+            guest_registers.rcx = words[2];
+            guest_registers.rdx = words[3];
             ExitType::IncrementRIP
         }
         CMD_RELEASE_READ_RESULT => {
@@ -481,6 +491,12 @@ mod tests {
             true
         ));
         assert!(!command_requires_ring0_with_client_read_state(
+            CMD_READ_RESULT_QUAD,
+            0,
+            true,
+            true
+        ));
+        assert!(!command_requires_ring0_with_client_read_state(
             CMD_READ_VIRT,
             0,
             true,
@@ -630,6 +646,13 @@ mod tests {
         ));
         assert!(diagnostic_command_allowed_with_client_read_state(
             CMD_READ_PHYS_RESULT,
+            0,
+            true,
+            true,
+            true
+        ));
+        assert!(diagnostic_command_allowed_with_client_read_state(
+            CMD_READ_RESULT_QUAD,
             0,
             true,
             true,

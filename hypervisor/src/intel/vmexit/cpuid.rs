@@ -166,7 +166,7 @@ fn cached_leaf7_subleaf0(host_cpuid: &mut impl FnMut(u32, u32) -> CpuIdResult) -
 }
 
 fn cpuid_leaf_is_zeroed_without_host(leaf: u32) -> bool {
-    matches!(leaf, 0x4000_0000..=0x4000_00ff) || leaf == CpuidLeaf::SgxCapabilities as u32
+    matches!(leaf, 0x4000_0000..=0x4fff_ffff) || leaf == CpuidLeaf::SgxCapabilities as u32
 }
 
 const fn zero_cpuid_result() -> CpuIdResult {
@@ -220,9 +220,9 @@ fn mask_cpuid_result(leaf: u32, sub_leaf: u32, cpuid_result: &mut CpuIdResult) {
                 .ecx
                 .set_bit(FeatureBits::SaferModeExtensionsBit as usize, false);
         }
-        // Keep hidden control leaves zeroed unless they were authenticated and
+        // Keep hidden hypervisor leaves zeroed unless they were authenticated and
         // handled before reaching this masking path.
-        0x4000_0000..=0x4000_00ff => {
+        0x4000_0000..=0x4fff_ffff => {
             log::trace!("CPUID leaf {:#x} hidden.", leaf);
             *cpuid_result = CpuIdResult {
                 eax: 0,
@@ -434,6 +434,18 @@ mod tests {
     fn hidden_hypervisor_leaf_bypasses_host_cpuid() {
         let result = guest_cpuid_result(CPUID_COMM_LEAF, 0, |_, _| {
             panic!("hidden leaf must not execute host cpuid")
+        });
+
+        assert_eq!(result.eax, 0);
+        assert_eq!(result.ebx, 0);
+        assert_eq!(result.ecx, 0);
+        assert_eq!(result.edx, 0);
+    }
+
+    #[test]
+    fn extended_hypervisor_leaf_range_bypasses_host_cpuid() {
+        let result = guest_cpuid_result(0x4000_0100, 0, |_, _| {
+            panic!("extended hypervisor leaf must not execute host cpuid")
         });
 
         assert_eq!(result.eax, 0);
