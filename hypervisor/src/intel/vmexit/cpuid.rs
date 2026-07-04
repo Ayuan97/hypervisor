@@ -104,12 +104,8 @@ pub fn handle_cpuid(guest_registers: &mut GuestRegisters, vmx: &mut Vmx) -> Exit
         return dispatch_command(guest_registers, vmx);
     }
 
-    // "Trap next RDTSC": record entry TSC and enable RDTSC exiting so the
-    // immediately following RDTSC returns a spoofed value that hides the
-    // VM-exit overhead.  TSC_OFFSET stays 0 → no cross-CPU drift.
-    let entry_tsc = unsafe { core::arch::x86_64::_rdtsc() as u64 };
-    vmx.cpuid_entry_tsc = entry_tsc;
-    enable_rdtsc_exiting();
+    // TSC compensation disabled for isolation testing — determine whether
+    // the game freeze is caused by CPUID timing detection or something else.
 
     let sub_leaf = guest_registers.rcx as u32;
 
