@@ -323,11 +323,19 @@ fn decode_basic_exit_reason(raw_exit_reason: u32) -> Option<VmxBasicExitReason> 
     VmxBasicExitReason::from_u32(raw_exit_reason & 0xffff)
 }
 
-fn vmexit_should_record_breadcrumb(exit_reason: u32, guest_registers: &GuestRegisters) -> bool {
-    !(decode_basic_exit_reason(exit_reason) == Some(VmxBasicExitReason::Cpuid)
-        && guest_registers.rax as u32 == vmcall::CPUID_COMM_LEAF
-        && guest_registers.r10 == vmcall::VMCALL_MAGIC
-        && guest_registers.r11 == vmcall::VMCALL_MAGIC)
+fn vmexit_should_record_breadcrumb(exit_reason: u32, _guest_registers: &GuestRegisters) -> bool {
+    !matches!(
+        decode_basic_exit_reason(exit_reason),
+        Some(
+            VmxBasicExitReason::Cpuid
+                | VmxBasicExitReason::Rdmsr
+                | VmxBasicExitReason::Wrmsr
+                | VmxBasicExitReason::Rdtsc
+                | VmxBasicExitReason::Rdtscp
+                | VmxBasicExitReason::ExternalInterrupt
+                | VmxBasicExitReason::MonitorTrapFlag
+        )
+    )
 }
 
 fn vmexit_breadcrumb_detail(exit_reason: u32, guest_registers: &GuestRegisters) -> u64 {
@@ -387,20 +395,31 @@ mod tests {
     }
 
     #[test]
-    fn breadcrumb_skips_authenticated_diagnostic_cpuid() {
-        let mut regs = GuestRegisters::default();
-        regs.rax = super::vmcall::CPUID_COMM_LEAF as u64;
-        regs.r10 = super::vmcall::VMCALL_MAGIC;
-        regs.r11 = super::vmcall::VMCALL_MAGIC;
+    fn breadcrumb_skips_high_frequency_exit_reasons() {
+        let regs = GuestRegisters::default();
 
         assert!(!vmexit_should_record_breadcrumb(
             VmxBasicExitReason::Cpuid as u32,
             &regs
         ));
-
-        regs.r10 = 0;
+        assert!(!vmexit_should_record_breadcrumb(
+            VmxBasicExitReason::Rdmsr as u32,
+            &regs
+        ));
+        assert!(!vmexit_should_record_breadcrumb(
+            VmxBasicExitReason::Rdtsc as u32,
+            &regs
+        ));
+        assert!(!vmexit_should_record_breadcrumb(
+            VmxBasicExitReason::ExternalInterrupt as u32,
+            &regs
+        ));
         assert!(vmexit_should_record_breadcrumb(
-            VmxBasicExitReason::Cpuid as u32,
+            VmxBasicExitReason::EptViolation as u32,
+            &regs
+        ));
+        assert!(vmexit_should_record_breadcrumb(
+            VmxBasicExitReason::Vmcall as u32,
             &regs
         ));
     }

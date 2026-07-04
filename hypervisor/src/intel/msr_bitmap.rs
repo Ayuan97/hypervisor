@@ -24,6 +24,7 @@ const IA32_RTIT_STATUS_MSR: u32 = 0x571;
 const IA32_RTIT_CR3_MATCH_MSR: u32 = 0x572;
 const IA32_RTIT_ADDR_MSR_START: u32 = 0x580;
 const IA32_RTIT_ADDR_MSR_END: u32 = 0x58f;
+const IA32_TSC_AUX: u32 = 0x103;
 
 /// Represents the MSR Bitmap structure used in VMX.
 ///
@@ -124,6 +125,10 @@ impl MsrBitmap {
             set_msr_bitmap_bit(&mut self.read_low_msrs, msr);
             set_msr_bitmap_bit(&mut self.write_low_msrs, msr);
         }
+
+        // Intercept writes to IA32_TSC_AUX — host IDT handlers use rdtscp
+        // for per-CPU indexing; a guest WRMSR would corrupt that index.
+        set_msr_bitmap_bit(&mut self.write_high_msrs, IA32_TSC_AUX);
     }
 }
 
@@ -176,6 +181,16 @@ mod tests {
         assert!(msr_bitmap_bit_is_set(&bitmap.write_low_msrs, 0x8f));
         assert!(!msr_bitmap_bit_is_set(&bitmap.read_low_msrs, 0x47f));
         assert!(!msr_bitmap_bit_is_set(&bitmap.write_low_msrs, 0x492));
+    }
+
+    #[test]
+    fn tsc_aux_write_is_intercepted_but_read_passes_through() {
+        let mut bitmap = empty_bitmap();
+
+        bitmap.intercept_vmx_msrs();
+
+        assert!(msr_bitmap_bit_is_set(&bitmap.write_high_msrs, IA32_TSC_AUX));
+        assert!(!msr_bitmap_bit_is_set(&bitmap.read_high_msrs, IA32_TSC_AUX));
     }
 
     #[test]

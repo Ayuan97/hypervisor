@@ -277,8 +277,7 @@ impl Vmcs {
         let requested_entry_ctl = requested_entry_controls();
         let exit_ctl = required_exit_controls();
         let requested_exit_ctl = requested_exit_controls();
-        const PINBASED_CTL: u64 =
-            vmcs::control::PinbasedControls::NMI_EXITING.bits() as u64;
+        const PINBASED_CTL: u64 = 0;
 
         let ctl_pin = adjust_vmx_controls(VmxControl::PinBased, PINBASED_CTL)?;
         let ctl_pri = adjust_vmx_controls(VmxControl::ProcessorBased, primary_ctl)?;
@@ -422,7 +421,8 @@ impl Vmcs {
 
 fn required_primary_controls() -> u64 {
     (vmcs::control::PrimaryControls::SECONDARY_CONTROLS.bits()
-        | vmcs::control::PrimaryControls::USE_MSR_BITMAPS.bits()) as u64
+        | vmcs::control::PrimaryControls::USE_MSR_BITMAPS.bits()
+        | vmcs::control::PrimaryControls::USE_TSC_OFFSETTING.bits()) as u64
 }
 
 fn required_secondary_controls() -> u64 {
@@ -794,11 +794,11 @@ mod tests {
     }
 
     #[test]
-    fn primary_controls_do_not_request_dynamic_tsc_offsetting_by_default() {
+    fn primary_controls_request_tsc_offsetting() {
         let required = required_primary_controls();
         let tsc_offsetting = vmcs::control::PrimaryControls::USE_TSC_OFFSETTING.bits() as u64;
 
-        assert_eq!(required & tsc_offsetting, 0);
+        assert_ne!(required & tsc_offsetting, 0);
     }
 
     #[test]
@@ -900,7 +900,10 @@ mod tests {
         let preemption_timer = vmcs::control::PinbasedControls::VMX_PREEMPTION_TIMER.bits() as u64;
         let posted_interrupts = vmcs::control::PinbasedControls::POSTED_INTERRUPTS.bits() as u64;
 
+        let nmi_exiting = vmcs::control::PinbasedControls::NMI_EXITING.bits() as u64;
+
         assert!(pinbased_interrupt_exiting_ready(0));
+        assert!(pinbased_interrupt_exiting_ready(nmi_exiting));
         assert!(!pinbased_interrupt_exiting_ready(ext_int));
         assert!(!pinbased_interrupt_exiting_ready(virtual_nmis));
         assert!(!pinbased_interrupt_exiting_ready(preemption_timer));

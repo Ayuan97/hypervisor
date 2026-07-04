@@ -9,6 +9,7 @@ use crate::{
 use x86::msr;
 
 const IA32_FEATURE_CONTROL_MSR: u32 = 0x3a;
+const IA32_TSC_AUX: u32 = 0xC000_0103;
 const FEATURE_CONTROL_VMX_BITS: u64 = (1 << 1) | (1 << 2);
 const FEATURE_CONTROL_SENTER_BITS: u64 = 0xff << 8;
 const FEATURE_CONTROL_SGX_BITS: u64 = (1 << 17) | (1 << 18);
@@ -65,6 +66,10 @@ where
             guest_registers.rax = 0;
             guest_registers.rdx = 0;
         }
+        return ExitType::IncrementRIP;
+    }
+
+    if matches!(access_type, MsrAccessType::Write) && msr == IA32_TSC_AUX {
         return ExitType::IncrementRIP;
     }
 
@@ -188,6 +193,23 @@ mod tests {
         assert_eq!(injected_error, None);
         assert_eq!(regs.rax, 0);
         assert_eq!(regs.rdx, 0);
+    }
+
+    #[test]
+    fn tsc_aux_wrmsr_is_silently_absorbed() {
+        let mut regs = GuestRegisters::default();
+        regs.rcx = IA32_TSC_AUX as u64;
+        let mut injected_error = None;
+
+        let exit = handle_msr_access_with(
+            &mut regs,
+            MsrAccessType::Write,
+            |_| panic!("TSC_AUX write should not reach hardware"),
+            |code| injected_error = Some(code),
+        );
+
+        assert_eq!(exit, ExitType::IncrementRIP);
+        assert_eq!(injected_error, None);
     }
 
     #[test]
