@@ -17,9 +17,8 @@ use {
     },
 };
 
-const CPUID_TSC_COMPENSATION_CYCLES: u64 = 600;
-const MAX_CPUID_TSC_COMPENSATION_CYCLES: u64 = 10_000;
-const ENABLE_DYNAMIC_CPUID_TSC_COMPENSATION: bool = true;
+pub const CPUID_BARE_METAL_COST: u64 = 120;
+
 static LEAF7_SUBLEAF0_LOW: AtomicU64 = AtomicU64::new(0);
 static LEAF7_SUBLEAF0_HIGH: AtomicU64 = AtomicU64::new(0);
 static LEAF7_SUBLEAF0_READY: AtomicBool = AtomicBool::new(false);
@@ -105,9 +104,12 @@ pub fn handle_cpuid(guest_registers: &mut GuestRegisters, vmx: &mut Vmx) -> Exit
         return dispatch_command(guest_registers, vmx);
     }
 
-    if ENABLE_DYNAMIC_CPUID_TSC_COMPENSATION {
-        compensate_cpuid_tsc(vmx);
-    }
+    // "Trap next RDTSC": record entry TSC and enable RDTSC exiting so the
+    // immediately following RDTSC returns a spoofed value that hides the
+    // VM-exit overhead.  TSC_OFFSET stays 0 → no cross-CPU drift.
+    let entry_tsc = unsafe { core::arch::x86_64::_rdtsc() as u64 };
+    vmx.cpuid_entry_tsc = entry_tsc;
+    enable_rdtsc_exiting();
 
     let sub_leaf = guest_registers.rcx as u32;
 
@@ -124,6 +126,20 @@ pub fn handle_cpuid(guest_registers: &mut GuestRegisters, vmx: &mut Vmx) -> Exit
     log::trace!("CPUID VMEXIT handled successfully!");
 
     ExitType::IncrementRIP
+}
+
+fn enable_rdtsc_exiting() {
+    if let Ok(val) = crate::intel::support::vmread_checked(vmcs::control::PRIMARY_PROCBASED_VMEXEC_CONTROLS) {
+        let new_val = val | (1 << 12); // bit 12 = RDTSC exiting
+        let _ = vmwrite_checked(vmcs::control::PRIMARY_PROCBASED_VMEXEC_CONTROLS, new_val);
+    }
+}
+
+pub fn disable_rdtsc_exiting() {
+    if let Ok(val) = crate::intel::support::vmread_checked(vmcs::control::PRIMARY_PROCBASED_VMEXEC_CONTROLS) {
+        let new_val = val & !(1 << 12);
+        let _ = vmwrite_checked(vmcs::control::PRIMARY_PROCBASED_VMEXEC_CONTROLS, new_val);
+    }
 }
 
 fn guest_cpuid_result(
@@ -255,27 +271,6 @@ fn cpuid_comm_authorized(guest_registers: &GuestRegisters) -> bool {
     guest_registers.r10 == VMCALL_MAGIC && guest_registers.r11 == VMCALL_MAGIC
 }
 
-fn next_tsc_offset(current: u64, compensation_cycles: u64) -> u64 {
-    let current_compensation = if current & (1 << 63) != 0 {
-        0u64.wrapping_sub(current)
-    } else {
-        0
-    };
-    let next_compensation = current_compensation
-        .saturating_add(compensation_cycles)
-        .min(MAX_CPUID_TSC_COMPENSATION_CYCLES);
-
-    0u64.wrapping_sub(next_compensation)
-}
-
-fn compensate_cpuid_tsc(vmx: &mut Vmx) {
-    vmx.tsc_offset = next_tsc_offset(vmx.tsc_offset, CPUID_TSC_COMPENSATION_CYCLES);
-    crate::intel::diag::TSC_OFFSET.store(vmx.tsc_offset, core::sync::atomic::Ordering::Relaxed);
-
-    if let Err(error) = vmwrite_checked(vmcs::control::TSC_OFFSET_FULL, vmx.tsc_offset) {
-        log::error!("Failed to update TSC offset after CPUID exit: {:?}", error);
-    }
-}
 
 #[cfg(test)]
 mod tests {
@@ -410,25 +405,8 @@ mod tests {
     }
 
     #[test]
-    fn cpuid_tsc_compensation_accumulates_negative_offset() {
-        assert_eq!(next_tsc_offset(0, 600), u64::MAX - 599);
-        assert_eq!(next_tsc_offset(u64::MAX - 599, 600), u64::MAX - 1199);
-    }
-
-    #[test]
-    fn cpuid_tsc_compensation_is_capped_to_avoid_clock_drift() {
-        let capped_offset = 0u64.wrapping_sub(MAX_CPUID_TSC_COMPENSATION_CYCLES);
-
-        assert_eq!(
-            next_tsc_offset(capped_offset, CPUID_TSC_COMPENSATION_CYCLES),
-            capped_offset
-        );
-    }
-
-    #[test]
-    fn dynamic_cpuid_tsc_compensation_is_enabled_with_bounded_cap() {
-        assert!(ENABLE_DYNAMIC_CPUID_TSC_COMPENSATION);
-        assert!(MAX_CPUID_TSC_COMPENSATION_CYCLES <= 50_000);
+    fn cpuid_bare_metal_cost_is_reasonable() {
+        assert!(CPUID_BARE_METAL_COST >= 50 && CPUID_BARE_METAL_COST <= 300);
     }
 
     #[test]

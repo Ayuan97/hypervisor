@@ -110,6 +110,8 @@ impl VmExit {
             );
         }
 
+        crate::intel::diag_trace::trace_vmexit(exit_reason as u64, guest_registers.rip);
+
         let Some(basic_exit_reason) = decode_basic_exit_reason(exit_reason) else {
             log::error!("Unknown exit reason: {:#x}", exit_reason);
             return Err(HypervisorError::UnknownVMExitReason);
@@ -171,8 +173,8 @@ impl VmExit {
             }
             VmxBasicExitReason::Invd => handle_invd(guest_registers),
             VmxBasicExitReason::WbinvdOrWbnoinvd => handle_wbinvd_or_wbnoinvd(),
-            VmxBasicExitReason::Rdtsc => handle_rdtsc(guest_registers, vmx.tsc_offset),
-            VmxBasicExitReason::Rdtscp => handle_rdtscp(guest_registers, vmx.tsc_offset),
+            VmxBasicExitReason::Rdtsc => handle_rdtsc(guest_registers, vmx),
+            VmxBasicExitReason::Rdtscp => handle_rdtscp(guest_registers, vmx),
             VmxBasicExitReason::EptViolation => {
                 diag::EXIT_EPT_VIOLATION.fetch_add(1, Relaxed);
                 handle_ept_violation(guest_registers, vmx)

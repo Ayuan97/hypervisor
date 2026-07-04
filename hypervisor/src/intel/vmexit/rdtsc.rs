@@ -28,17 +28,36 @@ User can add the following later:
 /// * `ExitType::IncrementRIP` - To move past the `RDTSC` instruction in the VM.
 ///
 /// Reference: Intel® 64 and IA-32 Architectures Software Developer's Manual, Table C-1. Basic Exit Reasons 10.
-pub fn handle_rdtsc(guest_registers: &mut GuestRegisters, tsc_offset: u64) -> ExitType {
+pub fn handle_rdtsc(guest_registers: &mut GuestRegisters, vmx: &mut crate::intel::vmx::Vmx) -> ExitType {
     log::debug!("Handling RDTSC VM exit...");
 
-    let exit = handle_rdtsc_with_offset(guest_registers, || unsafe { rdtsc() }, tsc_offset);
+    let exit = if vmx.cpuid_entry_tsc != 0 {
+        handle_rdtsc_spoofed(guest_registers, vmx)
+    } else {
+        handle_rdtsc_with_offset(guest_registers, || unsafe { rdtsc() }, vmx.tsc_offset)
+    };
 
     log::debug!("RDTSC VMEXIT handled successfully!");
     exit
 }
 
-pub fn handle_rdtscp(guest_registers: &mut GuestRegisters, tsc_offset: u64) -> ExitType {
-    handle_rdtscp_with_offset(guest_registers, || unsafe { rdtscp() }, tsc_offset)
+pub fn handle_rdtscp(guest_registers: &mut GuestRegisters, vmx: &mut crate::intel::vmx::Vmx) -> ExitType {
+    if vmx.cpuid_entry_tsc != 0 {
+        let (_, aux) = unsafe { rdtscp() };
+        guest_registers.rcx = aux as u64;
+        handle_rdtsc_spoofed(guest_registers, vmx)
+    } else {
+        handle_rdtscp_with_offset(guest_registers, || unsafe { rdtscp() }, vmx.tsc_offset)
+    }
+}
+
+fn handle_rdtsc_spoofed(guest_registers: &mut GuestRegisters, vmx: &mut crate::intel::vmx::Vmx) -> ExitType {
+    use super::cpuid::CPUID_BARE_METAL_COST;
+    let spoofed = vmx.cpuid_entry_tsc.wrapping_add(CPUID_BARE_METAL_COST);
+    write_tsc(guest_registers, spoofed);
+    vmx.cpuid_entry_tsc = 0;
+    super::cpuid::disable_rdtsc_exiting();
+    ExitType::IncrementRIP
 }
 
 fn handle_rdtsc_with_offset<F>(

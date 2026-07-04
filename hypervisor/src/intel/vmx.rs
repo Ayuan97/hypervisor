@@ -79,6 +79,10 @@ pub struct Vmx {
 
     /// Cumulative guest TSC offset used to hide unavoidable CPUID VM-exit cost.
     pub tsc_offset: u64,
+
+    /// TSC value captured at CPUID VM-exit entry; when non-zero the next
+    /// RDTSC/RDTSCP exit returns a spoofed value and clears this field.
+    pub cpuid_entry_tsc: u64,
 }
 
 impl Vmx {
@@ -140,6 +144,7 @@ impl Vmx {
             shared_data: unsafe { NonNull::new_unchecked(shared_data as *mut _) },
             mtf_recloak_pa: None,
             tsc_offset: 0,
+            cpuid_entry_tsc: 0,
         };
 
         let mut instance = Box::new(instance);
@@ -295,11 +300,13 @@ impl Vmx {
         log::trace!("Vmx: {:#p}", self.vmstack.vmx);
 
         log::info!("Launching VM for processor {}", cpu_index);
+        crate::intel::diag_trace::trace("vmlaunch: entering guest");
         if let Err(error) = diag::boot_stage(700 + cpu_index as u64) {
             self.teardown_vmx_operation("boot-stage stop");
             return Err(error);
         }
         unsafe { launch_vm(&mut self.guest_registers, vmcs_host_rsp as *mut u64) };
+        crate::intel::diag_trace::trace("vmlaunch: returned (FAILED)");
 
         self.restore_control_registers();
         let _ = diag::boot_stage(790 + cpu_index as u64);
