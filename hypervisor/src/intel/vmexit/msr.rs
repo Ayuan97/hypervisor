@@ -10,6 +10,10 @@ use x86::msr;
 
 const IA32_FEATURE_CONTROL_MSR: u32 = 0x3a;
 const IA32_TSC_AUX: u32 = 0xC000_0103;
+const IA32_VMX_MSR_START: u32 = 0x480;
+const IA32_VMX_MSR_END: u32 = 0x491;
+const IA32_SGXLEPUBKEYHASH_MSR_START: u32 = 0x8c;
+const IA32_SGXLEPUBKEYHASH_MSR_END: u32 = 0x8f;
 const FEATURE_CONTROL_VMX_BITS: u64 = (1 << 1) | (1 << 2);
 const FEATURE_CONTROL_SENTER_BITS: u64 = 0xff << 8;
 const FEATURE_CONTROL_SGX_BITS: u64 = (1 << 17) | (1 << 18);
@@ -33,11 +37,12 @@ pub enum MsrAccessType {
 
 /// Handles MSR access VM exits.
 ///
-/// MSR bitmap is all-zeros, so MSRs in 0x0-0x1FFF and 0xC0000000-0xC0001FFF
-/// pass through without VM exit. Only out-of-range MSRs reach here (Intel SDM
-/// 25.1.3). Native rdmsr/wrmsr in VMX root for non-existent MSRs → #GP → BSOD.
-/// Out-of-range RDMSR/WRMSR should behave like hardware and raise #GP. Silently
-/// returning zero makes kernel probes observe non-native behavior.
+/// Handles intercepted MSR accesses.
+///
+/// The MSR bitmap intercepts specific MSRs: IA32_FEATURE_CONTROL, VMX
+/// capability MSRs, SGX key-hash MSRs, Intel PT MSRs, and IA32_TSC_AUX.
+/// Reads are passed through to hardware (hiding VMX bits where needed);
+/// writes to read-only MSRs inject #GP to match bare-metal behavior.
 pub fn handle_msr_access(
     guest_registers: &mut GuestRegisters,
     access_type: MsrAccessType,
@@ -61,6 +66,7 @@ where
     G: FnOnce(u32),
 {
     let msr = guest_registers.rcx as u32;
+
     if intel_pt_msr_is_virtualized(msr) {
         if matches!(access_type, MsrAccessType::Read) {
             guest_registers.rax = 0;
@@ -80,8 +86,57 @@ where
         return ExitType::IncrementRIP;
     }
 
+    // VMX capability MSRs (0x480-0x491) — read-only on bare metal.
+    // Pass reads through to hardware; writes → #GP (matches bare metal).
+    if vmx_capability_msr(msr) {
+        match access_type {
+            MsrAccessType::Read => {
+                let value = read_msr(msr);
+                guest_registers.rax = value & 0xFFFF_FFFF;
+                guest_registers.rdx = value >> 32;
+                return ExitType::IncrementRIP;
+            }
+            MsrAccessType::Write => {
+                inject_gp(0);
+                return ExitType::Continue;
+            }
+        }
+    }
+
+    // SGX key-hash MSRs (0x8C-0x8F) and IA32_FEATURE_CONTROL writes —
+    // pass through reads; absorb or #GP writes as appropriate.
+    if sgx_keyhash_msr(msr) {
+        match access_type {
+            MsrAccessType::Read => {
+                let value = read_msr(msr);
+                guest_registers.rax = value & 0xFFFF_FFFF;
+                guest_registers.rdx = value >> 32;
+                return ExitType::IncrementRIP;
+            }
+            MsrAccessType::Write => {
+                inject_gp(0);
+                return ExitType::Continue;
+            }
+        }
+    }
+
+    // IA32_FEATURE_CONTROL write — bare metal #GPs when lock bit is set,
+    // which it always is after BIOS. Inject #GP to match.
+    if matches!(access_type, MsrAccessType::Write) && msr == IA32_FEATURE_CONTROL_MSR {
+        inject_gp(0);
+        return ExitType::Continue;
+    }
+
     inject_gp(0);
     ExitType::Continue
+}
+
+fn vmx_capability_msr(msr: u32) -> bool {
+    (IA32_VMX_MSR_START..=IA32_VMX_MSR_END).contains(&msr)
+}
+
+fn sgx_keyhash_msr(msr: u32) -> bool {
+    (IA32_SGXLEPUBKEYHASH_MSR_START..=IA32_SGXLEPUBKEYHASH_MSR_END).contains(&msr)
 }
 
 fn intel_pt_msr_is_virtualized(msr: u32) -> bool {
@@ -227,5 +282,56 @@ mod tests {
 
         assert_eq!(exit, ExitType::IncrementRIP);
         assert_eq!(injected_error, None);
+    }
+
+    #[test]
+    fn vmx_capability_rdmsr_passes_through_to_hardware() {
+        let mut regs = GuestRegisters::default();
+        regs.rcx = 0x480; // IA32_VMX_BASIC
+
+        let exit = handle_msr_access_with(
+            &mut regs,
+            MsrAccessType::Read,
+            |_| 0xDEAD_BEEF_CAFE_BABE,
+            |_| panic!("VMX MSR read should not inject #GP"),
+        );
+
+        assert_eq!(exit, ExitType::IncrementRIP);
+        assert_eq!(regs.rax, 0xCAFE_BABE);
+        assert_eq!(regs.rdx, 0xDEAD_BEEF);
+    }
+
+    #[test]
+    fn vmx_capability_wrmsr_injects_gp() {
+        let mut regs = GuestRegisters::default();
+        regs.rcx = 0x480;
+        let mut injected_error = None;
+
+        let exit = handle_msr_access_with(
+            &mut regs,
+            MsrAccessType::Write,
+            |_| panic!("VMX MSR write should not reach hardware"),
+            |code| injected_error = Some(code),
+        );
+
+        assert_eq!(exit, ExitType::Continue);
+        assert_eq!(injected_error, Some(0));
+    }
+
+    #[test]
+    fn sgx_keyhash_rdmsr_passes_through_to_hardware() {
+        let mut regs = GuestRegisters::default();
+        regs.rcx = 0x8c;
+
+        let exit = handle_msr_access_with(
+            &mut regs,
+            MsrAccessType::Read,
+            |_| 0x1122_3344_5566_7788,
+            |_| panic!("SGX keyhash MSR read should not inject #GP"),
+        );
+
+        assert_eq!(exit, ExitType::IncrementRIP);
+        assert_eq!(regs.rax, 0x5566_7788);
+        assert_eq!(regs.rdx, 0x1122_3344);
     }
 }
