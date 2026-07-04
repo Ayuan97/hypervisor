@@ -68,7 +68,7 @@ pub fn handle_ept_violation(_guest_registers: &mut GuestRegisters, _vmx: &mut Vm
     #[cfg(feature = "secondary-ept")]
     {
         if is_execute_violation_on_read_write_page(&eq) {
-            let secondary_eptp = unsafe { _vmx.shared_data.as_mut().secondary_eptp };
+            let secondary_eptp = _vmx.shared_data_ref().secondary_eptp;
             if let Err(error) = vmwrite_checked(vmcs::control::EPTP_FULL, secondary_eptp) {
                 log::error!("Failed to switch to secondary EPTP: {:?}", error);
                 EventInjection::vmentry_inject_gp(0);
@@ -87,6 +87,10 @@ pub fn handle_ept_violation(_guest_registers: &mut GuestRegisters, _vmx: &mut Vm
                 enable_monitor_trap_flag(proc_ctl),
             ) {
                 log::error!("Failed to enable monitor trap flag: {:?}", error);
+                // Recovery: switch back to primary EPTP since MTF won't fire
+                let primary_eptp = _vmx.shared_data_ref().primary_eptp;
+                let _ = vmwrite_checked(vmcs::control::EPTP_FULL, primary_eptp);
+                invept_all_contexts();
                 EventInjection::vmentry_inject_gp(0);
                 return ExitType::Continue;
             }
@@ -95,7 +99,7 @@ pub fn handle_ept_violation(_guest_registers: &mut GuestRegisters, _vmx: &mut Vm
         }
 
         if is_memory_violation_on_execute_only_page(&eq) {
-            let primary_eptp = unsafe { _vmx.shared_data.as_mut().primary_eptp };
+            let primary_eptp = _vmx.shared_data_ref().primary_eptp;
             if let Err(error) = vmwrite_checked(vmcs::control::EPTP_FULL, primary_eptp) {
                 log::error!("Failed to switch to primary EPTP: {:?}", error);
                 EventInjection::vmentry_inject_gp(0);
@@ -129,7 +133,7 @@ pub fn handle_mtf(vmx: &mut Vmx) -> ExitType {
     if vmx.mtf_recloak_pa.take().is_some() {
         #[cfg(feature = "secondary-ept")]
         {
-            let primary_eptp = unsafe { vmx.shared_data.as_mut().primary_eptp };
+            let primary_eptp = vmx.shared_data_ref().primary_eptp;
             if let Err(error) = vmwrite_checked(vmcs::control::EPTP_FULL, primary_eptp) {
                 log::error!("Failed to restore primary EPTP on MTF: {:?}", error);
                 EventInjection::vmentry_inject_gp(0);
@@ -150,13 +154,13 @@ pub fn handle_mtf(vmx: &mut Vmx) -> ExitType {
             return ExitType::Continue;
         }
     };
-    if let Err(error) = vmwrite_checked(
-        vmcs::control::PRIMARY_PROCBASED_EXEC_CONTROLS,
-        disable_monitor_trap_flag(proc_ctl),
-    ) {
-        log::error!("Failed to disable monitor trap flag on MTF: {:?}", error);
-        EventInjection::vmentry_inject_gp(0);
-        return ExitType::Continue;
+    let cleared = disable_monitor_trap_flag(proc_ctl);
+    if proc_ctl != cleared {
+        if let Err(error) = vmwrite_checked(vmcs::control::PRIMARY_PROCBASED_EXEC_CONTROLS, cleared)
+        {
+            log::error!("Failed to disable monitor trap flag on MTF: {:?}", error);
+            EventInjection::vmentry_inject_gp(0);
+        }
     }
 
     ExitType::Continue

@@ -333,7 +333,7 @@ pub fn dispatch_command(guest_registers: &mut GuestRegisters, vmx: &mut Vmx) -> 
         }
         CMD_CLOAK_PAGE => {
             let pa = arg1 & !0xFFF;
-            let shared_data = unsafe { vmx.shared_data.as_mut() };
+            let shared_data = vmx.shared_data_mut();
             let ept = &mut shared_data.primary_ept;
 
             let split_ok = ept

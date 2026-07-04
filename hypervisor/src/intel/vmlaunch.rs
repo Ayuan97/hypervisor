@@ -525,6 +525,6 @@ fn fatal_vmx_failure_loop() -> ! {
     }
 
     loop {
-        core::hint::spin_loop();
+        unsafe { core::arch::asm!("hlt", options(nomem, nostack)) };
     }
 }

@@ -16,6 +16,8 @@ const ZERO_U8: AtomicU8 = AtomicU8::new(0);
 const ZERO_U64: AtomicU64 = AtomicU64::new(0);
 static NMI_FLAGS: [AtomicU8; 256] = [ZERO_U8; 256];
 static MC_FLAGS: [AtomicU8; 256] = [ZERO_U8; 256];
+static GP_REENTRANT: [AtomicU8; 256] = [ZERO_U8; 256];
+static PF_REENTRANT: [AtomicU8; 256] = [ZERO_U8; 256];
 static HOST_IDT_PATCH_MASK: [AtomicU64; 256] = [ZERO_U64; 256];
 static HOST_IDT_BASE: [AtomicU64; 256] = [ZERO_U64; 256];
 static HOST_IDT_LIMIT: [AtomicU64; 256] = [ZERO_U64; 256];
@@ -129,45 +131,73 @@ core::arch::global_asm!(
     "host_gp_handler:",
     "push rax",
     "push rcx",
-    // After 2 pushes (+16), offsets shift:
-    //   error_code  +0x10
-    //   RIP         +0x18
-    //   CS          +0x20
-    //   RFLAGS      +0x28
-    //   RSP         +0x30
-    //   SS          +0x38
+    "push rdx",
+    // After 3 pushes (+24), offsets shift:
+    //   error_code  +0x18
+    //   RIP         +0x20
+    //   CS          +0x28
+    //   RFLAGS      +0x30
+    //   RSP         +0x38
+    //   SS          +0x40
 
     // counter
     "lea rax, [rip + {gp_count}]",
     "lock inc qword ptr [rax]",
 
     // save faulting RIP for diagnostics
-    "mov rax, [rsp + 0x18]",
+    "mov rax, [rsp + 0x20]",
     "lea rcx, [rip + {gp_rip}]",
     "mov [rcx], rax",
+
+    // re-entrancy check via rdtscp
+    "rdtscp",
+    "and ecx, 0xFF",
+    "lea rax, [rip + {gp_reentrant}]",
+    "cmp byte ptr [rax + rcx], 0",
+    "jne 2f",
+    // set re-entrancy flag
+    "mov byte ptr [rax + rcx], 1",
 
     // read HOST_RSP from VMCS (encoding 0x6C14)
     "mov ecx, 0x6C14",
     "vmread rax, rcx",
 
     // patch interrupt frame: RSP → HOST_RSP
-    "mov [rsp + 0x30], rax",
+    "mov [rsp + 0x38], rax",
 
     // patch interrupt frame: RIP → recovery stub
     "lea rax, [rip + vmexit_recover_gp]",
-    "mov [rsp + 0x18], rax",
+    "mov [rsp + 0x20], rax",
 
+    "pop rdx",
     "pop rcx",
     "pop rax",
     "add rsp, 8",          // skip error_code
     "iretq",
 
+    // re-entrant: fatal halt (allows NMI watchdog to fire)
+    "2:",
+    "pop rdx",
+    "pop rcx",
+    "pop rax",
+    "add rsp, 8",
+    "3:",
+    "hlt",
+    "jmp 3b",
+
     // ------ recovery: inject #GP to guest, then restore + vmresume ------
     ".global vmexit_recover_gp",
     "vmexit_recover_gp:",
     // RSP = HOST_RSP, [RSP] = GuestRegisters*
+    // Clear re-entrancy flag
     "push rax",
     "push rcx",
+    "push rdx",
+    "rdtscp",
+    "and ecx, 0xFF",
+    "lea rax, [rip + {gp_reentrant}]",
+    "mov byte ptr [rax + rcx], 0",
+    "pop rdx",
     // VMENTRY_EXCEPTION_ERR_CODE (0x4018) = 0
     "mov ecx, 0x4018",
     "xor eax, eax",
@@ -184,6 +214,7 @@ core::arch::global_asm!(
 
     gp_count = sym HOST_GP_COUNT,
     gp_rip   = sym GP_FAULT_RIP,
+    gp_reentrant = sym GP_REENTRANT,
 );
 
 // ---------------------------------------------------------------------------
@@ -202,16 +233,17 @@ core::arch::global_asm!(
     "host_pf_handler:",
     "push rax",
     "push rcx",
+    "push rdx",
 
     // counter
     "lea rax, [rip + {pf_count}]",
     "lock inc qword ptr [rax]",
 
-    // After 2 pushes (+16), offsets shift:
-    //   error_code  +0x10
-    //   RIP         +0x18
-    //   RSP         +0x30
-    "mov rax, [rsp + 0x18]",
+    // After 3 pushes (+24), offsets shift:
+    //   error_code  +0x18
+    //   RIP         +0x20
+    //   RSP         +0x38
+    "mov rax, [rsp + 0x20]",
     "lea rcx, [rip + {pf_rip}]",
     "mov [rcx], rax",
 
@@ -219,8 +251,17 @@ core::arch::global_asm!(
     "lea rcx, [rip + {pf_cr2}]",
     "mov [rcx], rax",
 
+    // re-entrancy check via rdtscp
+    "rdtscp",
+    "and ecx, 0xFF",
+    "lea rax, [rip + {pf_reentrant}]",
+    "cmp byte ptr [rax + rcx], 0",
+    "jne 2f",
+    // set re-entrancy flag
+    "mov byte ptr [rax + rcx], 1",
+
     // Preserve the root #PF error code for the injected guest event.
-    "mov rax, [rsp + 0x10]",
+    "mov rax, [rsp + 0x18]",
     "mov ecx, 0x4018",
     "vmwrite rcx, rax",
 
@@ -229,22 +270,40 @@ core::arch::global_asm!(
     "vmread rax, rcx",
 
     // patch interrupt frame: RSP -> HOST_RSP
-    "mov [rsp + 0x30], rax",
+    "mov [rsp + 0x38], rax",
 
     // patch interrupt frame: RIP -> recovery stub
     "lea rax, [rip + vmexit_recover_pf]",
-    "mov [rsp + 0x18], rax",
+    "mov [rsp + 0x20], rax",
 
+    "pop rdx",
     "pop rcx",
     "pop rax",
     "add rsp, 8",          // skip error_code
     "iretq",
 
+    // re-entrant: fatal halt
+    "2:",
+    "pop rdx",
+    "pop rcx",
+    "pop rax",
+    "add rsp, 8",
+    "3:",
+    "hlt",
+    "jmp 3b",
+
     ".global vmexit_recover_pf",
     "vmexit_recover_pf:",
     // RSP = HOST_RSP, [RSP] = GuestRegisters*
+    // Clear re-entrancy flag
     "push rax",
     "push rcx",
+    "push rdx",
+    "rdtscp",
+    "and ecx, 0xFF",
+    "lea rax, [rip + {pf_reentrant}]",
+    "mov byte ptr [rax + rcx], 0",
+    "pop rdx",
     // VMENTRY_INTERRUPTION_INFO_FIELD (0x4016) =
     //   valid(1<<31) | deliver_err(1<<11) | hw_exc(3<<8) | vector=14
     //   = 0x80000B0E
@@ -258,6 +317,7 @@ core::arch::global_asm!(
     pf_count = sym HOST_PF_COUNT,
     pf_rip   = sym PF_FAULT_RIP,
     pf_cr2   = sym PF_FAULT_CR2,
+    pf_reentrant = sym PF_REENTRANT,
 );
 
 // ---------------------------------------------------------------------------

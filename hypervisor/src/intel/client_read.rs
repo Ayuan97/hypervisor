@@ -879,7 +879,12 @@ unsafe extern "C" fn worker_main(_start_context: PVOID) {
         }
 
         idle_spins = idle_spins.wrapping_add(1);
-        core::hint::spin_loop();
+        if idle_spins < 1_024 {
+            core::hint::spin_loop();
+        } else {
+            delay_worker(true);
+            idle_spins = 0;
+        }
     }
 
     cleanup_batch_registration();
@@ -1065,6 +1070,7 @@ fn read_result_word_unchecked(offset: usize) -> u64 {
     if available == 0 {
         return 0;
     }
+    core::sync::atomic::fence(Ordering::Acquire);
     unsafe {
         core::ptr::copy_nonoverlapping(
             result_bytes_ptr().add(offset),
@@ -1086,6 +1092,7 @@ fn write_result_bytes(offset: usize, bytes: &[u8]) {
     unsafe {
         core::ptr::copy_nonoverlapping(bytes.as_ptr(), result_bytes_ptr().add(offset), len);
     }
+    core::sync::atomic::fence(Ordering::Release);
 }
 
 fn read_phys_to_ptr(pa: u64, dst: *mut u8, size: usize) -> Option<usize> {
