@@ -18,9 +18,8 @@ use {
 };
 
 const CPUID_TSC_COMPENSATION_CYCLES: u64 = 600;
-const MAX_CPUID_TSC_COMPENSATION_CYCLES: u64 = 5_000_000;
+const MAX_CPUID_TSC_COMPENSATION_CYCLES: u64 = 10_000;
 const ENABLE_DYNAMIC_CPUID_TSC_COMPENSATION: bool = true;
-static GLOBAL_TSC_OFFSET: AtomicU64 = AtomicU64::new(0);
 static LEAF7_SUBLEAF0_LOW: AtomicU64 = AtomicU64::new(0);
 static LEAF7_SUBLEAF0_HIGH: AtomicU64 = AtomicU64::new(0);
 static LEAF7_SUBLEAF0_READY: AtomicBool = AtomicBool::new(false);
@@ -270,16 +269,10 @@ fn next_tsc_offset(current: u64, compensation_cycles: u64) -> u64 {
 }
 
 fn compensate_cpuid_tsc(vmx: &mut Vmx) {
-    // Global shared offset: all CPUs read/write the same atomic,
-    // preventing cross-CPU TSC divergence on thread migration.
-    let current = GLOBAL_TSC_OFFSET.load(core::sync::atomic::Ordering::Relaxed);
-    let next = next_tsc_offset(current, CPUID_TSC_COMPENSATION_CYCLES);
-    GLOBAL_TSC_OFFSET.store(next, core::sync::atomic::Ordering::Relaxed);
+    vmx.tsc_offset = next_tsc_offset(vmx.tsc_offset, CPUID_TSC_COMPENSATION_CYCLES);
+    crate::intel::diag::TSC_OFFSET.store(vmx.tsc_offset, core::sync::atomic::Ordering::Relaxed);
 
-    vmx.tsc_offset = next;
-    crate::intel::diag::TSC_OFFSET.store(next, core::sync::atomic::Ordering::Relaxed);
-
-    if let Err(error) = vmwrite_checked(vmcs::control::TSC_OFFSET_FULL, next) {
+    if let Err(error) = vmwrite_checked(vmcs::control::TSC_OFFSET_FULL, vmx.tsc_offset) {
         log::error!("Failed to update TSC offset after CPUID exit: {:?}", error);
     }
 }
@@ -433,11 +426,9 @@ mod tests {
     }
 
     #[test]
-    fn dynamic_cpuid_tsc_compensation_uses_global_offset() {
+    fn dynamic_cpuid_tsc_compensation_is_enabled_with_bounded_cap() {
         assert!(ENABLE_DYNAMIC_CPUID_TSC_COMPENSATION);
-        // Verify global offset starts at zero
-        GLOBAL_TSC_OFFSET.store(0, core::sync::atomic::Ordering::Relaxed);
-        assert_eq!(GLOBAL_TSC_OFFSET.load(core::sync::atomic::Ordering::Relaxed), 0);
+        assert!(MAX_CPUID_TSC_COMPENSATION_CYCLES <= 50_000);
     }
 
     #[test]
