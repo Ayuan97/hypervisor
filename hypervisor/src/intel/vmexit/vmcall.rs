@@ -36,6 +36,8 @@ const CMD_READ_RESULT_WORD: u64 = 0x1D;
 const CMD_RELEASE_READ_RESULT: u64 = 0x1E;
 const CMD_READ_RESULT_QUAD: u64 = 0x1F;
 const CMD_CLOAK_PAGE: u64 = 0x20;
+const CMD_REGISTER_BATCH_BUFFER: u64 = 0x26;
+const CMD_UNREGISTER_BATCH_BUFFER: u64 = 0x27;
 pub const CMD_DEVIRTUALIZE: u64 = 0xFF;
 const CLIENT_READ_ARM_TOKEN: u64 = 0xC17E_A2D5_90B4_6F31;
 
@@ -73,6 +75,8 @@ fn user_client_read_command(cmd: u64) -> bool {
             | CMD_READ_RESULT_WORD
             | CMD_RELEASE_READ_RESULT
             | CMD_READ_RESULT_QUAD
+            | CMD_REGISTER_BATCH_BUFFER
+            | CMD_UNREGISTER_BATCH_BUFFER
     )
 }
 
@@ -248,6 +252,15 @@ pub fn dispatch_command(guest_registers: &mut GuestRegisters, vmx: &mut Vmx) -> 
             guest_registers.rbx = words[1];
             guest_registers.rcx = words[2];
             guest_registers.rdx = words[3];
+            ExitType::IncrementRIP
+        }
+        CMD_REGISTER_BATCH_BUFFER => {
+            guest_registers.rax =
+                crate::intel::client_read::request_batch_buffer_registration(arg1, arg2 as usize);
+            ExitType::IncrementRIP
+        }
+        CMD_UNREGISTER_BATCH_BUFFER => {
+            guest_registers.rax = crate::intel::client_read::request_batch_buffer_unregister();
             ExitType::IncrementRIP
         }
         CMD_RELEASE_READ_RESULT => {
@@ -535,6 +548,24 @@ mod tests {
     }
 
     #[test]
+    fn client_read_build_allows_batch_buffer_commands() {
+        assert_eq!(CMD_REGISTER_BATCH_BUFFER, 0x26);
+        assert_eq!(CMD_UNREGISTER_BATCH_BUFFER, 0x27);
+        assert!(!command_requires_ring0_with_client_read_state(
+            CMD_REGISTER_BATCH_BUFFER,
+            0,
+            true,
+            true
+        ));
+        assert!(!command_requires_ring0_with_client_read_state(
+            CMD_UNREGISTER_BATCH_BUFFER,
+            0,
+            true,
+            true
+        ));
+    }
+
+    #[test]
     fn client_read_build_requires_runtime_arm() {
         assert!(command_requires_ring0_with_client_read_state(
             CMD_READ_PHYS,
@@ -660,6 +691,20 @@ mod tests {
         ));
         assert!(diagnostic_command_allowed_with_client_read_state(
             CMD_READ_VIRT,
+            0,
+            true,
+            true,
+            true
+        ));
+        assert!(diagnostic_command_allowed_with_client_read_state(
+            CMD_REGISTER_BATCH_BUFFER,
+            0,
+            true,
+            true,
+            true
+        ));
+        assert!(diagnostic_command_allowed_with_client_read_state(
+            CMD_UNREGISTER_BATCH_BUFFER,
             0,
             true,
             true,

@@ -1,0 +1,34 @@
+@echo off
+setlocal
+
+set "HV_BOOT_STOP_STAGE="
+set "HV_USER_CLIENT_READS=1"
+set "HV_PT_CONCEAL_MASK=0"
+set "DRIVER_PATH=%~dp0..\target\release\matrix_client_pt0_diag.sys"
+set "DLL_PATH=%~dp0..\target\release\matrix.dll"
+
+echo [*] Building client-read PT0 diagnostic driver...
+echo [*] Build flags: HV_USER_CLIENT_READS=%HV_USER_CLIENT_READS% HV_PT_CONCEAL_MASK=%HV_PT_CONCEAL_MASK%
+cd /d "%~dp0.."
+cargo clean -p matrix -p hypervisor >nul 2>&1
+cargo build -p matrix --release
+if %errorlevel% neq 0 (
+    echo [-] Build failed.
+    exit /b 1
+)
+
+echo [*] Finalizing SYS...
+powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0finalize_driver.ps1" -Source "%DLL_PATH%" -Destination "%DRIVER_PATH%"
+if %errorlevel% neq 0 (
+    echo [-] Finalize failed.
+    exit /b 1
+)
+
+echo [*] Scanning release strings...
+powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0scan_release_strings.ps1" -Driver "%DRIVER_PATH%"
+if %errorlevel% neq 0 (
+    echo [-] Release string scan failed.
+    exit /b 1
+)
+
+echo [+] PT0 diagnostic client-read driver ready: %DRIVER_PATH%
