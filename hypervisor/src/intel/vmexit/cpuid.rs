@@ -19,7 +19,7 @@ use {
 
 const CPUID_TSC_COMPENSATION_CYCLES: u64 = 600;
 const MAX_CPUID_TSC_COMPENSATION_CYCLES: u64 = 5_000_000;
-const ENABLE_DYNAMIC_CPUID_TSC_COMPENSATION: bool = true;
+const ENABLE_DYNAMIC_CPUID_TSC_COMPENSATION: bool = false;
 static LEAF7_SUBLEAF0_LOW: AtomicU64 = AtomicU64::new(0);
 static LEAF7_SUBLEAF0_HIGH: AtomicU64 = AtomicU64::new(0);
 static LEAF7_SUBLEAF0_READY: AtomicBool = AtomicBool::new(false);
@@ -426,8 +426,8 @@ mod tests {
     }
 
     #[test]
-    fn dynamic_cpuid_tsc_compensation_is_enabled() {
-        assert!(ENABLE_DYNAMIC_CPUID_TSC_COMPENSATION);
+    fn dynamic_cpuid_tsc_compensation_is_disabled() {
+        assert!(!ENABLE_DYNAMIC_CPUID_TSC_COMPENSATION);
     }
 
     #[test]
