@@ -79,6 +79,7 @@ impl Ept {
     /// A `Result<(), HypervisorError>` indicating if the operation was successful.
     pub fn identity_2mb(&mut self, access_type: AccessType) -> Result<(), HypervisorError> {
         log::trace!("Creating identity map for 2MB pages");
+        crate::intel::diag_trace::trace("ept: identity_2mb start");
 
         let mut mtrr = Mtrr::new();
 
@@ -86,6 +87,7 @@ impl Ept {
             self.map_2mb(pa, pa, access_type, &mut mtrr)?;
         }
 
+        crate::intel::diag_trace::trace("ept: identity_2mb done");
         Ok(())
     }
 

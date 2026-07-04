@@ -279,11 +279,22 @@ impl Vmcs {
         let requested_exit_ctl = requested_exit_controls();
         const PINBASED_CTL: u64 = 0;
 
+        use crate::intel::diag_trace as dt;
+        dt::trace("vmcs: adjusting controls");
+        dt::trace_val("  requested pri", primary_ctl);
+        dt::trace_val("  requested sec", requested_secondary_ctl);
+
         let ctl_pin = adjust_vmx_controls(VmxControl::PinBased, PINBASED_CTL)?;
         let ctl_pri = adjust_vmx_controls(VmxControl::ProcessorBased, primary_ctl)?;
         let ctl_sec = adjust_vmx_controls(VmxControl::ProcessorBased2, requested_secondary_ctl)?;
         let ctl_ent = adjust_vmx_controls(VmxControl::VmEntry, requested_entry_ctl)?;
         let ctl_ext = adjust_vmx_controls(VmxControl::VmExit, requested_exit_ctl)?;
+
+        dt::trace_val("  actual pin", ctl_pin);
+        dt::trace_val("  actual pri", ctl_pri);
+        dt::trace_val("  actual sec", ctl_sec);
+        dt::trace_val("  actual ent", ctl_ent);
+        dt::trace_val("  actual ext", ctl_ext);
 
         if !required_controls_present(primary_ctl, ctl_pri)
             || !required_controls_present(secondary_ctl, ctl_sec)
@@ -369,6 +380,7 @@ impl Vmcs {
             return Err(HypervisorError::VMXUnsupported);
         }
 
+        dt::trace("vmcs: writing control fields");
         vmwrite_checked(vmcs::control::PINBASED_EXEC_CONTROLS, ctl_pin)?;
         vmwrite_checked(vmcs::control::PRIMARY_PROCBASED_EXEC_CONTROLS, ctl_pri)?;
         vmwrite_checked(vmcs::control::SECONDARY_PROCBASED_EXEC_CONTROLS, ctl_sec)?;
@@ -405,9 +417,11 @@ impl Vmcs {
         vmwrite_checked(vmcs::control::EPTP_FULL, shared_data.primary_eptp)?;
         vmwrite_checked(vmcs::control::VPID, VPID_TAG)?;
 
+        dt::trace_val("vmcs: eptp", shared_data.primary_eptp);
         try_invept_single_context(shared_data.primary_eptp)?;
         try_invvpid_single_context(VPID_TAG)?;
 
+        dt::trace("vmcs: control fields done");
         log::debug!("VMCS Control Fields setup successfully!");
 
         Ok(())

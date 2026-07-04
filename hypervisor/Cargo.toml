@@ -5,6 +5,7 @@ edition = "2021"
 
 [features]
 default = []
+debug-log = []
 secondary-ept = []
 shellcode-hook = []
 

@@ -2,6 +2,7 @@ pub mod client_read;
 pub mod controls;
 pub mod descriptor;
 pub mod diag;
+pub mod diag_trace;
 pub mod ept;
 pub mod events;
 pub mod host_idt;

@@ -77,6 +77,7 @@ pub const fn parse_boot_stop_stage(value: Option<&str>) -> u64 {
 
 pub fn set_boot_stage(stage: u64) {
     BOOT_STAGE.store(stage, Relaxed);
+    super::diag_trace::trace_stage(stage);
 }
 
 pub fn boot_stage(stage: u64) -> Result<(), HypervisorError> {
