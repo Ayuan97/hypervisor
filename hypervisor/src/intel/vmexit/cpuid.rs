@@ -129,16 +129,16 @@ pub fn handle_cpuid(guest_registers: &mut GuestRegisters, vmx: &mut Vmx) -> Exit
 }
 
 fn enable_rdtsc_exiting() {
-    if let Ok(val) = crate::intel::support::vmread_checked(vmcs::control::PRIMARY_PROCBASED_VMEXEC_CONTROLS) {
+    if let Ok(val) = crate::intel::support::vmread_checked(vmcs::control::PRIMARY_PROCBASED_EXEC_CONTROLS) {
         let new_val = val | (1 << 12); // bit 12 = RDTSC exiting
-        let _ = vmwrite_checked(vmcs::control::PRIMARY_PROCBASED_VMEXEC_CONTROLS, new_val);
+        let _ = vmwrite_checked(vmcs::control::PRIMARY_PROCBASED_EXEC_CONTROLS, new_val);
     }
 }
 
 pub fn disable_rdtsc_exiting() {
-    if let Ok(val) = crate::intel::support::vmread_checked(vmcs::control::PRIMARY_PROCBASED_VMEXEC_CONTROLS) {
+    if let Ok(val) = crate::intel::support::vmread_checked(vmcs::control::PRIMARY_PROCBASED_EXEC_CONTROLS) {
         let new_val = val & !(1 << 12);
-        let _ = vmwrite_checked(vmcs::control::PRIMARY_PROCBASED_VMEXEC_CONTROLS, new_val);
+        let _ = vmwrite_checked(vmcs::control::PRIMARY_PROCBASED_EXEC_CONTROLS, new_val);
     }
 }
 
