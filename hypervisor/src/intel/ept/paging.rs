@@ -235,11 +235,9 @@ impl Ept {
             return Err(HypervisorError::OutOfMemory);
         }
 
+        let pt_pfn = table_pa_from_va(pt as u64) >> BASE_PAGE_SHIFT;
         let pd_entry = &mut self.pd[pdpt_index].0.entries[pd_index];
-        set_entry_access(pd_entry, access_type);
-        pd_entry.set_memory_type(0);
-        pd_entry.set_large(false);
-        pd_entry.set_pfn(table_pa_from_va(pt as u64) >> BASE_PAGE_SHIFT);
+        pd_entry.0 = access_type.bits() as u64 | (pt_pfn << 12);
 
         Ok(())
     }
@@ -388,11 +386,9 @@ impl Ept {
             return Err(HypervisorError::OutOfMemory);
         }
 
+        let pt_pfn = table_pa_from_va(pt as u64) >> BASE_PAGE_SHIFT;
         let pd_entry = &mut self.pd[pdpt_index].0.entries[pd_index];
-        set_entry_access(pd_entry, access_type);
-        pd_entry.set_memory_type(0);
-        pd_entry.set_large(false);
-        pd_entry.set_pfn(table_pa_from_va(pt as u64) >> BASE_PAGE_SHIFT);
+        pd_entry.0 = access_type.bits() as u64 | (pt_pfn << 12);
 
         Ok(())
     }
@@ -454,17 +450,11 @@ impl Ept {
     /// * `entry`: Mutable reference to the page directory entry to unmap.
     pub fn unmap_2mb(entry: &mut Entry) {
         if !entry.readable() {
-            // The page is already not present; no action needed.
             return;
         }
 
-        // Unmap the large page and clear the flags
-        entry.set_readable(false);
-        entry.set_writable(false);
-        entry.set_executable(false);
-        entry.set_memory_type(0);
-        entry.set_large(false);
-        entry.set_pfn(0); // Reset the Page Frame Number
+        // Single store: avoids transient reserved states visible to other CPUs.
+        entry.0 = 0;
     }
 
     /// Unmaps a 4KB page, typically involved in deconstructing finer-grained page tables.
@@ -545,10 +535,9 @@ impl Ept {
         };
 
         let pt_entry = &mut pt.0.entries[pt_index];
-        set_entry_access(pt_entry, access_type);
-        pt_entry.set_memory_type(memory_type as u64);
-        pt_entry.set_large(false);
-        pt_entry.set_pfn(host_pa >> BASE_PAGE_SHIFT);
+        pt_entry.0 = access_type.bits() as u64
+            | ((memory_type as u64) << 3)
+            | ((host_pa >> BASE_PAGE_SHIFT) << 12);
 
         Ok(())
     }
@@ -681,9 +670,9 @@ bitfield! {
 }
 
 fn set_entry_access(entry: &mut Entry, access_type: AccessType) {
-    entry.set_readable(access_type.contains(AccessType::READ));
-    entry.set_writable(access_type.contains(AccessType::WRITE));
-    entry.set_executable(access_type.contains(AccessType::EXECUTE));
+    // Single store: avoids transient reserved bit patterns (e.g. writable
+    // without readable) that cause EPT misconfiguration on other CPUs.
+    entry.0 = (entry.0 & !0b111u64) | access_type.bits() as u64;
 }
 
 #[cfg(not(test))]

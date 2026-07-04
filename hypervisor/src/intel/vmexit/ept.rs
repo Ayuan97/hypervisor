@@ -87,7 +87,6 @@ pub fn handle_ept_violation(_guest_registers: &mut GuestRegisters, _vmx: &mut Vm
                 enable_monitor_trap_flag(proc_ctl),
             ) {
                 log::error!("Failed to enable monitor trap flag: {:?}", error);
-                // Recovery: switch back to primary EPTP since MTF won't fire
                 let primary_eptp = _vmx.shared_data_ref().primary_eptp;
                 let _ = vmwrite_checked(vmcs::control::EPTP_FULL, primary_eptp);
                 invept_all_contexts();
@@ -96,6 +95,7 @@ pub fn handle_ept_violation(_guest_registers: &mut GuestRegisters, _vmx: &mut Vm
             }
             _vmx.mtf_recloak_pa = Some(guest_physical_address);
             invept_all_contexts();
+            return ExitType::Continue;
         }
 
         if is_memory_violation_on_execute_only_page(&eq) {
@@ -123,9 +123,12 @@ pub fn handle_ept_violation(_guest_registers: &mut GuestRegisters, _vmx: &mut Vm
             }
             _vmx.mtf_recloak_pa.take();
             invept_all_contexts();
+            return ExitType::Continue;
         }
     }
 
+    // Unhandled EPT violation: inject #GP to prevent infinite re-execution loop.
+    EventInjection::vmentry_inject_gp(0);
     ExitType::Continue
 }
 
