@@ -465,11 +465,26 @@ fn main() {
         "MSR",
         "Host #GP",
         "Host NMI",
+        "LastMsrAddr",
+        "LastMsrAction",
+        "MsrReadCnt",
+        "MsrWriteCnt",
+        "MsrGpInject",
+        "LastHandlerID",
+        "LastHandlerDet",
+        "Host #PF",
+        "Host #MC",
+        "RDTSC",
+        "VMX Instr",
     ];
     for (i, name) in counter_names.iter().enumerate() {
         let v = hv_cmd(0x14, i as u64);
         if v > 0 || i == 0 {
-            println!("  {:<14} = {}", name, v);
+            if i == 12 || i == 18 {
+                println!("  {:<14} = {:#x}", name, v);
+            } else {
+                println!("  {:<14} = {}", name, v);
+            }
         }
     }
 

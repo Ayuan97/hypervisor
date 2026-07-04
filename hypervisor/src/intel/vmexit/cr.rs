@@ -78,9 +78,15 @@ fn sanitize_cr4_write(
         return Err(Cr4WriteError::DisallowedFixed1Bits);
     }
 
+    let shadow_value = if option_env!("HV_TRANSPARENT").is_some() {
+        guest_value
+    } else {
+        requested_value & !CR4_VMXE
+    };
+
     Ok(Cr4Update {
         guest_value,
-        shadow_value: requested_value & !CR4_VMXE,
+        shadow_value,
     })
 }
 

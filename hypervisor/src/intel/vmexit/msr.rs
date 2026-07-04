@@ -47,11 +47,28 @@ pub fn handle_msr_access(
     guest_registers: &mut GuestRegisters,
     access_type: MsrAccessType,
 ) -> ExitType {
+    use crate::intel::diag;
+    use core::sync::atomic::Ordering::Relaxed;
+    let msr_addr = guest_registers.rcx as u32;
+    diag::LAST_MSR_ADDR.store(msr_addr as u64, Relaxed);
+    match &access_type {
+        MsrAccessType::Read => {
+            diag::LAST_MSR_ACTION.store(0, Relaxed);
+            diag::MSR_READ_COUNT.fetch_add(1, Relaxed);
+        }
+        MsrAccessType::Write => {
+            diag::LAST_MSR_ACTION.store(1, Relaxed);
+            diag::MSR_WRITE_COUNT.fetch_add(1, Relaxed);
+        }
+    }
     handle_msr_access_with(
         guest_registers,
         access_type,
         |msr| unsafe { msr::rdmsr(msr) },
-        EventInjection::vmentry_inject_gp,
+        |code| {
+            diag::MSR_GP_INJECTED.fetch_add(1, Relaxed);
+            EventInjection::vmentry_inject_gp(code);
+        },
     )
 }
 
@@ -80,7 +97,12 @@ where
     }
 
     if matches!(access_type, MsrAccessType::Read) && msr == IA32_FEATURE_CONTROL_MSR {
-        let value = read_msr(msr) & !FEATURE_CONTROL_HIDDEN_BITS;
+        let raw = read_msr(msr);
+        let value = if option_env!("HV_TRANSPARENT").is_some() {
+            raw
+        } else {
+            raw & !FEATURE_CONTROL_HIDDEN_BITS
+        };
         guest_registers.rax = value & 0xFFFF_FFFF;
         guest_registers.rdx = value >> 32;
         return ExitType::IncrementRIP;

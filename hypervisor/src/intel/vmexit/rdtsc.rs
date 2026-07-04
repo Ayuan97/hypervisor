@@ -28,20 +28,21 @@ User can add the following later:
 /// * `ExitType::IncrementRIP` - To move past the `RDTSC` instruction in the VM.
 ///
 /// Reference: Intel® 64 and IA-32 Architectures Software Developer's Manual, Table C-1. Basic Exit Reasons 10.
-pub fn handle_rdtsc(guest_registers: &mut GuestRegisters, vmx: &mut crate::intel::vmx::Vmx) -> ExitType {
-    log::debug!("Handling RDTSC VM exit...");
-
-    let exit = if vmx.cpuid_entry_tsc != 0 {
+pub fn handle_rdtsc(
+    guest_registers: &mut GuestRegisters,
+    vmx: &mut crate::intel::vmx::Vmx,
+) -> ExitType {
+    if vmx.cpuid_entry_tsc != 0 {
         handle_rdtsc_spoofed(guest_registers, vmx)
     } else {
         handle_rdtsc_with_offset(guest_registers, || unsafe { rdtsc() }, vmx.tsc_offset)
-    };
-
-    log::debug!("RDTSC VMEXIT handled successfully!");
-    exit
+    }
 }
 
-pub fn handle_rdtscp(guest_registers: &mut GuestRegisters, vmx: &mut crate::intel::vmx::Vmx) -> ExitType {
+pub fn handle_rdtscp(
+    guest_registers: &mut GuestRegisters,
+    vmx: &mut crate::intel::vmx::Vmx,
+) -> ExitType {
     if vmx.cpuid_entry_tsc != 0 {
         let (_, aux) = unsafe { rdtscp() };
         guest_registers.rcx = aux as u64;
@@ -51,12 +52,33 @@ pub fn handle_rdtscp(guest_registers: &mut GuestRegisters, vmx: &mut crate::inte
     }
 }
 
-fn handle_rdtsc_spoofed(guest_registers: &mut GuestRegisters, vmx: &mut crate::intel::vmx::Vmx) -> ExitType {
-    use super::cpuid::CPUID_BARE_METAL_COST;
-    let spoofed = vmx.cpuid_entry_tsc.wrapping_add(CPUID_BARE_METAL_COST);
-    write_tsc(guest_registers, spoofed);
+pub const SPOOF_WINDOW: u64 = 10_000;
+
+fn handle_rdtsc_spoofed(
+    guest_registers: &mut GuestRegisters,
+    vmx: &mut crate::intel::vmx::Vmx,
+) -> ExitType {
+    use super::cpuid::{CPUID_BARE_METAL_COST, VMEXIT_ENTRY_OVERHEAD};
+    let now = unsafe { x86::time::rdtsc() };
+    let elapsed = now.wrapping_sub(vmx.cpuid_entry_tsc);
     vmx.cpuid_entry_tsc = 0;
     super::cpuid::disable_rdtsc_exiting();
+    if elapsed > SPOOF_WINDOW {
+        write_tsc(guest_registers, now.wrapping_add(vmx.tsc_offset));
+        return ExitType::IncrementRIP;
+    }
+    let vmcs_tsc_offset =
+        crate::intel::support::vmread_checked(x86::vmx::vmcs::control::TSC_OFFSET_FULL)
+            .unwrap_or(0);
+    // cpuid_entry_tsc was captured AFTER VM-exit transition (~600 cycles).
+    // Subtract VMEXIT_ENTRY_OVERHEAD to approximate guest-side TSC at CPUID time,
+    // then add bare-metal CPUID cost so guest sees: rdtsc_after - rdtsc_before ≈ 120.
+    let spoofed = now
+        .wrapping_sub(elapsed)
+        .wrapping_sub(VMEXIT_ENTRY_OVERHEAD)
+        .wrapping_add(CPUID_BARE_METAL_COST)
+        .wrapping_add(vmcs_tsc_offset);
+    write_tsc(guest_registers, spoofed);
     ExitType::IncrementRIP
 }
 

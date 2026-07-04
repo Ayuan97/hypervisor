@@ -30,7 +30,18 @@ pub static EXIT_CR_ACCESS: AtomicU64 = AtomicU64::new(0);
 pub static EXIT_XSETBV: AtomicU64 = AtomicU64::new(0);
 pub static EXIT_MSR: AtomicU64 = AtomicU64::new(0);
 pub static EXIT_OTHER: AtomicU64 = AtomicU64::new(0);
+pub static EXIT_RDTSC: AtomicU64 = AtomicU64::new(0);
+pub static EXIT_VMX_INSTR: AtomicU64 = AtomicU64::new(0);
 pub static LAST_EXIT_REASON: AtomicU64 = AtomicU64::new(u64::MAX);
+
+pub static LAST_MSR_ADDR: AtomicU64 = AtomicU64::new(0);
+pub static LAST_MSR_ACTION: AtomicU64 = AtomicU64::new(0);
+pub static MSR_READ_COUNT: AtomicU64 = AtomicU64::new(0);
+pub static MSR_WRITE_COUNT: AtomicU64 = AtomicU64::new(0);
+pub static MSR_GP_INJECTED: AtomicU64 = AtomicU64::new(0);
+
+pub static LAST_HANDLER_ID: AtomicU64 = AtomicU64::new(0);
+pub static LAST_HANDLER_DETAIL: AtomicU64 = AtomicU64::new(0);
 
 pub static CTL_PINBASED: AtomicU64 = AtomicU64::new(0);
 pub static CTL_PRIMARY: AtomicU64 = AtomicU64::new(0);
@@ -221,6 +232,17 @@ pub fn counter(id: u64) -> u64 {
         9 => EXIT_MSR.load(Relaxed),
         10 => super::host_idt::HOST_GP_COUNT.load(Relaxed),
         11 => super::host_idt::HOST_NMI_COUNT.load(Relaxed),
+        12 => LAST_MSR_ADDR.load(Relaxed),
+        13 => LAST_MSR_ACTION.load(Relaxed),
+        14 => MSR_READ_COUNT.load(Relaxed),
+        15 => MSR_WRITE_COUNT.load(Relaxed),
+        16 => MSR_GP_INJECTED.load(Relaxed),
+        17 => LAST_HANDLER_ID.load(Relaxed),
+        18 => LAST_HANDLER_DETAIL.load(Relaxed),
+        19 => super::host_idt::HOST_PF_COUNT.load(Relaxed),
+        20 => super::host_idt::HOST_MC_COUNT.load(Relaxed),
+        21 => EXIT_RDTSC.load(Relaxed),
+        22 => EXIT_VMX_INSTR.load(Relaxed),
         _ => u64::MAX,
     }
 }

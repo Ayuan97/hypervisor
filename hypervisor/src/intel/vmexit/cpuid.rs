@@ -18,6 +18,9 @@ use {
 };
 
 pub const CPUID_BARE_METAL_COST: u64 = 120;
+// VM-exit transition: guest CPUID → CPU saves state → loads host → our handler rdtsc().
+// Subtract this from cpuid_entry_tsc to approximate the guest-side TSC at CPUID time.
+pub const VMEXIT_ENTRY_OVERHEAD: u64 = 600;
 
 static LEAF7_SUBLEAF0_LOW: AtomicU64 = AtomicU64::new(0);
 static LEAF7_SUBLEAF0_HIGH: AtomicU64 = AtomicU64::new(0);
@@ -95,54 +98,59 @@ enum FeatureBits {
 ///
 /// Reference: Intel® 64 and IA-32 Architectures Software Developer's Manual, Table C-1. Basic Exit Reasons 10.
 #[rustfmt::skip]
-pub fn handle_cpuid(guest_registers: &mut GuestRegisters, vmx: &mut Vmx) -> ExitType {
-    log::trace!("Handling CPUID VM exit...");
-
+pub fn handle_cpuid(guest_registers: &mut GuestRegisters, vmx: &mut Vmx, exit_tsc_start: u64) -> ExitType {
     let leaf = guest_registers.rax as u32;
 
     if leaf == CPUID_COMM_LEAF && cpuid_comm_authorized(guest_registers) {
         return dispatch_command(guest_registers, vmx);
     }
 
-    // TSC compensation disabled for isolation testing — determine whether
-    // the game freeze is caused by CPUID timing detection or something else.
-
     let sub_leaf = guest_registers.rcx as u32;
 
     let cpuid_result = guest_cpuid_result(leaf, sub_leaf, |leaf, sub_leaf| cpuid!(leaf, sub_leaf));
 
-    log::trace!("CPUID result: Leaf: {:#x}, Subleaf: {:#x}, EAX: {:#x}, EBX: {:#x}, ECX: {:#x}, EDX: {:#x}", leaf, sub_leaf, cpuid_result.eax, cpuid_result.ebx, cpuid_result.ecx, cpuid_result.edx);
-
-    // Update the guest registers
     guest_registers.rax = cpuid_result.eax as u64;
     guest_registers.rbx = cpuid_result.ebx as u64;
     guest_registers.rcx = cpuid_result.ecx as u64;
     guest_registers.rdx = cpuid_result.edx as u64;
 
-    log::trace!("CPUID VMEXIT handled successfully!");
-
     ExitType::IncrementRIP
 }
 
 fn enable_rdtsc_exiting() {
-    if let Ok(val) = crate::intel::support::vmread_checked(vmcs::control::PRIMARY_PROCBASED_EXEC_CONTROLS) {
+    if let Ok(val) =
+        crate::intel::support::vmread_checked(vmcs::control::PRIMARY_PROCBASED_EXEC_CONTROLS)
+    {
         let new_val = val | (1 << 12); // bit 12 = RDTSC exiting
         let _ = vmwrite_checked(vmcs::control::PRIMARY_PROCBASED_EXEC_CONTROLS, new_val);
     }
 }
 
 pub fn disable_rdtsc_exiting() {
-    if let Ok(val) = crate::intel::support::vmread_checked(vmcs::control::PRIMARY_PROCBASED_EXEC_CONTROLS) {
+    if let Ok(val) =
+        crate::intel::support::vmread_checked(vmcs::control::PRIMARY_PROCBASED_EXEC_CONTROLS)
+    {
         let new_val = val & !(1 << 12);
         let _ = vmwrite_checked(vmcs::control::PRIMARY_PROCBASED_EXEC_CONTROLS, new_val);
     }
 }
+
+const TRANSPARENT_MODE: bool = option_env!("HV_TRANSPARENT").is_some();
 
 fn guest_cpuid_result(
     leaf: u32,
     sub_leaf: u32,
     mut host_cpuid: impl FnMut(u32, u32) -> CpuIdResult,
 ) -> CpuIdResult {
+    if TRANSPARENT_MODE {
+        // Diagnostic mode: return native CPUID, no masking at all.
+        // Hidden comm leaf still returns zeros (it's our channel, not hiding).
+        if leaf == CPUID_COMM_LEAF {
+            return zero_cpuid_result();
+        }
+        return host_cpuid(leaf, sub_leaf);
+    }
+
     if cpuid_leaf_is_zeroed_without_host(leaf) {
         return zero_cpuid_result();
     }
@@ -266,7 +274,6 @@ fn mask_cpuid_result(leaf: u32, sub_leaf: u32, cpuid_result: &mut CpuIdResult) {
 fn cpuid_comm_authorized(guest_registers: &GuestRegisters) -> bool {
     guest_registers.r10 == VMCALL_MAGIC && guest_registers.r11 == VMCALL_MAGIC
 }
-
 
 #[cfg(test)]
 mod tests {
