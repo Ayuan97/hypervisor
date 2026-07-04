@@ -106,7 +106,7 @@ pub fn handle_exception(guest_registers: &mut GuestRegisters, vmx: &mut Vmx) -> 
 fn handle_breakpoint_exception(guest_registers: &mut GuestRegisters, vmx: &mut Vmx) {
     log::debug!("Breakpoint Exception");
 
-    let hook_manager = unsafe { vmx.shared_data.as_mut().hook_manager.as_mut() };
+    let hook_manager = vmx.shared_data_mut().hook_manager.as_mut();
 
     log::trace!("Finding hook for RIP: {:#x}", guest_registers.rip);
 

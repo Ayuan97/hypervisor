@@ -310,12 +310,24 @@ impl Vmx {
         self.control_registers.restore();
     }
 
+    /// Returns a shared reference to the shared data.
+    ///
+    /// # Safety
+    ///
+    /// The pointer must be valid for the lifetime of the hypervisor.
+    /// Multiple CPUs may hold shared references concurrently.
+    pub fn shared_data_ref(&self) -> &SharedData {
+        unsafe { self.shared_data.as_ref() }
+    }
+
     /// Returns a mutable reference to the shared data.
     ///
-    /// # Returns
+    /// # Safety
     ///
-    /// A mutable reference to the shared data.
-    pub fn shared_data(&mut self) -> &mut SharedData {
+    /// Caller must ensure no other CPU concurrently accesses the same
+    /// fields being mutated (e.g., EPT page table modifications via VMCALL
+    /// are serialized by the single-threaded CPL0 caller).
+    pub fn shared_data_mut(&mut self) -> &mut SharedData {
         unsafe { self.shared_data.as_mut() }
     }
 }
