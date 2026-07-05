@@ -11,7 +11,6 @@
 
 use crate::{
     intel::{
-        events::EventInjection,
         support::{vmread_checked, vmxoff},
         vcpu::Vcpu,
         vmerror::VmInstructionError,
@@ -112,16 +111,16 @@ launch_vm:
     // Save the original host stack and Windows x64 nonvolatile XMM registers
     // in the VmStack footer before switching RSP.
     mov     [rdx + vmstack_original_rsp], rsp
-    movdqa  [rdx + vmstack_host_xmm6], xmm6
-    movdqa  [rdx + vmstack_host_xmm7], xmm7
-    movdqa  [rdx + vmstack_host_xmm8], xmm8
-    movdqa  [rdx + vmstack_host_xmm9], xmm9
-    movdqa  [rdx + vmstack_host_xmm10], xmm10
-    movdqa  [rdx + vmstack_host_xmm11], xmm11
-    movdqa  [rdx + vmstack_host_xmm12], xmm12
-    movdqa  [rdx + vmstack_host_xmm13], xmm13
-    movdqa  [rdx + vmstack_host_xmm14], xmm14
-    movdqa  [rdx + vmstack_host_xmm15], xmm15
+    movdqu  [rdx + vmstack_host_xmm6], xmm6
+    movdqu  [rdx + vmstack_host_xmm7], xmm7
+    movdqu  [rdx + vmstack_host_xmm8], xmm8
+    movdqu  [rdx + vmstack_host_xmm9], xmm9
+    movdqu  [rdx + vmstack_host_xmm10], xmm10
+    movdqu  [rdx + vmstack_host_xmm11], xmm11
+    movdqu  [rdx + vmstack_host_xmm12], xmm12
+    movdqu  [rdx + vmstack_host_xmm13], xmm13
+    movdqu  [rdx + vmstack_host_xmm14], xmm14
+    movdqu  [rdx + vmstack_host_xmm15], xmm15
 
     // Set host stack pointer (RSP) to the end of stack_contents in VmStack.
     mov rsp, rdx
@@ -163,23 +162,23 @@ launch_vm:
     mov     r11, [r15 + registers_r11]
     mov     r12, [r15 + registers_r12]
 
-    // Restore guest XMM registers.
-    movdqa  xmm0, [r15 + registers_xmm0]
-    movdqa  xmm1, [r15 + registers_xmm1]
-    movdqa  xmm2, [r15 + registers_xmm2]
-    movdqa  xmm3, [r15 + registers_xmm3]
-    movdqa  xmm4, [r15 + registers_xmm4]
-    movdqa  xmm5, [r15 + registers_xmm5]
-    movdqa  xmm6, [r15 + registers_xmm6]
-    movdqa  xmm7, [r15 + registers_xmm7]
-    movdqa  xmm8, [r15 + registers_xmm8]
-    movdqa  xmm9, [r15 + registers_xmm9]
-    movdqa  xmm10, [r15 + registers_xmm10]
-    movdqa  xmm11, [r15 + registers_xmm11]
-    movdqa  xmm12, [r15 + registers_xmm12]
-    movdqa  xmm13, [r15 + registers_xmm13]
-    movdqa  xmm14, [r15 + registers_xmm14]
-    movdqa  xmm15, [r15 + registers_xmm15]
+    // Restore guest XMM registers (movdqu: no alignment #GP).
+    movdqu  xmm0, [r15 + registers_xmm0]
+    movdqu  xmm1, [r15 + registers_xmm1]
+    movdqu  xmm2, [r15 + registers_xmm2]
+    movdqu  xmm3, [r15 + registers_xmm3]
+    movdqu  xmm4, [r15 + registers_xmm4]
+    movdqu  xmm5, [r15 + registers_xmm5]
+    movdqu  xmm6, [r15 + registers_xmm6]
+    movdqu  xmm7, [r15 + registers_xmm7]
+    movdqu  xmm8, [r15 + registers_xmm8]
+    movdqu  xmm9, [r15 + registers_xmm9]
+    movdqu  xmm10, [r15 + registers_xmm10]
+    movdqu  xmm11, [r15 + registers_xmm11]
+    movdqu  xmm12, [r15 + registers_xmm12]
+    movdqu  xmm13, [r15 + registers_xmm13]
+    movdqu  xmm14, [r15 + registers_xmm14]
+    movdqu  xmm15, [r15 + registers_xmm15]
 
     // Prepare VMCS for VM launch: set HOST_RSP and HOST_RIP.
     mov     r14, 0x6C14 // VMCS_HOST_RSP
@@ -200,16 +199,16 @@ launch_vm:
     call x1
     add     rsp, 0x20
 
-    movdqa  xmm6, [rsp + launch_host_xmm6]
-    movdqa  xmm7, [rsp + launch_host_xmm7]
-    movdqa  xmm8, [rsp + launch_host_xmm8]
-    movdqa  xmm9, [rsp + launch_host_xmm9]
-    movdqa  xmm10, [rsp + launch_host_xmm10]
-    movdqa  xmm11, [rsp + launch_host_xmm11]
-    movdqa  xmm12, [rsp + launch_host_xmm12]
-    movdqa  xmm13, [rsp + launch_host_xmm13]
-    movdqa  xmm14, [rsp + launch_host_xmm14]
-    movdqa  xmm15, [rsp + launch_host_xmm15]
+    movdqu  xmm6, [rsp + launch_host_xmm6]
+    movdqu  xmm7, [rsp + launch_host_xmm7]
+    movdqu  xmm8, [rsp + launch_host_xmm8]
+    movdqu  xmm9, [rsp + launch_host_xmm9]
+    movdqu  xmm10, [rsp + launch_host_xmm10]
+    movdqu  xmm11, [rsp + launch_host_xmm11]
+    movdqu  xmm12, [rsp + launch_host_xmm12]
+    movdqu  xmm13, [rsp + launch_host_xmm13]
+    movdqu  xmm14, [rsp + launch_host_xmm14]
+    movdqu  xmm15, [rsp + launch_host_xmm15]
 
     mov     rbx, [rsp + launch_saved_rbx]
     mov     rbp, [rsp + launch_saved_rbp]
@@ -245,23 +244,23 @@ vmexit_stub:
     mov     [r15 + registers_r13], r13
     mov     [r15 + registers_r14], r14
 
-    // Save guest XMM registers.
-    movdqa  [r15 + registers_xmm0], xmm0
-    movdqa  [r15 + registers_xmm1], xmm1
-    movdqa  [r15 + registers_xmm2], xmm2
-    movdqa  [r15 + registers_xmm3], xmm3
-    movdqa  [r15 + registers_xmm4], xmm4
-    movdqa  [r15 + registers_xmm5], xmm5
-    movdqa  [r15 + registers_xmm6], xmm6
-    movdqa  [r15 + registers_xmm7], xmm7
-    movdqa  [r15 + registers_xmm8], xmm8
-    movdqa  [r15 + registers_xmm9], xmm9
-    movdqa  [r15 + registers_xmm10], xmm10
-    movdqa  [r15 + registers_xmm11], xmm11
-    movdqa  [r15 + registers_xmm12], xmm12
-    movdqa  [r15 + registers_xmm13], xmm13
-    movdqa  [r15 + registers_xmm14], xmm14
-    movdqa  [r15 + registers_xmm15], xmm15
+    // Save guest XMM registers (movdqu: no alignment #GP).
+    movdqu  [r15 + registers_xmm0], xmm0
+    movdqu  [r15 + registers_xmm1], xmm1
+    movdqu  [r15 + registers_xmm2], xmm2
+    movdqu  [r15 + registers_xmm3], xmm3
+    movdqu  [r15 + registers_xmm4], xmm4
+    movdqu  [r15 + registers_xmm5], xmm5
+    movdqu  [r15 + registers_xmm6], xmm6
+    movdqu  [r15 + registers_xmm7], xmm7
+    movdqu  [r15 + registers_xmm8], xmm8
+    movdqu  [r15 + registers_xmm9], xmm9
+    movdqu  [r15 + registers_xmm10], xmm10
+    movdqu  [r15 + registers_xmm11], xmm11
+    movdqu  [r15 + registers_xmm12], xmm12
+    movdqu  [r15 + registers_xmm13], xmm13
+    movdqu  [r15 + registers_xmm14], xmm14
+    movdqu  [r15 + registers_xmm15], xmm15
 
     // Set rcx to point to the saved guest registers for `vmexit_handler` (1st parameter).
     mov rcx, r15
@@ -312,22 +311,22 @@ vmexit_restore:
     mov     r13, [r15 + registers_r13]
     mov     r14, [r15 + registers_r14]
 
-    movdqa  xmm0, [r15 + registers_xmm0]
-    movdqa  xmm1, [r15 + registers_xmm1]
-    movdqa  xmm2, [r15 + registers_xmm2]
-    movdqa  xmm3, [r15 + registers_xmm3]
-    movdqa  xmm4, [r15 + registers_xmm4]
-    movdqa  xmm5, [r15 + registers_xmm5]
-    movdqa  xmm6, [r15 + registers_xmm6]
-    movdqa  xmm7, [r15 + registers_xmm7]
-    movdqa  xmm8, [r15 + registers_xmm8]
-    movdqa  xmm9, [r15 + registers_xmm9]
-    movdqa  xmm10, [r15 + registers_xmm10]
-    movdqa  xmm11, [r15 + registers_xmm11]
-    movdqa  xmm12, [r15 + registers_xmm12]
-    movdqa  xmm13, [r15 + registers_xmm13]
-    movdqa  xmm14, [r15 + registers_xmm14]
-    movdqa  xmm15, [r15 + registers_xmm15]
+    movdqu  xmm0, [r15 + registers_xmm0]
+    movdqu  xmm1, [r15 + registers_xmm1]
+    movdqu  xmm2, [r15 + registers_xmm2]
+    movdqu  xmm3, [r15 + registers_xmm3]
+    movdqu  xmm4, [r15 + registers_xmm4]
+    movdqu  xmm5, [r15 + registers_xmm5]
+    movdqu  xmm6, [r15 + registers_xmm6]
+    movdqu  xmm7, [r15 + registers_xmm7]
+    movdqu  xmm8, [r15 + registers_xmm8]
+    movdqu  xmm9, [r15 + registers_xmm9]
+    movdqu  xmm10, [r15 + registers_xmm10]
+    movdqu  xmm11, [r15 + registers_xmm11]
+    movdqu  xmm12, [r15 + registers_xmm12]
+    movdqu  xmm13, [r15 + registers_xmm13]
+    movdqu  xmm14, [r15 + registers_xmm14]
+    movdqu  xmm15, [r15 + registers_xmm15]
 
     // Do this last to avoid overwriting r15.
     mov     r15, [r15 + registers_r15]
@@ -354,22 +353,22 @@ vmexit_devirtualize_restore:
     mov     [rax + 0x8], r11
     mov     rsp, rax
 
-    movdqa  xmm0, [r15 + registers_xmm0]
-    movdqa  xmm1, [r15 + registers_xmm1]
-    movdqa  xmm2, [r15 + registers_xmm2]
-    movdqa  xmm3, [r15 + registers_xmm3]
-    movdqa  xmm4, [r15 + registers_xmm4]
-    movdqa  xmm5, [r15 + registers_xmm5]
-    movdqa  xmm6, [r15 + registers_xmm6]
-    movdqa  xmm7, [r15 + registers_xmm7]
-    movdqa  xmm8, [r15 + registers_xmm8]
-    movdqa  xmm9, [r15 + registers_xmm9]
-    movdqa  xmm10, [r15 + registers_xmm10]
-    movdqa  xmm11, [r15 + registers_xmm11]
-    movdqa  xmm12, [r15 + registers_xmm12]
-    movdqa  xmm13, [r15 + registers_xmm13]
-    movdqa  xmm14, [r15 + registers_xmm14]
-    movdqa  xmm15, [r15 + registers_xmm15]
+    movdqu  xmm0, [r15 + registers_xmm0]
+    movdqu  xmm1, [r15 + registers_xmm1]
+    movdqu  xmm2, [r15 + registers_xmm2]
+    movdqu  xmm3, [r15 + registers_xmm3]
+    movdqu  xmm4, [r15 + registers_xmm4]
+    movdqu  xmm5, [r15 + registers_xmm5]
+    movdqu  xmm6, [r15 + registers_xmm6]
+    movdqu  xmm7, [r15 + registers_xmm7]
+    movdqu  xmm8, [r15 + registers_xmm8]
+    movdqu  xmm9, [r15 + registers_xmm9]
+    movdqu  xmm10, [r15 + registers_xmm10]
+    movdqu  xmm11, [r15 + registers_xmm11]
+    movdqu  xmm12, [r15 + registers_xmm12]
+    movdqu  xmm13, [r15 + registers_xmm13]
+    movdqu  xmm14, [r15 + registers_xmm14]
+    movdqu  xmm15, [r15 + registers_xmm15]
 
     mov     rax, [r15 + registers_rax]
     mov     rbx, [r15 + registers_rbx]
@@ -419,9 +418,12 @@ pub unsafe extern "C" fn vmexit_handler(registers: *mut GuestRegisters, vmx: *mu
     match vmexit.handle_vmexit(registers, vmx) {
         Ok(crate::intel::vmexit::ExitType::ExitHypervisor) => 1,
         Ok(_) => 0,
-        Err(e) => {
-            log::error!("Failed to handle VMEXIT: {:?}", e);
-            EventInjection::vmentry_inject_ud();
+        Err(_e) => {
+            crate::intel::diag::cpu_enter_phase(crate::intel::diag::PHASE_ERROR_HANDLER);
+            let _ = crate::intel::support::vmwrite_checked(
+                x86::vmx::vmcs::control::VMENTRY_INTERRUPTION_INFO_FIELD,
+                0u64,
+            );
             0
         }
     }
@@ -517,6 +519,10 @@ fn log_vm_instruction_failure(instruction: &str) {
 }
 
 fn fatal_vmx_failure_loop() -> ! {
+    fatal_vmx_failure_loop_pub()
+}
+
+pub fn fatal_vmx_failure_loop_pub() -> ! {
     if let Err(error) = vmxoff() {
         log::error!(
             "Failed to leave VMX operation after fatal VMX failure: {:?}",
@@ -524,7 +530,8 @@ fn fatal_vmx_failure_loop() -> ! {
         );
     }
 
+    // STI before HLT so IPIs can still reach this CPU; prevents cascade freeze.
     loop {
-        unsafe { core::arch::asm!("hlt", options(nomem, nostack)) };
+        unsafe { core::arch::asm!("sti; hlt", options(nomem, nostack)) };
     }
 }

@@ -33,7 +33,7 @@ use {
     x86::{
         dtables::{lgdt, lidt, DescriptorTablePointer},
         msr as x86_msr,
-        vmx::vmcs::{control, guest, ro},
+        vmx::vmcs::{guest, ro},
     },
 };
 
@@ -87,76 +87,67 @@ impl VmExit {
         let exit_tsc_start = unsafe { x86::time::rdtsc() };
 
         let exit_reason = vmread_checked(ro::EXIT_REASON)? as u32;
+        let vm_entry_failure = (exit_reason & 0x8000_0000) != 0;
         let basic_reason = exit_reason & 0xFFFF;
 
+        if vm_entry_failure {
+            use core::sync::atomic::Ordering::Relaxed;
+            diag::EXIT_OTHER.fetch_add(1, Relaxed);
+            diag::LAST_HANDLER_ID.store(200, Relaxed);
+            diag::LAST_HANDLER_DETAIL.store(exit_reason as u64, Relaxed);
+            let guest_rip = vmread_checked(guest::RIP).unwrap_or(0);
+            let exit_qual = vmread_checked(ro::EXIT_QUALIFICATION).unwrap_or(0);
+            diag::ring_record(exit_reason as u64, guest_rip, exit_qual, 0xDEAD_E0);
+            log::error!(
+                "VM-entry failure: reason={:#x} qual={:#x} rip={:#x} — halting CPU",
+                exit_reason, exit_qual, guest_rip
+            );
+            crate::intel::vmlaunch::fatal_vmx_failure_loop_pub();
+        }
+
         // ── Fast path: CPUID / RDTSC / RDTSCP ──
-        // These are the timing-critical exits that EAC measures.
-        // Skip breadcrumbs + trace but keep check_pending_nmi (required for stability).
+        // Phase-instrumented passthrough for freeze-point diagnosis.
         if basic_reason == 10
         /* CPUID */
         {
+            diag::cpu_enter_phase(diag::PHASE_FAST_CPUID);
             guest_registers.rip = vmread_checked(guest::RIP)?;
-            guest_registers.rsp = vmread_checked(guest::RSP)?;
-            guest_registers.rflags = vmread_checked(guest::RFLAGS)?;
-            use core::sync::atomic::Ordering::Relaxed;
-            diag::EXIT_TOTAL.fetch_add(1, Relaxed);
-            diag::EXIT_CPUID.fetch_add(1, Relaxed);
+            diag::cpu_enter_phase(diag::PHASE_FAST_CPUID_DONE);
             let exit_type = handle_cpuid(guest_registers, vmx, exit_tsc_start);
+            diag::cpu_enter_phase(diag::PHASE_FAST_RIP_ADV);
             if exit_type_advances_rip(exit_type) {
                 self.advance_guest_rip(guest_registers)?;
             }
-            // Only compensate when CPUIDs arrive in a tight loop (< 5000 cycles
-            // apart), i.e. EAC's timing-attack pattern.  Normal system CPUIDs
-            // are spaced far apart and must NOT accumulate TSC drift.
-            let gap = exit_tsc_start.wrapping_sub(vmx.cpuid_entry_tsc);
-            vmx.cpuid_entry_tsc = exit_tsc_start;
-            if gap < 5000 {
-                let h_end = unsafe { x86::time::rdtsc() };
-                let handler_cost = h_end.wrapping_sub(exit_tsc_start);
-                const VM_TRANSITION_PAIR: u64 = 1000;
-                const BARE_METAL: u64 = 120;
-                let compensation = handler_cost + VM_TRANSITION_PAIR - BARE_METAL;
-                if let Ok(offset) = vmread_checked(control::TSC_OFFSET_FULL) {
-                    let _ = vmwrite_checked(control::TSC_OFFSET_FULL, offset.wrapping_sub(compensation));
-                }
-            }
-            super::host_idt::check_pending_nmi();
+            diag::cpu_enter_phase(diag::PHASE_PRE_VMRESUME);
             return Ok(exit_type);
         }
         if basic_reason == 16
         /* RDTSC */
         {
+            diag::cpu_enter_phase(diag::PHASE_FAST_CPUID);
             guest_registers.rip = vmread_checked(guest::RIP)?;
-            guest_registers.rsp = vmread_checked(guest::RSP)?;
-            guest_registers.rflags = vmread_checked(guest::RFLAGS)?;
-            use core::sync::atomic::Ordering::Relaxed;
-            diag::EXIT_TOTAL.fetch_add(1, Relaxed);
-            diag::EXIT_RDTSC.fetch_add(1, Relaxed);
             let exit_type = handle_rdtsc(guest_registers, vmx);
             if exit_type_advances_rip(exit_type) {
                 self.advance_guest_rip(guest_registers)?;
             }
-            super::host_idt::check_pending_nmi();
+            diag::cpu_enter_phase(diag::PHASE_PRE_VMRESUME);
             return Ok(exit_type);
         }
         if basic_reason == 51
         /* RDTSCP */
         {
+            diag::cpu_enter_phase(diag::PHASE_FAST_CPUID);
             guest_registers.rip = vmread_checked(guest::RIP)?;
-            guest_registers.rsp = vmread_checked(guest::RSP)?;
-            guest_registers.rflags = vmread_checked(guest::RFLAGS)?;
-            use core::sync::atomic::Ordering::Relaxed;
-            diag::EXIT_TOTAL.fetch_add(1, Relaxed);
-            diag::EXIT_RDTSC.fetch_add(1, Relaxed);
             let exit_type = handle_rdtscp(guest_registers, vmx);
             if exit_type_advances_rip(exit_type) {
                 self.advance_guest_rip(guest_registers)?;
             }
-            super::host_idt::check_pending_nmi();
+            diag::cpu_enter_phase(diag::PHASE_PRE_VMRESUME);
             return Ok(exit_type);
         }
 
         // ── Slow path: all other exits ──
+        diag::cpu_enter_phase(diag::PHASE_SLOW_PATH);
         // Disarm RDTSC trap if it was armed by a prior CPUID exit.
         if vmx.cpuid_entry_tsc != 0 {
             vmx.cpuid_entry_tsc = 0;
@@ -168,6 +159,14 @@ impl VmExit {
         guest_registers.rflags = vmread_checked(guest::RFLAGS)?;
 
         let exit_qualification = vmread_checked(ro::EXIT_QUALIFICATION).unwrap_or(0);
+
+        diag::ring_record(
+            exit_reason as u64,
+            guest_registers.rip,
+            exit_qualification,
+            guest_registers.rax,
+        );
+
         let guest_cr3 = vmread_checked(guest::CR3).unwrap_or(0);
         let breadcrumb_detail = vmexit_breadcrumb_detail(exit_reason, guest_registers);
         if vmexit_should_record_breadcrumb(exit_reason, guest_registers) {
@@ -196,6 +195,7 @@ impl VmExit {
         diag::EXIT_TOTAL.fetch_add(1, Relaxed);
         diag::LAST_EXIT_REASON.store(exit_reason as u64, Relaxed);
 
+        diag::cpu_enter_phase(diag::PHASE_SLOW_HANDLER);
         let exit_type = match basic_exit_reason {
             VmxBasicExitReason::ExceptionOrNmi => {
                 diag::EXIT_EXCEPTION.fetch_add(1, Relaxed);
@@ -230,7 +230,7 @@ impl VmExit {
                 diag::EXIT_VMX_INSTR.fetch_add(1, Relaxed);
                 diag::LAST_HANDLER_ID.store(6, Relaxed);
                 diag::LAST_HANDLER_DETAIL.store(exit_reason as u64, Relaxed);
-                handle_undefined_opcode_exception()
+                handle_vmx_instruction(reason, guest_registers)
             }
 
             VmxBasicExitReason::MonitorTrapFlag => {
@@ -289,6 +289,25 @@ impl VmExit {
                 diag::LAST_HANDLER_ID.store(18, Relaxed);
                 handle_xsetbv(guest_registers)
             }
+            VmxBasicExitReason::VmxPreemptionTimerExpired => {
+                diag::EXIT_PREEMPT.fetch_add(1, Relaxed);
+                diag::LAST_HANDLER_ID.store(19, Relaxed);
+                let _ = vmwrite_checked(
+                    x86::vmx::vmcs::guest::VMX_PREEMPTION_TIMER_VALUE,
+                    0x0060_0000u64,
+                );
+                let inject_nmi = diag::cpu_record_timer_rip(guest_registers.rip);
+                if inject_nmi {
+                    // Inject NMI into guest to force BSOD + crash dump
+                    // VM-entry interruption info: valid=1, type=NMI(2), vector=2
+                    let nmi_info: u64 = (1u64 << 31) | (2u64 << 8) | 2u64;
+                    let _ = vmwrite_checked(
+                        x86::vmx::vmcs::control::VMENTRY_INTERRUPTION_INFO_FIELD,
+                        nmi_info,
+                    );
+                }
+                ExitType::Continue
+            }
             _ => {
                 diag::EXIT_OTHER.fetch_add(1, Relaxed);
                 diag::LAST_HANDLER_ID.store(99, Relaxed);
@@ -307,7 +326,9 @@ impl VmExit {
             return Ok(exit_type);
         }
 
+        diag::cpu_enter_phase(diag::PHASE_CHECK_NMI);
         super::host_idt::check_pending_nmi();
+        diag::cpu_enter_phase(diag::PHASE_PRE_VMRESUME);
 
         log::debug!(
             "Guest registers after handling vmexit: {:#x?}",
@@ -421,6 +442,59 @@ fn vmx_probe_instruction_should_inject_ud(reason: VmxBasicExitReason) -> bool {
             | VmxBasicExitReason::Vmxon
             | VmxBasicExitReason::Vmxoff
     )
+}
+
+/// Emulates correct hardware behavior for VMX instructions executed in the guest.
+///
+/// Uses CR4_READ_SHADOW (the guest's view of CR4) to decide behavior:
+/// - Guest sees VMXE=0 → #UD (matches bare metal without VMX enabled)
+/// - Guest sees VMXE=1, CPL>0 → #GP(0)
+/// - Guest sees VMXE=1, CPL=0 → VMfailInvalid (CF=1)
+fn handle_vmx_instruction(
+    reason: VmxBasicExitReason,
+    guest_registers: &mut GuestRegisters,
+) -> ExitType {
+    use crate::intel::events::EventInjection;
+
+    // GETSEC/ENCLS/ENCLV: always #UD (not VMX instructions proper)
+    if matches!(
+        reason,
+        VmxBasicExitReason::Getsec | VmxBasicExitReason::Encls | VmxBasicExitReason::Enclv
+    ) {
+        EventInjection::vmentry_inject_ud();
+        return ExitType::Continue;
+    }
+
+    // Use the READ SHADOW — what the guest believes CR4 contains.
+    let cr4_shadow =
+        vmread_checked(x86::vmx::vmcs::control::CR4_READ_SHADOW).unwrap_or(0);
+    if cr4_shadow & (1 << 13) == 0 {
+        // Guest's view: CR4.VMXE=0 → #UD per SDM
+        EventInjection::vmentry_inject_ud();
+        return ExitType::Continue;
+    }
+
+    // CR4.VMXE=1 in guest's view: check CPL via CS selector RPL
+    let cs_sel = vmread_checked(guest::CS_SELECTOR).unwrap_or(0);
+    if cs_sel & 3 != 0 {
+        // CPL > 0 → #GP(0) per SDM
+        EventInjection::vmentry_inject_gp(0);
+        return ExitType::Continue;
+    }
+
+    // CPL=0, CR4.VMXE=1: emulate VMfailInvalid
+    // Set CF=1, clear ZF/PF/AF/SF/OF, advance RIP
+    const CF: u64 = 1 << 0;
+    const PF: u64 = 1 << 2;
+    const AF: u64 = 1 << 4;
+    const ZF: u64 = 1 << 6;
+    const SF: u64 = 1 << 7;
+    const OF: u64 = 1 << 11;
+    let rflags = (guest_registers.rflags & !(CF | PF | AF | ZF | SF | OF)) | CF;
+    guest_registers.rflags = rflags;
+    let _ = vmwrite_checked(guest::RFLAGS, rflags);
+
+    ExitType::IncrementRIP
 }
 
 fn decode_basic_exit_reason(raw_exit_reason: u32) -> Option<VmxBasicExitReason> {
