@@ -33,6 +33,7 @@ pub static HOST_GP_COUNT: AtomicU64 = AtomicU64::new(0);
 pub static HOST_NMI_COUNT: AtomicU64 = AtomicU64::new(0);
 pub static HOST_MC_COUNT: AtomicU64 = AtomicU64::new(0);
 pub static HOST_PF_COUNT: AtomicU64 = AtomicU64::new(0);
+pub static HOST_DEFAULT_COUNT: AtomicU64 = AtomicU64::new(0);
 pub static GP_FAULT_RIP: AtomicU64 = AtomicU64::new(0);
 pub static PF_FAULT_RIP: AtomicU64 = AtomicU64::new(0);
 pub static PF_FAULT_CR2: AtomicU64 = AtomicU64::new(0);
@@ -58,6 +59,7 @@ extern "C" {
     fn host_gp_handler();
     fn host_pf_handler();
     fn host_mc_handler();
+    fn host_default_handler();
 }
 
 // ---------------------------------------------------------------------------
@@ -185,11 +187,10 @@ core::arch::global_asm!(
     "hlt",
     "jmp 3b",
 
-    // ------ recovery: inject #GP to guest, then restore + vmresume ------
+    // ------ recovery: #GP in VMX-root means state is corrupted; halt this CPU ------
     ".global vmexit_recover_gp",
     "vmexit_recover_gp:",
-    // RSP = HOST_RSP, [RSP] = GuestRegisters*
-    // Clear re-entrancy flag
+    // Clear re-entrancy flag so NMI watchdog can fire
     "push rax",
     "push rcx",
     "push rdx",
@@ -198,19 +199,14 @@ core::arch::global_asm!(
     "lea rax, [rip + {gp_reentrant}]",
     "mov byte ptr [rax + rcx], 0",
     "pop rdx",
-    // VMENTRY_EXCEPTION_ERR_CODE (0x4018) = 0
-    "mov ecx, 0x4018",
-    "xor eax, eax",
-    "vmwrite rcx, rax",
-    // VMENTRY_INTERRUPTION_INFO_FIELD (0x4016) =
-    //   valid(1<<31) | deliver_err(1<<11) | hw_exc(3<<8) | vector=13
-    //   = 0x80000B0D
-    "mov ecx, 0x4016",
-    "mov eax, 0x80000B0D",
-    "vmwrite rcx, rax",
     "pop rcx",
     "pop rax",
-    "jmp vmexit_restore",
+    // VMXOFF + STI + HLT: leave VMX, let NMI watchdog BSOD
+    "vmxoff",
+    "sti",
+    "4:",
+    "hlt",
+    "jmp 4b",
 
     gp_count = sym HOST_GP_COUNT,
     gp_rip   = sym GP_FAULT_RIP,
@@ -294,8 +290,7 @@ core::arch::global_asm!(
 
     ".global vmexit_recover_pf",
     "vmexit_recover_pf:",
-    // RSP = HOST_RSP, [RSP] = GuestRegisters*
-    // Clear re-entrancy flag
+    // #PF in VMX-root means state is corrupted; halt this CPU
     "push rax",
     "push rcx",
     "push rdx",
@@ -304,20 +299,40 @@ core::arch::global_asm!(
     "lea rax, [rip + {pf_reentrant}]",
     "mov byte ptr [rax + rcx], 0",
     "pop rdx",
-    // VMENTRY_INTERRUPTION_INFO_FIELD (0x4016) =
-    //   valid(1<<31) | deliver_err(1<<11) | hw_exc(3<<8) | vector=14
-    //   = 0x80000B0E
-    "mov ecx, 0x4016",
-    "mov eax, 0x80000B0E",
-    "vmwrite rcx, rax",
     "pop rcx",
     "pop rax",
-    "jmp vmexit_restore",
+    // VMXOFF + STI + HLT: leave VMX, let NMI watchdog BSOD
+    "vmxoff",
+    "sti",
+    "5:",
+    "hlt",
+    "jmp 5b",
 
     pf_count = sym HOST_PF_COUNT,
     pf_rip   = sym PF_FAULT_RIP,
     pf_cr2   = sym PF_FAULT_CR2,
     pf_reentrant = sym PF_REENTRANT,
+);
+
+// ---------------------------------------------------------------------------
+// Assembly: default handler for all unpatched vectors
+//
+// Catches any unexpected exception/interrupt during VMX-root that we don't
+// have a specific handler for. Without this, the original Windows handler
+// runs on VmStack in VMX-root and tries to bugcheck → sends freeze IPI →
+// other cores in VMX-root can't ACK → complete system deadlock.
+// ---------------------------------------------------------------------------
+core::arch::global_asm!(
+    ".global host_default_handler",
+    "host_default_handler:",
+    "lea rax, [rip + {default_count}]",
+    "lock inc qword ptr [rax]",
+    "vmxoff",
+    "sti",
+    "1:",
+    "hlt",
+    "jmp 1b",
+    default_count = sym HOST_DEFAULT_COUNT,
 );
 
 // ---------------------------------------------------------------------------
@@ -342,8 +357,8 @@ fn rdtscp_aux() -> u32 {
 
 /// Check for a pending NMI on this CPU and inject it to the guest.
 /// Called at the end of every VM exit handler, before VMRESUME.
-/// If another event is already queued for injection, the NMI stays pending
-/// and will be injected on the next VM exit.
+/// If another event is already queued for injection or the guest is blocking
+/// NMIs, the NMI stays pending and will be injected on the next VM exit.
 pub fn check_pending_nmi() {
     let cpu = rdtscp_aux() as usize & 0xFF;
     if NMI_FLAGS[cpu].load(Ordering::Relaxed) != 0 || MC_FLAGS[cpu].load(Ordering::Relaxed) != 0 {
@@ -359,14 +374,24 @@ pub fn check_pending_nmi() {
                 return;
             }
         };
-        if info & (1 << 31) == 0 {
-            if MC_FLAGS[cpu].load(Ordering::Relaxed) != 0 {
-                MC_FLAGS[cpu].store(0, Ordering::Relaxed);
-                crate::intel::events::EventInjection::vmentry_inject_machine_check();
-            } else {
-                NMI_FLAGS[cpu].store(0, Ordering::Relaxed);
-                crate::intel::events::EventInjection::vmentry_inject_nmi();
+        if info & (1 << 31) != 0 {
+            return;
+        }
+        if MC_FLAGS[cpu].load(Ordering::Relaxed) != 0 {
+            MC_FLAGS[cpu].store(0, Ordering::Relaxed);
+            crate::intel::events::EventInjection::vmentry_inject_machine_check();
+        } else {
+            let interruptibility = crate::intel::support::vmread_checked(
+                x86::vmx::vmcs::guest::INTERRUPTIBILITY_STATE,
+            )
+            .unwrap_or(0);
+            // Bit 3: blocking by NMI; bit 1: blocking by MOV-SS.
+            // Intel SDM 26.3.1.5: NMI injection requires both to be 0.
+            if interruptibility & ((1 << 3) | (1 << 1)) != 0 {
+                return;
             }
+            NMI_FLAGS[cpu].store(0, Ordering::Relaxed);
+            crate::intel::events::EventInjection::vmentry_inject_nmi();
         }
     }
 }
@@ -375,9 +400,19 @@ pub fn check_pending_nmi() {
 // IDT patching
 // ---------------------------------------------------------------------------
 
-/// Replace selected host IDT vectors with custom handlers.
-/// Must be called after the host IDT is copied from the kernel IDT.
+/// Replace ALL host IDT vectors with safe handlers.
+///
+/// Every entry first points to `host_default_handler` (vmxoff + sti + hlt),
+/// then specific vectors are overridden with proper handlers. This prevents
+/// Windows kernel handlers from ever running in VMX-root context, which
+/// would deadlock on bugcheck's freeze-IPI because other cores are also
+/// in VMX-root with IF=0.
 pub fn patch_host_idt(idt: &mut [u64]) {
+    let default = expected_default_handler();
+    let max_vectors = idt.len() / 2;
+    for vector in 0..max_vectors.min(256) {
+        patch_idt_entry(idt, vector, default);
+    }
     patch_idt_entry(idt, 2, expected_nmi_handler());
     patch_idt_entry(idt, 13, expected_gp_handler());
     patch_idt_entry(idt, 14, expected_pf_handler());
@@ -451,6 +486,10 @@ pub fn expected_pf_handler() -> u64 {
 
 pub fn expected_mc_handler() -> u64 {
     host_mc_handler as *const () as usize as u64
+}
+
+pub fn expected_default_handler() -> u64 {
+    host_default_handler as *const () as usize as u64
 }
 
 fn host_idt_patch_mask(idt: &[u64], base: u64, limit: u64) -> u64 {

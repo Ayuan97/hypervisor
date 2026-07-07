@@ -49,12 +49,49 @@ pub mod rdtsc;
 pub mod vmcall;
 pub mod xsetbv;
 
+static BUGCHECK_BAILOUT: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
 /// Represents the type of VM exit.
 #[derive(Debug, Copy, Clone, PartialOrd, PartialEq)]
 pub enum ExitType {
     ExitHypervisor,
     IncrementRIP,
     Continue,
+}
+
+/// Re-inject any event that was being delivered through the guest IDT when this
+/// VM-exit occurred.  If the valid bit in IDT_VECTORING_INFO is set, the CPU
+/// was mid-delivery of an interrupt/exception and that event was lost.  We copy
+/// it into VMENTRY_INTERRUPTION_INFO so the CPU re-delivers it on vmresume.
+/// Without this, timer interrupts (and others) can be silently dropped during
+/// heavy VM-exit traffic, stalling the guest scheduler → system freeze.
+#[inline]
+fn reinject_idt_vectoring_event() {
+    let vectoring_info = vmread_checked(ro::IDT_VECTORING_INFO).unwrap_or(0);
+    if vectoring_info & (1 << 31) != 0 {
+        let _ = vmwrite_checked(
+            x86::vmx::vmcs::control::VMENTRY_INTERRUPTION_INFO_FIELD,
+            vectoring_info,
+        );
+        let event_type = (vectoring_info >> 8) & 0x7;
+        let has_error_code = (vectoring_info >> 11) & 1 != 0;
+        if has_error_code {
+            let error_code = vmread_checked(ro::IDT_VECTORING_ERR_CODE).unwrap_or(0);
+            let _ = vmwrite_checked(
+                x86::vmx::vmcs::control::VMENTRY_EXCEPTION_ERR_CODE,
+                error_code,
+            );
+        }
+        if event_type == 4 || event_type == 6 {
+            let instr_len = vmread_checked(ro::VMEXIT_INSTRUCTION_LEN).unwrap_or(0);
+            if instr_len != 0 {
+                let _ = vmwrite_checked(
+                    x86::vmx::vmcs::control::VMENTRY_INSTRUCTION_LEN,
+                    instr_len,
+                );
+            }
+        }
+    }
 }
 
 pub struct VmExit;
@@ -106,7 +143,6 @@ impl VmExit {
         }
 
         // ── Fast path: CPUID / RDTSC / RDTSCP ──
-        // Phase-instrumented passthrough for freeze-point diagnosis.
         if basic_reason == 10
         /* CPUID */
         {
@@ -118,35 +154,38 @@ impl VmExit {
             if exit_type_advances_rip(exit_type) {
                 self.advance_guest_rip(guest_registers)?;
             }
+            reinject_idt_vectoring_event();
+            super::host_idt::check_pending_nmi();
             diag::cpu_enter_phase(diag::PHASE_PRE_VMRESUME);
             return Ok(exit_type);
         }
         if basic_reason == 16
         /* RDTSC */
         {
-            diag::cpu_enter_phase(diag::PHASE_FAST_CPUID);
             guest_registers.rip = vmread_checked(guest::RIP)?;
             let exit_type = handle_rdtsc(guest_registers, vmx);
             if exit_type_advances_rip(exit_type) {
                 self.advance_guest_rip(guest_registers)?;
             }
-            diag::cpu_enter_phase(diag::PHASE_PRE_VMRESUME);
+            reinject_idt_vectoring_event();
+            super::host_idt::check_pending_nmi();
             return Ok(exit_type);
         }
         if basic_reason == 51
         /* RDTSCP */
         {
-            diag::cpu_enter_phase(diag::PHASE_FAST_CPUID);
             guest_registers.rip = vmread_checked(guest::RIP)?;
             let exit_type = handle_rdtscp(guest_registers, vmx);
             if exit_type_advances_rip(exit_type) {
                 self.advance_guest_rip(guest_registers)?;
             }
-            diag::cpu_enter_phase(diag::PHASE_PRE_VMRESUME);
+            reinject_idt_vectoring_event();
+            super::host_idt::check_pending_nmi();
             return Ok(exit_type);
         }
 
         // ── Slow path: all other exits ──
+
         diag::cpu_enter_phase(diag::PHASE_SLOW_PATH);
         // Disarm RDTSC trap if it was armed by a prior CPUID exit.
         if vmx.cpuid_entry_tsc != 0 {
@@ -326,6 +365,7 @@ impl VmExit {
             return Ok(exit_type);
         }
 
+        reinject_idt_vectoring_event();
         diag::cpu_enter_phase(diag::PHASE_CHECK_NMI);
         super::host_idt::check_pending_nmi();
         diag::cpu_enter_phase(diag::PHASE_PRE_VMRESUME);

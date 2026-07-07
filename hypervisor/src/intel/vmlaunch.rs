@@ -74,6 +74,8 @@ core::arch::global_asm!(
 .set registers_xmm13, 0x160
 .set registers_xmm14, 0x170
 .set registers_xmm15, 0x180
+.set registers_mxcsr, 0x190
+.set mxcsr_safe_scratch, 0x194
 .set vmstack_original_rsp, 0x8
 .set vmstack_host_xmm6, 0x10
 .set vmstack_host_xmm7, 0x20
@@ -162,23 +164,14 @@ launch_vm:
     mov     r11, [r15 + registers_r11]
     mov     r12, [r15 + registers_r12]
 
-    // Restore guest XMM registers (movdqu: no alignment #GP).
+    // Restore only volatile guest XMM registers; xmm6-xmm15 are callee-saved
+    // and already hold the correct values at initial launch.
     movdqu  xmm0, [r15 + registers_xmm0]
     movdqu  xmm1, [r15 + registers_xmm1]
     movdqu  xmm2, [r15 + registers_xmm2]
     movdqu  xmm3, [r15 + registers_xmm3]
     movdqu  xmm4, [r15 + registers_xmm4]
     movdqu  xmm5, [r15 + registers_xmm5]
-    movdqu  xmm6, [r15 + registers_xmm6]
-    movdqu  xmm7, [r15 + registers_xmm7]
-    movdqu  xmm8, [r15 + registers_xmm8]
-    movdqu  xmm9, [r15 + registers_xmm9]
-    movdqu  xmm10, [r15 + registers_xmm10]
-    movdqu  xmm11, [r15 + registers_xmm11]
-    movdqu  xmm12, [r15 + registers_xmm12]
-    movdqu  xmm13, [r15 + registers_xmm13]
-    movdqu  xmm14, [r15 + registers_xmm14]
-    movdqu  xmm15, [r15 + registers_xmm15]
 
     // Prepare VMCS for VM launch: set HOST_RSP and HOST_RIP.
     mov     r14, 0x6C14 // VMCS_HOST_RSP
@@ -244,23 +237,19 @@ vmexit_stub:
     mov     [r15 + registers_r13], r13
     mov     [r15 + registers_r14], r14
 
-    // Save guest XMM registers (movdqu: no alignment #GP).
+    // Save only volatile XMM registers (xmm0-xmm5 per Windows x64 ABI).
+    // xmm6-xmm15 are callee-saved — the Rust compiler preserves them.
     movdqu  [r15 + registers_xmm0], xmm0
     movdqu  [r15 + registers_xmm1], xmm1
     movdqu  [r15 + registers_xmm2], xmm2
     movdqu  [r15 + registers_xmm3], xmm3
     movdqu  [r15 + registers_xmm4], xmm4
     movdqu  [r15 + registers_xmm5], xmm5
-    movdqu  [r15 + registers_xmm6], xmm6
-    movdqu  [r15 + registers_xmm7], xmm7
-    movdqu  [r15 + registers_xmm8], xmm8
-    movdqu  [r15 + registers_xmm9], xmm9
-    movdqu  [r15 + registers_xmm10], xmm10
-    movdqu  [r15 + registers_xmm11], xmm11
-    movdqu  [r15 + registers_xmm12], xmm12
-    movdqu  [r15 + registers_xmm13], xmm13
-    movdqu  [r15 + registers_xmm14], xmm14
-    movdqu  [r15 + registers_xmm15], xmm15
+
+    // Save guest MXCSR and load safe value (all SSE exceptions masked).
+    stmxcsr [r15 + registers_mxcsr]
+    mov     dword ptr [r15 + mxcsr_safe_scratch], 0x1F80
+    ldmxcsr [r15 + mxcsr_safe_scratch]
 
     // Set rcx to point to the saved guest registers for `vmexit_handler` (1st parameter).
     mov rcx, r15
@@ -276,6 +265,9 @@ vmexit_stub:
 
     // Allocate stack space for the VM exit handler.
     sub     rsp, 0x20
+
+    // Clear DF for safe Rust ABI string ops.
+    cld
 
     // Call the VM exit handler.
     call x0
@@ -311,22 +303,16 @@ vmexit_restore:
     mov     r13, [r15 + registers_r13]
     mov     r14, [r15 + registers_r14]
 
+    // Restore only volatile XMM registers (xmm0-xmm5).
     movdqu  xmm0, [r15 + registers_xmm0]
     movdqu  xmm1, [r15 + registers_xmm1]
     movdqu  xmm2, [r15 + registers_xmm2]
     movdqu  xmm3, [r15 + registers_xmm3]
     movdqu  xmm4, [r15 + registers_xmm4]
     movdqu  xmm5, [r15 + registers_xmm5]
-    movdqu  xmm6, [r15 + registers_xmm6]
-    movdqu  xmm7, [r15 + registers_xmm7]
-    movdqu  xmm8, [r15 + registers_xmm8]
-    movdqu  xmm9, [r15 + registers_xmm9]
-    movdqu  xmm10, [r15 + registers_xmm10]
-    movdqu  xmm11, [r15 + registers_xmm11]
-    movdqu  xmm12, [r15 + registers_xmm12]
-    movdqu  xmm13, [r15 + registers_xmm13]
-    movdqu  xmm14, [r15 + registers_xmm14]
-    movdqu  xmm15, [r15 + registers_xmm15]
+
+    // Restore guest MXCSR before returning to guest.
+    ldmxcsr [r15 + registers_mxcsr]
 
     // Do this last to avoid overwriting r15.
     mov     r15, [r15 + registers_r15]
@@ -353,22 +339,13 @@ vmexit_devirtualize_restore:
     mov     [rax + 0x8], r11
     mov     rsp, rax
 
+    // Restore only volatile XMMs; xmm6-xmm15 are callee-saved and already correct.
     movdqu  xmm0, [r15 + registers_xmm0]
     movdqu  xmm1, [r15 + registers_xmm1]
     movdqu  xmm2, [r15 + registers_xmm2]
     movdqu  xmm3, [r15 + registers_xmm3]
     movdqu  xmm4, [r15 + registers_xmm4]
     movdqu  xmm5, [r15 + registers_xmm5]
-    movdqu  xmm6, [r15 + registers_xmm6]
-    movdqu  xmm7, [r15 + registers_xmm7]
-    movdqu  xmm8, [r15 + registers_xmm8]
-    movdqu  xmm9, [r15 + registers_xmm9]
-    movdqu  xmm10, [r15 + registers_xmm10]
-    movdqu  xmm11, [r15 + registers_xmm11]
-    movdqu  xmm12, [r15 + registers_xmm12]
-    movdqu  xmm13, [r15 + registers_xmm13]
-    movdqu  xmm14, [r15 + registers_xmm14]
-    movdqu  xmm15, [r15 + registers_xmm15]
 
     mov     rax, [r15 + registers_rax]
     mov     rbx, [r15 + registers_rbx]

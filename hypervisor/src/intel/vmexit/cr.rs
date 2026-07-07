@@ -69,6 +69,12 @@ fn sanitize_cr4_write(
     fixed0: u64,
     fixed1: u64,
 ) -> Result<Cr4Update, Cr4WriteError> {
+    // In stealth mode, reject guest attempts to set VMXE — we advertise no VMX support.
+    // Bare metal without VMX would #GP on setting this bit.
+    if !option_env!("HV_TRANSPARENT").is_some() && (requested_value & CR4_VMXE != 0) {
+        return Err(Cr4WriteError::DisallowedFixed1Bits);
+    }
+
     let guest_value = requested_value | CR4_VMXE;
 
     if guest_value & fixed0 != fixed0 {
@@ -126,6 +132,15 @@ mod tests {
 
         assert_eq!(update.guest_value, CR4_VMXE | CR4_PAE);
         assert_eq!(update.shadow_value, CR4_PAE);
+    }
+
+    #[test]
+    fn cr4_write_rejects_guest_setting_vmxe() {
+        const CR4_PAE: u64 = 1 << 5;
+        let fixed0 = CR4_VMXE;
+        let fixed1 = CR4_VMXE | CR4_PAE;
+
+        assert!(sanitize_cr4_write(CR4_VMXE | CR4_PAE, fixed0, fixed1).is_err());
     }
 
     #[test]

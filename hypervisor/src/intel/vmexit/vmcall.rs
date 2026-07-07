@@ -36,8 +36,11 @@ const CMD_READ_RESULT_WORD: u64 = 0x1D;
 const CMD_RELEASE_READ_RESULT: u64 = 0x1E;
 const CMD_READ_RESULT_QUAD: u64 = 0x1F;
 const CMD_CLOAK_PAGE: u64 = 0x20;
+const CMD_GET_RING: u64 = 0x25;
 const CMD_REGISTER_BATCH_BUFFER: u64 = 0x26;
 const CMD_UNREGISTER_BATCH_BUFFER: u64 = 0x27;
+const CMD_GET_CPU_DIAG: u64 = 0x28;
+const CMD_READ_CMOS_FREEZE: u64 = 0x29;
 pub const CMD_DEVIRTUALIZE: u64 = 0xFF;
 const CLIENT_READ_ARM_TOKEN: u64 = 0xC17E_A2D5_90B4_6F31;
 
@@ -309,6 +312,18 @@ pub fn dispatch_command(guest_registers: &mut GuestRegisters, vmx: &mut Vmx) -> 
         }
         CMD_GET_BREADCRUMB => {
             guest_registers.rax = crate::intel::diag::breadcrumb(arg1, arg2);
+            ExitType::IncrementRIP
+        }
+        CMD_GET_RING => {
+            guest_registers.rax = crate::intel::diag::ring_entry(arg1, arg2);
+            ExitType::IncrementRIP
+        }
+        CMD_GET_CPU_DIAG => {
+            guest_registers.rax = crate::intel::diag::cpu_diag(arg1, arg2);
+            ExitType::IncrementRIP
+        }
+        CMD_READ_CMOS_FREEZE => {
+            guest_registers.rax = crate::intel::diag::cmos_read_freeze(arg1);
             ExitType::IncrementRIP
         }
         CMD_GET_CLIENT_READ_STATE => {

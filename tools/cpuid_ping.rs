@@ -8,7 +8,12 @@ const CMD_PING: u64 = 0x01;
 const CMD_GET_COUNTER: u64 = 0x14;
 const CMD_SEAL_DIAGNOSTICS: u64 = 0x16;
 const CMD_GET_CTL: u64 = 0x15;
+const CMD_GET_RING: u64 = 0x25;
+const CMD_GET_BREADCRUMB: u64 = 0x19;
+const CMD_GET_CPU_DIAG: u64 = 0x28;
+const CMD_READ_CMOS_FREEZE: u64 = 0x29;
 const HOST_IDT_PATCH_ALL: u64 = 0x3F;
+const MAX_TRACKED_CPUS: u64 = 64;
 
 #[cfg(test)]
 mod tests {
@@ -227,6 +232,10 @@ fn cpuid_result_is_zero(result: (u32, u32, u32, u32)) -> bool {
 }
 
 fn cpuid_cmd(leaf: u64, cmd: u64, arg1: u64, token: u64) -> u64 {
+    cpuid_cmd2(leaf, cmd, arg1, 0, token)
+}
+
+fn cpuid_cmd2(leaf: u64, cmd: u64, arg1: u64, arg2: u64, token: u64) -> u64 {
     let result: u64;
     unsafe {
         asm!(
@@ -236,13 +245,25 @@ fn cpuid_cmd(leaf: u64, cmd: u64, arg1: u64, token: u64) -> u64 {
             inlateout("rax") leaf => result,
             inlateout("rcx") cmd => _,
             inlateout("rdx") arg1 => _,
-            in("r8") 0u64,
+            in("r8") arg2,
             in("r9") 0u64,
             in("r10") token,
             in("r11") token,
         );
     }
     result
+}
+
+fn hv_ring(slot: u64, field: u64) -> u64 {
+    cpuid_cmd2(CPUID_LEAF, CMD_GET_RING, slot, field, EXPECTED_MAGIC)
+}
+
+fn hv_cpu_diag(cpu: u64, field: u64) -> u64 {
+    cpuid_cmd2(CPUID_LEAF, CMD_GET_CPU_DIAG, cpu, field, EXPECTED_MAGIC)
+}
+
+fn hv_breadcrumb(cpu: u64, field: u64) -> u64 {
+    cpuid_cmd2(CPUID_LEAF, CMD_GET_BREADCRUMB, cpu, field, EXPECTED_MAGIC)
 }
 
 fn guest_cpuid(leaf: u32, sub_leaf: u32) -> (u32, u32, u32, u32) {
@@ -476,6 +497,8 @@ fn main() {
         "Host #MC",
         "RDTSC",
         "VMX Instr",
+        "RingWriteIdx",
+        "Preempt Timer",
     ];
     for (i, name) in counter_names.iter().enumerate() {
         let v = hv_cmd(0x14, i as u64);
@@ -566,6 +589,16 @@ fn main() {
             "  #MC handler    = target={:#x} expected={:#x}",
             mc_target, mc_expected
         );
+        let host_gp_count = hv_cmd(CMD_GET_COUNTER, 10);
+        let host_nmi_count = hv_cmd(CMD_GET_COUNTER, 11);
+        println!(
+            "  Host #GP       = count={} rip={:#x}",
+            host_gp_count, gp_rip
+        );
+        println!(
+            "  Host NMI       = count={}",
+            host_nmi_count
+        );
         println!(
             "  Host #MC       = count={} rip={:#x}",
             host_mc_count, mc_fault_rip
@@ -611,6 +644,115 @@ fn main() {
         println!("[+] SGX ENCLS/ENCLV exiting enabled");
     } else {
         println!("[i] SGX ENCLS/ENCLV exiting unavailable or not enabled");
+    }
+
+    let ring_idx = hv_cmd(CMD_GET_COUNTER, 23);
+    if ring_idx != u64::MAX {
+        println!("\n=== VM-Exit Ring Buffer (last 32, filtered) ===");
+        println!("  Write index    = {}", ring_idx);
+        let count = if ring_idx < 32 { ring_idx } else { 32 };
+        let start = if ring_idx >= 32 { ring_idx - 32 } else { 0 };
+        for i in 0..count {
+            let slot = ((start + i) % 32) as u64;
+            let reason = hv_ring(slot, 0);
+            let rip = hv_ring(slot, 1);
+            let qual = hv_ring(slot, 2);
+            let rax = hv_ring(slot, 3);
+            if reason == 0 && rip == 0 { continue; }
+            println!(
+                "  [{}] reason={:<3} rip={:#018x} qual={:#x} rax={:#x}",
+                slot, reason, rip, qual, rax
+            );
+        }
+    }
+
+    println!("\n=== Per-CPU Heartbeat ===");
+    let mut any_active = false;
+    for cpu in 0..MAX_TRACKED_CPUS {
+        let heartbeat = hv_cpu_diag(cpu, 0);
+        let phase = hv_cpu_diag(cpu, 1);
+        let last_leaf = hv_cpu_diag(cpu, 2);
+        let timer_rip = hv_cpu_diag(cpu, 3);
+        let timer_stuck = hv_cpu_diag(cpu, 4);
+        if heartbeat == u64::MAX { break; }
+        if heartbeat > 0 {
+            any_active = true;
+            if timer_stuck > 2 {
+                println!(
+                    "  CPU {:>2}  heartbeat={:<10} phase={:#04x} leaf={:#x} STUCK_RIP={:#x} ({})",
+                    cpu, heartbeat, phase, last_leaf, timer_rip, timer_stuck
+                );
+            } else {
+                println!(
+                    "  CPU {:>2}  heartbeat={:<10} phase={:#04x} leaf={:#x} rip={:#x}",
+                    cpu, heartbeat, phase, last_leaf, timer_rip
+                );
+            }
+        }
+    }
+    if !any_active {
+        println!("  (no active CPUs)");
+    }
+
+    // Per-CPU breadcrumbs: last VM-exit guest state (captured by preemption timer)
+    println!("\n=== Per-CPU Breadcrumb (last slow-path VM-exit) ===");
+    let mut any_breadcrumb = false;
+    for cpu in 0..MAX_TRACKED_CPUS {
+        let count = hv_breadcrumb(cpu, 0);
+        if count == u64::MAX || count == 0 { continue; }
+        any_breadcrumb = true;
+        let exit_reason = hv_breadcrumb(cpu, 1);
+        let guest_rip = hv_breadcrumb(cpu, 3);
+        let guest_rsp = hv_breadcrumb(cpu, 4);
+        let guest_cr3 = hv_breadcrumb(cpu, 5);
+        let guest_rflags = hv_breadcrumb(cpu, 6);
+        let if_flag = (guest_rflags >> 9) & 1;
+        println!(
+            "  CPU {:>2}  n={:<6} reason={:<3} rip={:#018x} rsp={:#018x} cr3={:#018x} IF={}",
+            cpu, count, exit_reason & 0xFFFF, guest_rip, guest_rsp, guest_cr3, if_flag
+        );
+    }
+    if !any_breadcrumb {
+        println!("  (no breadcrumbs recorded)");
+    }
+
+    // === CMOS Freeze Data ===
+    println!("\n=== CMOS Freeze Snapshot ===");
+    let cmos0 = hv_cmd(CMD_READ_CMOS_FREEZE, 0);
+    let magic = (cmos0 & 0xFF) as u8;
+    if magic == 0xDE {
+        let cpu1 = ((cmos0 >> 8) & 0xFF) as u8;
+        let stuck_count = ((cmos0 >> 16) & 0xFFFF) as u16;
+        let rip1 = hv_cmd(CMD_READ_CMOS_FREEZE, 1);
+
+        println!("  [+] CMOS DATA FOUND!");
+        println!("  Last-write CPU:   #{}", cpu1);
+        println!("  RIP:              {:#018x}", rip1);
+        println!("  Stuck count:      {} (~{:.1}s in same 128B block)", stuck_count, stuck_count as f64 * 0.075);
+        // Clear after reading
+        let _ = hv_cmd(CMD_READ_CMOS_FREEZE, 4);
+    } else {
+        println!("  (no freeze data in CMOS)");
+    }
+
+    // CR8 bugcheck diagnostic (standard CMOS 0x72-0x75)
+    let cr8_diag = hv_cmd(CMD_READ_CMOS_FREEZE, 5);
+    let cr8_marker = (cr8_diag & 0xFF) as u8;
+    let cr8_val = ((cr8_diag >> 8) & 0xFF) as u8;
+    let cr8_leaf_lo = ((cr8_diag >> 16) & 0xFF) as u8;
+    let cr8_leaf_hi = ((cr8_diag >> 24) & 0xFF) as u8;
+    if cr8_marker == 0xBC {
+        let leaf = (cr8_leaf_hi as u32) << 8 | cr8_leaf_lo as u32;
+        println!("\n=== CR8 Bugcheck Diagnostic ===");
+        println!("  [+] CR8 HIGH detected during freeze!");
+        println!("  CR8 value:        {}", cr8_val);
+        println!("  CPUID leaf:       {:#06x}", leaf);
+        if cr8_val >= 15 { println!("  Interpretation:   HIGH_LEVEL — KeBugCheckEx in progress"); }
+        else if cr8_val >= 14 { println!("  Interpretation:   IPI_LEVEL"); }
+        else { println!("  Interpretation:   IRQL >= CLOCK_LEVEL ({})", cr8_val); }
+    } else {
+        println!("\n=== CR8 Bugcheck Diagnostic ===");
+        println!("  (no CR8 high detected, marker=0x{:02x})", cr8_marker);
     }
 
     if !checks_ok {

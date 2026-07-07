@@ -235,10 +235,13 @@ pub struct GuestRegisters {
     pub xmm13: M128A,
     pub xmm14: M128A,
     pub xmm15: M128A,
+    pub mxcsr_guest: u32,
+    pub _mxcsr_pad: u32,
+    pub _align_pad: u64,
 }
 const_assert_eq!(
     core::mem::size_of::<GuestRegisters>(),
-    0x190 /* 400 bytes */
+    0x1A0 /* 416 bytes */
 );
 
 #[repr(C)]

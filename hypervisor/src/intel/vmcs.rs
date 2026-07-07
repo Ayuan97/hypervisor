@@ -277,14 +277,19 @@ impl Vmcs {
         let requested_entry_ctl = requested_entry_controls();
         let exit_ctl = required_exit_controls();
         let requested_exit_ctl = requested_exit_controls();
-        const PINBASED_CTL: u64 = 0;
+        let pinbased_ctl: u64 = if minimal_mode() {
+            0
+        } else {
+            (vmcs::control::PinbasedControls::NMI_EXITING.bits()
+                | vmcs::control::PinbasedControls::VIRTUAL_NMIS.bits()) as u64
+        };
 
         use crate::intel::diag_trace as dt;
         dt::trace("vmcs: adjusting controls");
         dt::trace_val("  requested pri", primary_ctl);
         dt::trace_val("  requested sec", requested_secondary_ctl);
 
-        let ctl_pin = adjust_vmx_controls(VmxControl::PinBased, PINBASED_CTL)?;
+        let ctl_pin = adjust_vmx_controls(VmxControl::PinBased, pinbased_ctl)?;
         let ctl_pri = adjust_vmx_controls(VmxControl::ProcessorBased, primary_ctl)?;
         let ctl_sec = adjust_vmx_controls(VmxControl::ProcessorBased2, requested_secondary_ctl)?;
         let ctl_ent = adjust_vmx_controls(VmxControl::VmEntry, requested_entry_ctl)?;
@@ -414,12 +419,17 @@ impl Vmcs {
         vmwrite_checked(vmcs::control::EXCEPTION_BITMAP, 0u64)?;
 
         vmwrite_checked(vmcs::control::TSC_OFFSET_FULL, 0u64)?;
-        vmwrite_checked(vmcs::control::EPTP_FULL, shared_data.primary_eptp)?;
-        vmwrite_checked(vmcs::control::VPID, VPID_TAG)?;
+        if !ept_disabled() {
+            vmwrite_checked(vmcs::control::EPTP_FULL, shared_data.primary_eptp)?;
+            dt::trace_val("vmcs: eptp", shared_data.primary_eptp);
+            try_invept_single_context(shared_data.primary_eptp)?;
+        }
+        if !minimal_mode() {
+            vmwrite_checked(vmcs::control::VPID, VPID_TAG)?;
+            try_invvpid_single_context(VPID_TAG)?;
+        }
 
-        dt::trace_val("vmcs: eptp", shared_data.primary_eptp);
-        try_invept_single_context(shared_data.primary_eptp)?;
-        try_invvpid_single_context(VPID_TAG)?;
+        vmwrite_checked(vmcs::guest::VMX_PREEMPTION_TIMER_VALUE, 0x0060_0000u64)?;
 
         dt::trace("vmcs: control fields done");
         log::debug!("VMCS Control Fields setup successfully!");
@@ -439,12 +449,28 @@ fn required_primary_controls() -> u64 {
         | vmcs::control::PrimaryControls::USE_TSC_OFFSETTING.bits()) as u64
 }
 
+fn ept_disabled() -> bool {
+    minimal_mode() || option_env!("HV_NO_EPT").map_or(false, |v| v == "1")
+}
+
+fn minimal_mode() -> bool {
+    option_env!("HV_MINIMAL").map_or(false, |v| v == "1")
+}
+
 fn required_secondary_controls() -> u64 {
-    (vmcs::control::SecondaryControls::ENABLE_RDTSCP.bits()
+    if minimal_mode() {
+        return (vmcs::control::SecondaryControls::ENABLE_RDTSCP.bits()
+            | vmcs::control::SecondaryControls::ENABLE_XSAVES_XRSTORS.bits()
+            | vmcs::control::SecondaryControls::ENABLE_INVPCID.bits()) as u64;
+    }
+    let mut bits = (vmcs::control::SecondaryControls::ENABLE_RDTSCP.bits()
         | vmcs::control::SecondaryControls::ENABLE_XSAVES_XRSTORS.bits()
         | vmcs::control::SecondaryControls::ENABLE_INVPCID.bits()
-        | vmcs::control::SecondaryControls::ENABLE_VPID.bits()
-        | vmcs::control::SecondaryControls::ENABLE_EPT.bits()) as u64
+        | vmcs::control::SecondaryControls::ENABLE_VPID.bits()) as u64;
+    if !ept_disabled() {
+        bits |= vmcs::control::SecondaryControls::ENABLE_EPT.bits() as u64;
+    }
+    bits
 }
 
 const PT_CONCEAL_SECONDARY: u8 = 1;
@@ -521,8 +547,6 @@ fn secondary_control_present(effective: u64, control: vmcs::control::SecondaryCo
 
 fn pinbased_interrupt_exiting_ready(effective_pinbased: u64) -> bool {
     let unsupported = (vmcs::control::PinbasedControls::EXTERNAL_INTERRUPT_EXITING.bits()
-        | vmcs::control::PinbasedControls::VIRTUAL_NMIS.bits()
-        | vmcs::control::PinbasedControls::VMX_PREEMPTION_TIMER.bits()
         | vmcs::control::PinbasedControls::POSTED_INTERRUPTS.bits()) as u64;
 
     effective_pinbased & unsupported == 0
@@ -539,7 +563,6 @@ fn unsupported_primary_exit_controls(effective_primary: u64) -> u64 {
         | vmcs::control::PrimaryControls::CR8_LOAD_EXITING.bits()
         | vmcs::control::PrimaryControls::CR8_STORE_EXITING.bits()
         | vmcs::control::PrimaryControls::USE_TPR_SHADOW.bits()
-        | vmcs::control::PrimaryControls::NMI_WINDOW_EXITING.bits()
         | vmcs::control::PrimaryControls::MOV_DR_EXITING.bits()
         | vmcs::control::PrimaryControls::UNCOND_IO_EXITING.bits()
         | vmcs::control::PrimaryControls::USE_IO_BITMAPS.bits()
@@ -593,7 +616,6 @@ fn unsupported_exit_controls(effective_exit: u64) -> u64 {
         | vmcs::control::ExitControls::LOAD_IA32_PAT.bits()
         | vmcs::control::ExitControls::SAVE_IA32_EFER.bits()
         | vmcs::control::ExitControls::LOAD_IA32_EFER.bits()
-        | vmcs::control::ExitControls::SAVE_VMX_PREEMPTION_TIMER.bits()
         | vmcs::control::ExitControls::CLEAR_IA32_BNDCFGS.bits()
         | vmcs::control::ExitControls::CLEAR_IA32_RTIT_CTL.bits()) as u64;
 
@@ -918,9 +940,9 @@ mod tests {
 
         assert!(pinbased_interrupt_exiting_ready(0));
         assert!(pinbased_interrupt_exiting_ready(nmi_exiting));
+        assert!(pinbased_interrupt_exiting_ready(preemption_timer));
+        assert!(pinbased_interrupt_exiting_ready(virtual_nmis));
         assert!(!pinbased_interrupt_exiting_ready(ext_int));
-        assert!(!pinbased_interrupt_exiting_ready(virtual_nmis));
-        assert!(!pinbased_interrupt_exiting_ready(preemption_timer));
         assert!(!pinbased_interrupt_exiting_ready(posted_interrupts));
     }
 

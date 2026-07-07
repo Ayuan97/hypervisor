@@ -17,6 +17,10 @@ use {
     },
 };
 
+fn minimal_cpuid() -> bool {
+    option_env!("HV_MINIMAL").map_or(false, |v| v == "1")
+}
+
 pub const CPUID_BARE_METAL_COST: u64 = 120;
 // VM-exit transition: guest CPUID → CPU saves state → loads host → our handler rdtsc().
 // Subtract this from cpuid_entry_tsc to approximate the guest-side TSC at CPUID time.
@@ -106,13 +110,35 @@ pub fn handle_cpuid(guest_registers: &mut GuestRegisters, vmx: &mut Vmx, exit_ts
     }
 
     let sub_leaf = guest_registers.rcx as u32;
+    let r = guest_cpuid_result(leaf, sub_leaf, |l, s| cpuid!(l, s));
+    guest_registers.rax = r.eax as u64;
+    guest_registers.rbx = r.ebx as u64;
+    guest_registers.rcx = r.ecx as u64;
+    guest_registers.rdx = r.edx as u64;
 
-    let cpuid_result = guest_cpuid_result(leaf, sub_leaf, |leaf, sub_leaf| cpuid!(leaf, sub_leaf));
+    // If guest is at HIGH_LEVEL (CR8=15), a bugcheck is likely in progress.
+    // Devirtualize so the bugcheck freeze IPI can complete → BSOD instead of lockup.
+    let cr8: u64;
+    unsafe { core::arch::asm!("mov {}, cr8", out(reg) cr8, options(nomem, nostack)); }
+    if cr8 >= 13 {
+        // Write CR8 value to CMOS as diagnostic marker (survives hard reset).
+        unsafe {
+            core::arch::asm!("out dx, al", in("dx") 0x70u16, in("al") 0x72u8, options(nomem, nostack));
+            core::arch::asm!("out dx, al", in("dx") 0x71u16, in("al") 0xBCu8, options(nomem, nostack));
+            core::arch::asm!("out dx, al", in("dx") 0x70u16, in("al") 0x73u8, options(nomem, nostack));
+            core::arch::asm!("out dx, al", in("dx") 0x71u16, in("al") cr8 as u8, options(nomem, nostack));
+            // Write leaf to CMOS 0x74-0x75
+            core::arch::asm!("out dx, al", in("dx") 0x70u16, in("al") 0x74u8, options(nomem, nostack));
+            core::arch::asm!("out dx, al", in("dx") 0x71u16, in("al") leaf as u8, options(nomem, nostack));
+            core::arch::asm!("out dx, al", in("dx") 0x70u16, in("al") 0x75u8, options(nomem, nostack));
+            core::arch::asm!("out dx, al", in("dx") 0x71u16, in("al") (leaf >> 8) as u8, options(nomem, nostack));
+        }
+    }
 
-    guest_registers.rax = cpuid_result.eax as u64;
-    guest_registers.rbx = cpuid_result.ebx as u64;
-    guest_registers.rcx = cpuid_result.ecx as u64;
-    guest_registers.rdx = cpuid_result.edx as u64;
+    if !minimal_cpuid() {
+        vmx.cpuid_entry_tsc = exit_tsc_start;
+        enable_rdtsc_exiting();
+    }
 
     ExitType::IncrementRIP
 }

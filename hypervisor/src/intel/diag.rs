@@ -275,6 +275,13 @@ pub fn cmos_read_freeze(field: u64) -> u64 {
             ext_cmos_write(0x00, 0x00);
             0
         }
+        5 => {
+            let b0 = cmos_read(0x72) as u64;
+            let b1 = cmos_read(0x73) as u64;
+            let b2 = cmos_read(0x74) as u64;
+            let b3 = cmos_read(0x75) as u64;
+            b0 | (b1 << 8) | (b2 << 16) | (b3 << 24)
+        }
         _ => u64::MAX,
     }
 }
@@ -595,6 +602,7 @@ pub fn counter(id: u64) -> u64 {
         22 => EXIT_VMX_INSTR.load(Relaxed),
         23 => ring_current_idx(),
         24 => EXIT_PREEMPT.load(Relaxed),
+        25 => super::host_idt::HOST_DEFAULT_COUNT.load(Relaxed),
         _ => u64::MAX,
     }
 }

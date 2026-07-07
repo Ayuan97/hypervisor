@@ -60,6 +60,10 @@ pub fn handle_exception(guest_registers: &mut GuestRegisters, vmx: &mut Vmx) -> 
 
     match interruption_info.interruption_type {
         InterruptionType::NonMaskableInterrupt => {
+            // With Virtual NMIs, VM-exit sets "blocking by NMI" — clear it before reinject.
+            if let Ok(interruptibility) = vmread_checked(vmcs::guest::INTERRUPTIBILITY_STATE) {
+                let _ = vmwrite_checked(vmcs::guest::INTERRUPTIBILITY_STATE, interruptibility & !8);
+            }
             EventInjection::vmentry_inject_nmi();
         },
         InterruptionType::HardwareException => {
