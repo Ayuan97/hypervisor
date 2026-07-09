@@ -716,6 +716,18 @@ fn main() {
         println!("  (no breadcrumbs recorded)");
     }
 
+    // === Bugcheck Callback state (2026-07-09) ===
+    let bugcheck_cb_ram = hv_cmd(CMD_GET_CTL, 65);
+    let bugcheck_cb_cmos = hv_cmd(CMD_READ_CMOS_FREEZE, 9);
+    println!("\n=== KeBugCheckCallback ===");
+    if bugcheck_cb_ram > 0 || bugcheck_cb_cmos == 0xB1 {
+        println!("  [🚨] Bug-check callback fired");
+        println!("  RAM count:  {}", bugcheck_cb_ram);
+        println!("  CMOS mark:  0x{:02x} (0xB1 = fired last session)", bugcheck_cb_cmos);
+    } else {
+        println!("  RAM=0  CMOS=0x{:02x}  (not fired this session or last)", bugcheck_cb_cmos);
+    }
+
     // === P2 stealth MSR counters (2026-07-09) ===
     let efer_r = hv_cmd(CMD_GET_CTL, 57);
     let efer_w = hv_cmd(CMD_GET_CTL, 58);

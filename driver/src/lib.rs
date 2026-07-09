@@ -29,7 +29,10 @@ use {
         },
         utils::{
             alloc::PhysicalAllocator,
-            nt::{init_kebugcheckex_sentinel, update_ntoskrnl_cr3},
+            nt::{
+                deregister_bugcheck_callback, init_kebugcheckex_sentinel,
+                register_bugcheck_callback, update_ntoskrnl_cr3,
+            },
         },
     },
     log::LevelFilter,
@@ -117,6 +120,9 @@ unsafe fn register_driver_unload(driver_object: PDRIVER_OBJECT) {
 }
 
 unsafe extern "C" fn driver_unload(_driver_object: PDRIVER_OBJECT) {
+    // Deregister the bug-check callback before releasing driver memory —
+    // a stale entry in the kernel callback list would fire into freed pages.
+    deregister_bugcheck_callback();
     hypervisor::intel::client_read::stop_worker();
     let hv = HYPERVISOR.swap(null_mut(), Ordering::AcqRel);
     if !hv.is_null() && hv != hypervisor_initializing() {
@@ -307,6 +313,7 @@ fn virtualize_system_claimed() -> NTSTATUS {
     }
     update_ntoskrnl_cr3();
     init_kebugcheckex_sentinel();
+    register_bugcheck_callback();
 
     if let Some(status) = boot_stage(240) {
         return status;

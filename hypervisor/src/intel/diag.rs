@@ -145,6 +145,28 @@ pub static KEBUGCHECKEX_HIT_RIP: AtomicU64 = AtomicU64::new(0);
 pub static KEBUGCHECKEX_HIT_TSC: AtomicU64 = AtomicU64::new(0);
 pub static KEBUGCHECKEX_HIT_ARG0: AtomicU64 = AtomicU64::new(0);
 
+/// Number of times `KeBugCheckCallback` actually fired. If nonzero after a
+/// freeze/reboot cycle, the callback ran — meaning bug-check processing
+/// reached the point where Windows dispatches driver callbacks. Together
+/// with `KEBUGCHECKEX_HITS` (guest-RIP sentinel) this covers both "guest
+/// executed the KeBugCheckEx prologue" and "kernel completed enough of
+/// bugcheck dispatch to call our callback". Persisted to CMOS via
+/// `cmos_sync_step4_state` so a hard reboot preserves the marker.
+pub static BUGCHECK_CALLBACK_FIRED: AtomicU64 = AtomicU64::new(0);
+
+/// CMOS extended offset 0x1F carries a `0xB1` magic once the bug-check
+/// callback has fired. Read via `CMD_READ_CMOS_FREEZE` field 9.
+const CMOS_OFF_BUGCHECK_CB_FLAG: u8 = 0x1F;
+const CMOS_MAGIC_BUGCHECK_CB: u8 = 0xB1;
+
+/// Called from `bugcheck_callback` in nt.rs. IRQL is HIGH_LEVEL, other CPUs
+/// suspended, so we do the smallest possible work: increment the counter and
+/// stamp a CMOS byte. Both survive the ensuing hard reboot.
+pub fn note_bugcheck_callback_fired() {
+    BUGCHECK_CALLBACK_FIRED.fetch_add(1, Relaxed);
+    ext_cmos_write(CMOS_OFF_BUGCHECK_CB_FLAG, CMOS_MAGIC_BUGCHECK_CB);
+}
+
 pub fn set_kebugcheckex_sentinel(addr: u64, first_qword: u64) {
     KEBUGCHECKEX_ADDR.store(addr, Relaxed);
     KEBUGCHECKEX_SENTINEL.store(first_qword, Relaxed);
@@ -286,6 +308,7 @@ pub fn cmos_read_step4(field: u64) -> u64 {
             let b3 = ext_cmos_read(CMOS_OFF_KBCHK_ARG0_3) as u64;
             b0 | (b1 << 8) | (b2 << 16) | (b3 << 24)
         }
+        9 => ext_cmos_read(CMOS_OFF_BUGCHECK_CB_FLAG) as u64,
         8 => {
             // Clear all Step 1-4 CMOS bytes and reset the change-detect shadows
             // so the next boot starts from a clean slate.
@@ -626,7 +649,7 @@ pub fn cmos_read_freeze(field: u64) -> u64 {
             let b3 = cmos_read(0x75) as u64;
             b0 | (b1 << 8) | (b2 << 16) | (b3 << 24)
         }
-        6 | 7 | 8 => cmos_read_step4(field),
+        6 | 7 | 8 | 9 => cmos_read_step4(field),
         _ => u64::MAX,
     }
 }
@@ -1317,6 +1340,7 @@ pub fn control(id: u64) -> u64 {
         62 => DEBUGCTL_WRITE_COUNT.load(Relaxed),
         63 => LBR_STACK_READ_COUNT.load(Relaxed),
         64 => LBR_DEBUGCTL_SHADOW.load(Relaxed),
+        65 => BUGCHECK_CALLBACK_FIRED.load(Relaxed),
         _ => u64::MAX,
     }
 }
