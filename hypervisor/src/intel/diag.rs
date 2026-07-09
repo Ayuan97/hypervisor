@@ -202,8 +202,13 @@ pub fn cmos_sync_step4_state() {
     // before the first change-detect fires. Without this, a driver load
     // would clobber last session's freeze data on the first VM-exit.
     cmos_load_step4_baseline();
+
+    // Only write when *this* session has recorded a nonzero event AND the
+    // value differs from what CMOS holds. RAM values start at 0, so the
+    // "hits == 0" guard prevents driver-load from overwriting a previous
+    // session's captured freeze data with this session's zeroed baseline.
     let hits = KEBUGCHECKEX_HITS.load(Relaxed);
-    if hits != CMOS_LAST_HITS.load(Relaxed) {
+    if hits != 0 && hits != CMOS_LAST_HITS.load(Relaxed) {
         ext_cmos_write(CMOS_OFF_MAGIC, CMOS_MAGIC_STEP4);
         ext_cmos_write(CMOS_OFF_KBCHK_HITS, hits.min(u8::MAX as u64) as u8);
         let arg0 = KEBUGCHECKEX_HIT_ARG0.load(Relaxed);
@@ -214,7 +219,7 @@ pub fn cmos_sync_step4_state() {
         CMOS_LAST_HITS.store(hits, Relaxed);
     }
     let vector = super::host_idt::HOST_FIRST_FAULT_VECTOR.load(Relaxed);
-    if vector != CMOS_LAST_VECTOR.load(Relaxed) {
+    if vector != 0 && vector != CMOS_LAST_VECTOR.load(Relaxed) {
         ext_cmos_write(CMOS_OFF_MAGIC, CMOS_MAGIC_STEP4);
         ext_cmos_write(CMOS_OFF_FIRST_VEC, vector.min(u8::MAX as u64) as u8);
         let cpu = super::host_idt::HOST_FIRST_FAULT_CPU.load(Relaxed);
@@ -222,7 +227,7 @@ pub fn cmos_sync_step4_state() {
         CMOS_LAST_VECTOR.store(vector, Relaxed);
     }
     let total = super::host_idt::HOST_FAULT_TOTAL.load(Relaxed);
-    if total != CMOS_LAST_TOTAL.load(Relaxed) {
+    if total != 0 && total != CMOS_LAST_TOTAL.load(Relaxed) {
         ext_cmos_write(CMOS_OFF_MAGIC, CMOS_MAGIC_STEP4);
         let clamped = total.min(u16::MAX as u64) as u16;
         ext_cmos_write(CMOS_OFF_TOTAL_LO, clamped as u8);
