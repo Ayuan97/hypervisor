@@ -200,17 +200,17 @@ where
         }
     }
 
-    // IA32_DEBUGCTL: guest read gets back a shadow (initially 0), guest
-    // write is virtualized (stored in shadow, not applied to hardware) so
-    // host code that runs between VM-exit and VM-entry does not corrupt LBR
-    // state from the guest's point of view.
+    // IA32_DEBUGCTL: pass through both directions after the first attempt
+    // to shadow-virtualise triggered a boot-time PAGE_FAULT_IN_NONPAGED_AREA
+    // (2026-07-09). Windows kernel relies on DEBUGCTL bits being consistent
+    // with the actual hardware state for LBR / BTS. Counters still fire so
+    // we can see whether EAC probes DEBUGCTL.
     if msr == IA32_DEBUGCTL {
         match access_type {
             MsrAccessType::Read => {
-                let shadow = super::super::diag::LBR_DEBUGCTL_SHADOW
-                    .load(core::sync::atomic::Ordering::Relaxed);
-                guest_registers.rax = shadow & 0xFFFF_FFFF;
-                guest_registers.rdx = shadow >> 32;
+                let value = read_msr(msr);
+                guest_registers.rax = value & 0xFFFF_FFFF;
+                guest_registers.rdx = value >> 32;
                 super::super::diag::DEBUGCTL_READ_COUNT
                     .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
                 return ExitType::IncrementRIP;
@@ -218,6 +218,7 @@ where
             MsrAccessType::Write => {
                 let value =
                     ((guest_registers.rdx as u64) << 32) | (guest_registers.rax as u64 & 0xFFFF_FFFF);
+                write_msr(msr, value);
                 super::super::diag::LBR_DEBUGCTL_SHADOW
                     .store(value, core::sync::atomic::Ordering::Relaxed);
                 super::super::diag::DEBUGCTL_WRITE_COUNT
@@ -227,21 +228,25 @@ where
         }
     }
 
-    // LBR TOS and LBR stack: return 0 on read, silently absorb writes. This
-    // hides any host branches that may have leaked into LBR while the
-    // handler was running.
+    // LBR TOS and LBR stack: pass through both directions. Returning 0 on
+    // read broke kernel LBR/BTB users at boot (2026-07-09 BSOD 0x50 at
+    // fffff8057ea8086f). Counters still tell us if EAC polls LBR stack.
     if msr == IA32_LASTBRANCH_TOS
         || (IA32_LBR_STACK_START..=IA32_LBR_STACK_END).contains(&msr)
     {
         match access_type {
             MsrAccessType::Read => {
-                guest_registers.rax = 0;
-                guest_registers.rdx = 0;
+                let value = read_msr(msr);
+                guest_registers.rax = value & 0xFFFF_FFFF;
+                guest_registers.rdx = value >> 32;
                 super::super::diag::LBR_STACK_READ_COUNT
                     .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
                 return ExitType::IncrementRIP;
             }
             MsrAccessType::Write => {
+                let value =
+                    ((guest_registers.rdx as u64) << 32) | (guest_registers.rax as u64 & 0xFFFF_FFFF);
+                write_msr(msr, value);
                 return ExitType::IncrementRIP;
             }
         }
@@ -493,35 +498,41 @@ mod tests {
     }
 
     #[test]
-    fn debugctl_read_returns_zero_shadow_by_default() {
-        crate::intel::diag::LBR_DEBUGCTL_SHADOW.store(0, core::sync::atomic::Ordering::Relaxed);
+    fn debugctl_read_passes_through_hardware_value() {
         let mut regs = GuestRegisters::default();
         regs.rcx = IA32_DEBUGCTL as u64;
-        let exit = handle_msr_access_test(
+        let exit = handle_msr_access_with(
             &mut regs,
             MsrAccessType::Read,
-            |_| panic!("DEBUGCTL must not read hardware"),
+            |m| {
+                assert_eq!(m, IA32_DEBUGCTL);
+                0x0000_0000_0000_0055
+            },
+            |_, _| panic!("DEBUGCTL read must not touch write closure"),
             |_| panic!("DEBUGCTL read must not #GP"),
         );
         assert_eq!(exit, ExitType::IncrementRIP);
-        assert_eq!(regs.rax, 0);
+        assert_eq!(regs.rax, 0x55);
         assert_eq!(regs.rdx, 0);
     }
 
     #[test]
-    fn debugctl_write_stores_shadow_not_hardware() {
+    fn debugctl_write_reaches_hardware_and_updates_shadow() {
         crate::intel::diag::LBR_DEBUGCTL_SHADOW.store(0, core::sync::atomic::Ordering::Relaxed);
         let mut regs = GuestRegisters::default();
         regs.rcx = IA32_DEBUGCTL as u64;
         regs.rax = 0x0000_00FF;
         regs.rdx = 0x1122_3344;
-        let exit = handle_msr_access_test(
+        let mut hw_wrote = None;
+        let exit = handle_msr_access_with(
             &mut regs,
             MsrAccessType::Write,
-            |_| panic!("DEBUGCTL write must not touch hardware"),
+            |_| panic!("DEBUGCTL write must not read hardware"),
+            |m, v| hw_wrote = Some((m, v)),
             |_| panic!("DEBUGCTL write must not #GP"),
         );
         assert_eq!(exit, ExitType::IncrementRIP);
+        assert_eq!(hw_wrote, Some((IA32_DEBUGCTL, 0x1122_3344_0000_00FF)));
         assert_eq!(
             crate::intel::diag::LBR_DEBUGCTL_SHADOW
                 .load(core::sync::atomic::Ordering::Relaxed),
@@ -530,31 +541,41 @@ mod tests {
     }
 
     #[test]
-    fn lbr_stack_reads_return_zero_and_writes_are_silently_absorbed() {
+    fn lbr_stack_reads_pass_through_hardware() {
         for msr in [IA32_LASTBRANCH_TOS, IA32_LBR_STACK_START, 0x69F, IA32_LBR_STACK_END] {
             let mut regs = GuestRegisters::default();
             regs.rcx = msr as u64;
             let read_exit = handle_msr_access_test(
                 &mut regs,
                 MsrAccessType::Read,
-                |_| panic!("LBR stack must not read hardware for {:#x}", msr),
+                |m| {
+                    assert_eq!(m, msr);
+                    0xAAAA_BBBB_CCCC_DDDD
+                },
                 |_| panic!("LBR stack read must not #GP"),
             );
             assert_eq!(read_exit, ExitType::IncrementRIP);
-            assert_eq!(regs.rax, 0);
-            assert_eq!(regs.rdx, 0);
-
-            let mut regs = GuestRegisters::default();
-            regs.rcx = msr as u64;
-            regs.rax = 0xdead;
-            let write_exit = handle_msr_access_test(
-                &mut regs,
-                MsrAccessType::Write,
-                |_| panic!("LBR stack write must not reach hardware"),
-                |_| panic!("LBR stack write must not #GP"),
-            );
-            assert_eq!(write_exit, ExitType::IncrementRIP);
+            assert_eq!(regs.rax, 0xCCCC_DDDD);
+            assert_eq!(regs.rdx, 0xAAAA_BBBB);
         }
+    }
+
+    #[test]
+    fn lbr_stack_writes_reach_hardware() {
+        let mut regs = GuestRegisters::default();
+        regs.rcx = IA32_LBR_STACK_START as u64;
+        regs.rax = 0x1234_5678;
+        regs.rdx = 0x9abc_def0;
+        let mut hw_wrote = None;
+        let exit = handle_msr_access_with(
+            &mut regs,
+            MsrAccessType::Write,
+            |_| panic!("LBR stack write must not read hardware"),
+            |m, v| hw_wrote = Some((m, v)),
+            |_| panic!("LBR stack write must not #GP"),
+        );
+        assert_eq!(exit, ExitType::IncrementRIP);
+        assert_eq!(hw_wrote, Some((IA32_LBR_STACK_START, 0x9abc_def0_1234_5678)));
     }
 
     #[test]
