@@ -716,6 +716,26 @@ fn main() {
         println!("  (no breadcrumbs recorded)");
     }
 
+    // === P2 stealth MSR counters (2026-07-09) ===
+    let efer_r = hv_cmd(CMD_GET_CTL, 57);
+    let efer_w = hv_cmd(CMD_GET_CTL, 58);
+    let aperf_r = hv_cmd(CMD_GET_CTL, 59);
+    let mperf_r = hv_cmd(CMD_GET_CTL, 60);
+    let debugctl_r = hv_cmd(CMD_GET_CTL, 61);
+    let debugctl_w = hv_cmd(CMD_GET_CTL, 62);
+    let lbr_r = hv_cmd(CMD_GET_CTL, 63);
+    let dbg_shadow = hv_cmd(CMD_GET_CTL, 64);
+    println!("\n=== P2 stealth MSR polls ===");
+    println!("  IA32_EFER          reads={} writes={}", efer_r, efer_w);
+    println!("  IA32_APERF/MPERF   aperf_reads={} mperf_reads={}", aperf_r, mperf_r);
+    println!("  IA32_DEBUGCTL      reads={} writes={} shadow={:#018x}", debugctl_r, debugctl_w, dbg_shadow);
+    println!("  IA32_LBR stack     reads={}", lbr_r);
+    if efer_r > 0 || aperf_r > 0 || mperf_r > 0 || debugctl_r > 0 || lbr_r > 0 {
+        println!("  [i] Non-zero polls = something is querying these MSRs.");
+        println!("      Windows kernel does hit EFER/APERF at boot, so a small baseline is normal.");
+        println!("      A sudden jump after game launch = anti-cheat probe.");
+    }
+
     // === KeBugCheckEx Sentinel Address ===
     let kbchk_addr = hv_cmd(CMD_GET_CTL, 50);
     let kbchk_sentinel = hv_cmd(CMD_GET_CTL, 51);
