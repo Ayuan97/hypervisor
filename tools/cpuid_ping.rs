@@ -716,6 +716,19 @@ fn main() {
         println!("  (no breadcrumbs recorded)");
     }
 
+    // === KeBugCheckEx Sentinel Address ===
+    let kbchk_addr = hv_cmd(CMD_GET_CTL, 50);
+    let kbchk_sentinel = hv_cmd(CMD_GET_CTL, 51);
+    let kbchk_hits_ram = hv_cmd(CMD_GET_CTL, 52);
+    println!("\n=== KeBugCheckEx Sentinel (RAM) ===");
+    if kbchk_addr == 0 {
+        println!("  [!] Sentinel NOT resolved — init_kebugcheckex_sentinel failed?");
+    } else {
+        println!("  ADDR:              {:#018x}", kbchk_addr);
+        println!("  First 8 bytes:     {:#018x}", kbchk_sentinel);
+        println!("  HITS (RAM):        {}", kbchk_hits_ram);
+    }
+
     // === CMOS Freeze Data ===
     println!("\n=== CMOS Freeze Snapshot ===");
     let cmos0 = hv_cmd(CMD_READ_CMOS_FREEZE, 0);
