@@ -129,6 +129,125 @@ pub fn set_kebugcheckex_sentinel(addr: u64, first_qword: u64) {
     KEBUGCHECKEX_SENTINEL.store(first_qword, Relaxed);
 }
 
+// ---------------------------------------------------------------------------
+// CMOS persistence for freeze-critical Step 1-4 fields (2026-07-09).
+//
+// The 2026-07-09 EAC scenario test proved KEBUGCHECKEX / first-fault / total
+// state stays only in RAM and vanishes on hard reboot — the exact scenario we
+// need to diagnose. Extended CMOS 0x10-0x19 mirrors the RAM values; writes go
+// through ext_cmos_write on state change so the port I/O is rare (fault
+// events + first bugcheck hit only).
+//
+// Layout (extended CMOS ports 0x72/0x73):
+//   0x10: magic 0xAB    — sentinel; anything else means "no diag data"
+//   0x11: KEBUGCHECKEX_HITS (saturated to u8, 0/1/many)
+//   0x12: HOST_FIRST_FAULT_VECTOR (0/2/8/13/14/18)
+//   0x13-0x14: HOST_FAULT_TOTAL (u16 LE, saturated to 65535)
+//   0x15-0x18: KEBUGCHECKEX_HIT_ARG0 (u32 LE) — bugcheck code (0x139 = ksec)
+//   0x19: HOST_FIRST_FAULT_CPU
+// ---------------------------------------------------------------------------
+pub const CMOS_MAGIC_STEP4: u8 = 0xAB;
+const CMOS_OFF_MAGIC: u8 = 0x10;
+const CMOS_OFF_KBCHK_HITS: u8 = 0x11;
+const CMOS_OFF_FIRST_VEC: u8 = 0x12;
+const CMOS_OFF_TOTAL_LO: u8 = 0x13;
+const CMOS_OFF_TOTAL_HI: u8 = 0x14;
+const CMOS_OFF_KBCHK_ARG0_0: u8 = 0x15;
+const CMOS_OFF_KBCHK_ARG0_1: u8 = 0x16;
+const CMOS_OFF_KBCHK_ARG0_2: u8 = 0x17;
+const CMOS_OFF_KBCHK_ARG0_3: u8 = 0x18;
+const CMOS_OFF_FIRST_CPU: u8 = 0x19;
+
+static CMOS_LAST_HITS: AtomicU64 = AtomicU64::new(u64::MAX);
+static CMOS_LAST_VECTOR: AtomicU64 = AtomicU64::new(u64::MAX);
+static CMOS_LAST_TOTAL: AtomicU64 = AtomicU64::new(u64::MAX);
+
+/// Snapshot the freeze-critical Step 1-4 fields into extended CMOS. Called
+/// on every VM-exit return path via `watchdog_handler_finish`; writes only
+/// when a value actually changed, so the port-I/O cost is negligible during
+/// normal runtime and only kicks in when something interesting fires.
+#[inline]
+pub fn cmos_sync_step4_state() {
+    let hits = KEBUGCHECKEX_HITS.load(Relaxed);
+    if hits != CMOS_LAST_HITS.load(Relaxed) {
+        ext_cmos_write(CMOS_OFF_MAGIC, CMOS_MAGIC_STEP4);
+        ext_cmos_write(CMOS_OFF_KBCHK_HITS, hits.min(u8::MAX as u64) as u8);
+        let arg0 = KEBUGCHECKEX_HIT_ARG0.load(Relaxed);
+        ext_cmos_write(CMOS_OFF_KBCHK_ARG0_0, arg0 as u8);
+        ext_cmos_write(CMOS_OFF_KBCHK_ARG0_1, (arg0 >> 8) as u8);
+        ext_cmos_write(CMOS_OFF_KBCHK_ARG0_2, (arg0 >> 16) as u8);
+        ext_cmos_write(CMOS_OFF_KBCHK_ARG0_3, (arg0 >> 24) as u8);
+        CMOS_LAST_HITS.store(hits, Relaxed);
+    }
+    let vector = super::host_idt::HOST_FIRST_FAULT_VECTOR.load(Relaxed);
+    if vector != CMOS_LAST_VECTOR.load(Relaxed) {
+        ext_cmos_write(CMOS_OFF_MAGIC, CMOS_MAGIC_STEP4);
+        ext_cmos_write(CMOS_OFF_FIRST_VEC, vector.min(u8::MAX as u64) as u8);
+        let cpu = super::host_idt::HOST_FIRST_FAULT_CPU.load(Relaxed);
+        ext_cmos_write(CMOS_OFF_FIRST_CPU, cpu.min(u8::MAX as u64) as u8);
+        CMOS_LAST_VECTOR.store(vector, Relaxed);
+    }
+    let total = super::host_idt::HOST_FAULT_TOTAL.load(Relaxed);
+    if total != CMOS_LAST_TOTAL.load(Relaxed) {
+        ext_cmos_write(CMOS_OFF_MAGIC, CMOS_MAGIC_STEP4);
+        let clamped = total.min(u16::MAX as u64) as u16;
+        ext_cmos_write(CMOS_OFF_TOTAL_LO, clamped as u8);
+        ext_cmos_write(CMOS_OFF_TOTAL_HI, (clamped >> 8) as u8);
+        CMOS_LAST_TOTAL.store(total, Relaxed);
+    }
+}
+
+/// Read the extended-CMOS Step 1-4 snapshot.
+///
+/// Field packing so the value fits in a single u64 return:
+///   field 6: `magic(8) | hits(8) | vec(8) | cpu(8) | total_lo(8) | total_hi(8)`
+///   field 7: full `arg0` u32
+/// Callers verify `field6 & 0xFF == CMOS_MAGIC_STEP4` before trusting the rest.
+pub fn cmos_read_step4(field: u64) -> u64 {
+    match field {
+        6 => {
+            let magic = ext_cmos_read(CMOS_OFF_MAGIC) as u64;
+            let hits = ext_cmos_read(CMOS_OFF_KBCHK_HITS) as u64;
+            let vec = ext_cmos_read(CMOS_OFF_FIRST_VEC) as u64;
+            let cpu = ext_cmos_read(CMOS_OFF_FIRST_CPU) as u64;
+            let total_lo = ext_cmos_read(CMOS_OFF_TOTAL_LO) as u64;
+            let total_hi = ext_cmos_read(CMOS_OFF_TOTAL_HI) as u64;
+            magic
+                | (hits << 8)
+                | (vec << 16)
+                | (cpu << 24)
+                | (total_lo << 32)
+                | (total_hi << 40)
+        }
+        7 => {
+            let b0 = ext_cmos_read(CMOS_OFF_KBCHK_ARG0_0) as u64;
+            let b1 = ext_cmos_read(CMOS_OFF_KBCHK_ARG0_1) as u64;
+            let b2 = ext_cmos_read(CMOS_OFF_KBCHK_ARG0_2) as u64;
+            let b3 = ext_cmos_read(CMOS_OFF_KBCHK_ARG0_3) as u64;
+            b0 | (b1 << 8) | (b2 << 16) | (b3 << 24)
+        }
+        8 => {
+            // Clear all Step 1-4 CMOS bytes and reset the change-detect shadows
+            // so the next boot starts from a clean slate.
+            ext_cmos_write(CMOS_OFF_MAGIC, 0);
+            ext_cmos_write(CMOS_OFF_KBCHK_HITS, 0);
+            ext_cmos_write(CMOS_OFF_FIRST_VEC, 0);
+            ext_cmos_write(CMOS_OFF_TOTAL_LO, 0);
+            ext_cmos_write(CMOS_OFF_TOTAL_HI, 0);
+            ext_cmos_write(CMOS_OFF_KBCHK_ARG0_0, 0);
+            ext_cmos_write(CMOS_OFF_KBCHK_ARG0_1, 0);
+            ext_cmos_write(CMOS_OFF_KBCHK_ARG0_2, 0);
+            ext_cmos_write(CMOS_OFF_KBCHK_ARG0_3, 0);
+            ext_cmos_write(CMOS_OFF_FIRST_CPU, 0);
+            CMOS_LAST_HITS.store(u64::MAX, Relaxed);
+            CMOS_LAST_VECTOR.store(u64::MAX, Relaxed);
+            CMOS_LAST_TOTAL.store(u64::MAX, Relaxed);
+            0
+        }
+        _ => u64::MAX,
+    }
+}
+
 /// Called from the VM-exit prologue with the current guest RIP and RCX. If
 /// RIP lies inside the watched KeBugCheckEx prologue, record a hit. RCX
 /// carries the bugcheck code in the Windows x64 calling convention, so
@@ -198,6 +317,10 @@ pub fn watchdog_handler_finish(guest_rip: u64) {
     }
     // Clear start so nested/spurious calls do not double-count.
     HANDLER_START_TSC[cpu].store(0, Relaxed);
+
+    // Persist freeze-critical Step 1-4 state to CMOS so a hard reboot can
+    // still recover the "who died first" answer we lost on 2026-07-09.
+    cmos_sync_step4_state();
 }
 
 /// Read one field of watchdog state for a given CPU.
@@ -443,6 +566,7 @@ pub fn cmos_read_freeze(field: u64) -> u64 {
             let b3 = cmos_read(0x75) as u64;
             b0 | (b1 << 8) | (b2 << 16) | (b3 << 24)
         }
+        6 | 7 | 8 => cmos_read_step4(field),
         _ => u64::MAX,
     }
 }
@@ -991,6 +1115,44 @@ mod tests {
         KEBUGCHECKEX_HITS.store(0, Relaxed);
         observe_guest_rip_for_bugcheck(0xdeadbeef, 0);
         assert_eq!(KEBUGCHECKEX_HITS.load(Relaxed), 0);
+    }
+
+    #[test]
+    fn cmos_step4_field6_packs_state_bytes_lsb_first() {
+        // The packing must place magic in the low byte and CPU/vector/hits
+        // in successive bytes so a user-mode reader can unpack with shifts
+        // that mirror the write layout above.
+        let magic = 0xABu8;
+        let hits = 3u8;
+        let vector = 14u8;
+        let cpu = 7u8;
+        let total: u16 = 0x1234;
+
+        let packed = (magic as u64)
+            | ((hits as u64) << 8)
+            | ((vector as u64) << 16)
+            | ((cpu as u64) << 24)
+            | (((total & 0xFF) as u64) << 32)
+            | (((total >> 8) as u64) << 40);
+
+        assert_eq!(packed & 0xFF, CMOS_MAGIC_STEP4 as u64);
+        assert_eq!((packed >> 8) & 0xFF, hits as u64);
+        assert_eq!((packed >> 16) & 0xFF, vector as u64);
+        assert_eq!((packed >> 24) & 0xFF, cpu as u64);
+        assert_eq!((packed >> 32) & 0xFFFF, total as u64);
+    }
+
+    #[test]
+    fn cmos_step4_field7_bugcheck_arg0_roundtrips_as_u32() {
+        let arg0: u32 = 0x0000_0139; // KERNEL_SECURITY_CHECK_FAILURE
+        let packed = (arg0 as u64) & 0xFFFF_FFFF;
+        assert_eq!(packed as u32, arg0);
+    }
+
+    #[test]
+    fn cmos_read_step4_out_of_range_returns_sentinel() {
+        assert_eq!(cmos_read_step4(0), u64::MAX);
+        assert_eq!(cmos_read_step4(9), u64::MAX);
     }
 
     #[test]

@@ -142,7 +142,7 @@ CMOS freeze snapshot（`CMD_READ_CMOS_FREEZE`，扩展 CMOS 0x00-0x0B + 传统 C
 | CPUID SGX/SGX_LC/WAITPKG | 隐藏 |
 | CPUID hypervisor leaves 0x4000_00xx | 未授权全 0 |
 | IA32_FEATURE_CONTROL | 隐藏 VMX/SENTER/SGX enable 位 |
-| VMX 能力 MSR (0x480-0x491) | **RDMSR pass-through 到硬件**、WRMSR 注入 `#GP`（与 CPUID VMX bit=0 存在一致性冲突，见 `docs/research-report-2026-07-09.md`） |
+| VMX 能力 MSR (0x480-0x491) | RDMSR/WRMSR 均注入 `#GP`（2026-07-09 修：跟 CPUID VMX bit=0 保持一致） |
 | 合成 MSR 0x40000000+ | 注入 `#GP` |
 | CR4.VMXE | guest read shadow 隐藏 + guest/host mask |
 | VMX 指令探针 | 用户态注入 `#UD`；CPL0 shadow VMXE=0 时 `#UD`；shadow VMXE=1 时 VMfailInvalid |

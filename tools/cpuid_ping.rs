@@ -755,6 +755,51 @@ fn main() {
         println!("  (no CR8 high detected, marker=0x{:02x})", cr8_marker);
     }
 
+    // === Step 1-4 CMOS Persistence (2026-07-09) ===
+    // Extended CMOS 0x10-0x19 mirrors the freeze-critical RAM state so a
+    // hard reboot no longer wipes "who died first" and "what bugcheck code".
+    let step4 = hv_cmd(CMD_READ_CMOS_FREEZE, 6);
+    let step4_magic = (step4 & 0xFF) as u8;
+    println!("\n=== Step 1-4 CMOS (KEBUGCHECKEX / first-fault / total) ===");
+    if step4_magic == 0xAB {
+        let hits = ((step4 >> 8) & 0xFF) as u8;
+        let vec = ((step4 >> 16) & 0xFF) as u8;
+        let cpu = ((step4 >> 24) & 0xFF) as u8;
+        let total_lo = ((step4 >> 32) & 0xFF) as u16;
+        let total_hi = ((step4 >> 40) & 0xFF) as u16;
+        let total = total_lo | (total_hi << 8);
+        let arg0 = hv_cmd(CMD_READ_CMOS_FREEZE, 7) as u32;
+
+        println!("  [+] Step 1-4 CMOS DATA FOUND!");
+        println!("  KEBUGCHECKEX_HITS:     {}", hits);
+        if hits > 0 {
+            println!("  KEBUGCHECKEX_HIT_ARG0: {:#010x}", arg0);
+            match arg0 {
+                0x139 => println!("    → KERNEL_SECURITY_CHECK_FAILURE (stack cookie / integrity)"),
+                0x109 => println!("    → CRITICAL_STRUCTURE_CORRUPTION (PatchGuard)"),
+                0x18b => println!("    → SECURE_KERNEL_ERROR"),
+                _ if arg0 != 0 => println!("    → bugcheck code {:#x}, look up in Windows docs", arg0),
+                _ => {}
+            }
+        }
+        let vec_name = match vec {
+            0 => "(none)",
+            2 => "#NMI",
+            8 => "#DF (double-fault, cascade)",
+            13 => "#GP",
+            14 => "#PF",
+            18 => "#MC",
+            _ => "unknown",
+        };
+        println!("  HOST_FIRST_FAULT_VECTOR: {} ({})", vec, vec_name);
+        if vec != 0 {
+            println!("  HOST_FIRST_FAULT_CPU:    #{}", cpu);
+        }
+        println!("  HOST_FAULT_TOTAL:        {}", total);
+    } else {
+        println!("  (no Step 1-4 CMOS data, magic=0x{:02x})", step4_magic);
+    }
+
     if !checks_ok {
         std::process::exit(1);
     }

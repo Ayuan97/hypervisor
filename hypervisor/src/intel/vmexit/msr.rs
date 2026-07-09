@@ -108,21 +108,17 @@ where
         return ExitType::IncrementRIP;
     }
 
-    // VMX capability MSRs (0x480-0x491) — read-only on bare metal.
-    // Pass reads through to hardware; writes → #GP (matches bare metal).
+    // VMX capability MSRs (0x480-0x491) — inject #GP for both reads and writes.
+    //
+    // Bare metal without VMX support returns #GP on RDMSR. With VMX support but
+    // BIOS-locked disable (the stealth model we present via CPUID.1.ECX[5]=0),
+    // reads *would* succeed with real values — but the CPUID/MSR mismatch is a
+    // known EAC detection vector (secret.club 2020). Present a stricter but
+    // consistent story: CPUID says no VMX → MSR reads also fault. Writes always
+    // #GP because these MSRs are architecturally read-only per Intel SDM.
     if vmx_capability_msr(msr) {
-        match access_type {
-            MsrAccessType::Read => {
-                let value = read_msr(msr);
-                guest_registers.rax = value & 0xFFFF_FFFF;
-                guest_registers.rdx = value >> 32;
-                return ExitType::IncrementRIP;
-            }
-            MsrAccessType::Write => {
-                inject_gp(0);
-                return ExitType::Continue;
-            }
-        }
+        inject_gp(0);
+        return ExitType::Continue;
     }
 
     // SGX key-hash MSRs (0x8C-0x8F) and IA32_FEATURE_CONTROL writes —
@@ -307,20 +303,24 @@ mod tests {
     }
 
     #[test]
-    fn vmx_capability_rdmsr_passes_through_to_hardware() {
+    fn vmx_capability_rdmsr_injects_gp_to_match_hidden_vmx_bit() {
+        // With CPUID.1.ECX[5] cleared (VMX bit hidden), leaking real values
+        // from VMX capability MSRs would create a detectable inconsistency
+        // (see docs/eac-hv-research-2026-07.md, secret.club analysis).
+        // Present a consistent "no VMX" story by injecting #GP on read.
         let mut regs = GuestRegisters::default();
         regs.rcx = 0x480; // IA32_VMX_BASIC
+        let mut injected_error = None;
 
         let exit = handle_msr_access_with(
             &mut regs,
             MsrAccessType::Read,
-            |_| 0xDEAD_BEEF_CAFE_BABE,
-            |_| panic!("VMX MSR read should not inject #GP"),
+            |_| panic!("VMX MSR read must not reach hardware"),
+            |code| injected_error = Some(code),
         );
 
-        assert_eq!(exit, ExitType::IncrementRIP);
-        assert_eq!(regs.rax, 0xCAFE_BABE);
-        assert_eq!(regs.rdx, 0xDEAD_BEEF);
+        assert_eq!(exit, ExitType::Continue);
+        assert_eq!(injected_error, Some(0));
     }
 
     #[test]
@@ -338,6 +338,29 @@ mod tests {
 
         assert_eq!(exit, ExitType::Continue);
         assert_eq!(injected_error, Some(0));
+    }
+
+    #[test]
+    fn vmx_capability_msr_range_boundary_all_reads_gp() {
+        // Full IA32_VMX_MSR_START..=IA32_VMX_MSR_END range should GP on read.
+        for msr in [
+            IA32_VMX_MSR_START,
+            0x485,
+            0x489,
+            IA32_VMX_MSR_END,
+        ] {
+            let mut regs = GuestRegisters::default();
+            regs.rcx = msr as u64;
+            let mut injected_error = None;
+            let exit = handle_msr_access_with(
+                &mut regs,
+                MsrAccessType::Read,
+                |_| panic!("VMX MSR read must not reach hardware for {:#x}", msr),
+                |code| injected_error = Some(code),
+            );
+            assert_eq!(exit, ExitType::Continue, "msr {:#x}", msr);
+            assert_eq!(injected_error, Some(0), "msr {:#x}", msr);
+        }
     }
 
     #[test]
