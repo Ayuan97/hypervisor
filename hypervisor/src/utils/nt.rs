@@ -109,6 +109,27 @@ pub fn update_ntoskrnl_cr3() {
     unsafe { KeUnstackDetachProcess(&mut apc_state) };
 }
 
+/// Resolve `nt!KeBugCheckEx` and store its address + first 8 bytes into the
+/// diagnostic sentinel. Called during driver init after `NTOSKRNL_CR3` is
+/// available so the read is guaranteed to hit paged-in kernel memory. If EAC
+/// triggers a bugcheck later, guest RIP inside VM-exits will hit this range;
+/// see `diag::observe_guest_rip_for_bugcheck`.
+pub fn init_kebugcheckex_sentinel() {
+    let address = get_ntoskrnl_export("KeBugCheckEx");
+    if address.is_null() {
+        log::error!("KeBugCheckEx not resolved");
+        return;
+    }
+    let addr_u64 = address as usize as u64;
+    let first_qword = unsafe { core::ptr::read_volatile(address as *const u64) };
+    crate::intel::diag::set_kebugcheckex_sentinel(addr_u64, first_qword);
+    log::info!(
+        "KeBugCheckEx sentinel: addr={:#x} bytes={:#x}",
+        addr_u64,
+        first_qword
+    );
+}
+
 #[link(name = "ntoskrnl")]
 extern "C" {
     pub static mut PsInitialSystemProcess: PEPROCESS;

@@ -34,12 +34,45 @@ pub static HOST_NMI_COUNT: AtomicU64 = AtomicU64::new(0);
 pub static HOST_MC_COUNT: AtomicU64 = AtomicU64::new(0);
 pub static HOST_PF_COUNT: AtomicU64 = AtomicU64::new(0);
 pub static HOST_DEFAULT_COUNT: AtomicU64 = AtomicU64::new(0);
+pub static HOST_DF_COUNT: AtomicU64 = AtomicU64::new(0);
 pub static GP_FAULT_RIP: AtomicU64 = AtomicU64::new(0);
 pub static PF_FAULT_RIP: AtomicU64 = AtomicU64::new(0);
 pub static PF_FAULT_CR2: AtomicU64 = AtomicU64::new(0);
 pub static MC_FAULT_RIP: AtomicU64 = AtomicU64::new(0);
 pub static HOST_IDT_PATCH_CALLS: AtomicU64 = AtomicU64::new(0);
 pub static HOST_IDT_PATCH_OK_CALLS: AtomicU64 = AtomicU64::new(0);
+
+// ---------------------------------------------------------------------------
+// First-fault breadcrumb (2026-07-09).
+//
+// Every host-side fault increments HOST_FAULT_TOTAL. The first fault (by
+// arrival, not by vector priority) claims HOST_FIRST_FAULT_VECTOR via lock
+// cmpxchg from zero and records RIP/RSP/error-code/CPU. Subsequent cascading
+// faults leave those fields alone, so the "who died first" question survives
+// even when handlers themselves fault.
+//
+// Vector-specific *_FAULT_RSP/*_FAULT_ERR extend the existing per-vector
+// RIP/CR2 fields with the interrupted host RSP and (where applicable) the
+// CPU-pushed error code, so we can tell which handler was running when the
+// fault hit.
+// ---------------------------------------------------------------------------
+pub static HOST_FAULT_TOTAL: AtomicU64 = AtomicU64::new(0);
+pub static HOST_FIRST_FAULT_VECTOR: AtomicU64 = AtomicU64::new(0);
+pub static HOST_FIRST_FAULT_RIP: AtomicU64 = AtomicU64::new(0);
+pub static HOST_FIRST_FAULT_RSP: AtomicU64 = AtomicU64::new(0);
+pub static HOST_FIRST_FAULT_ERR: AtomicU64 = AtomicU64::new(0);
+pub static HOST_FIRST_FAULT_CPU: AtomicU64 = AtomicU64::new(0);
+pub static NMI_FAULT_RIP: AtomicU64 = AtomicU64::new(0);
+pub static NMI_FAULT_RSP: AtomicU64 = AtomicU64::new(0);
+pub static GP_FAULT_RSP: AtomicU64 = AtomicU64::new(0);
+pub static GP_FAULT_ERR: AtomicU64 = AtomicU64::new(0);
+pub static PF_FAULT_RSP: AtomicU64 = AtomicU64::new(0);
+pub static PF_FAULT_ERR: AtomicU64 = AtomicU64::new(0);
+pub static MC_FAULT_RSP: AtomicU64 = AtomicU64::new(0);
+pub static DF_FAULT_RIP: AtomicU64 = AtomicU64::new(0);
+pub static DF_FAULT_RSP: AtomicU64 = AtomicU64::new(0);
+pub static HOST_DEFAULT_RIP: AtomicU64 = AtomicU64::new(0);
+pub static HOST_DEFAULT_RSP: AtomicU64 = AtomicU64::new(0);
 
 pub const HOST_IDT_PATCH_NMI_MATCH: u64 = 1 << 0;
 pub const HOST_IDT_PATCH_GP_MATCH: u64 = 1 << 1;
@@ -59,6 +92,7 @@ extern "C" {
     fn host_gp_handler();
     fn host_pf_handler();
     fn host_mc_handler();
+    fn host_df_handler();
     fn host_default_handler();
 }
 
@@ -71,10 +105,40 @@ core::arch::global_asm!(
     "push rax",
     "push rcx",
     "push rdx",
-    // counter
+    // ---- per-vector counter ----
     "lea rax, [rip + {nmi_count}]",
     "lock inc qword ptr [rax]",
-    // per-CPU flag via rdtscp (ECX = IA32_TSC_AUX = processor number)
+    // ---- global fault total (breadcrumb sequence) ----
+    "lea rax, [rip + {fault_total}]",
+    "lock inc qword ptr [rax]",
+    // ---- always record NMI RIP + RSP (overwrites prior NMI) ----
+    "mov rax, [rsp + 0x18]",       // RIP (no error code for NMI)
+    "lea rdx, [rip + {nmi_rip}]",
+    "mov [rdx], rax",
+    "mov rax, [rsp + 0x30]",       // interrupted RSP
+    "lea rdx, [rip + {nmi_rsp}]",
+    "mov [rdx], rax",
+    // ---- try to claim first-fault (vector 2) ----
+    "xor eax, eax",
+    "mov ecx, 2",
+    "lea rdx, [rip + {first_vec}]",
+    "lock cmpxchg qword ptr [rdx], rcx",
+    "jne 1f",
+    "mov rax, [rsp + 0x18]",
+    "lea rdx, [rip + {first_rip}]",
+    "mov [rdx], rax",
+    "mov rax, [rsp + 0x30]",
+    "lea rdx, [rip + {first_rsp}]",
+    "mov [rdx], rax",
+    "xor eax, eax",
+    "lea rdx, [rip + {first_err}]",
+    "mov [rdx], rax",
+    "rdtscp",
+    "and ecx, 0xFF",
+    "lea rdx, [rip + {first_cpu}]",
+    "mov [rdx], rcx",
+    "1:",
+    // ---- per-CPU NMI-pending flag via rdtscp (ECX = IA32_TSC_AUX) ----
     "rdtscp",
     "and ecx, 0xFF",
     "lea rax, [rip + {nmi_flags}]",
@@ -85,6 +149,14 @@ core::arch::global_asm!(
     "iretq",
     nmi_flags = sym NMI_FLAGS,
     nmi_count = sym HOST_NMI_COUNT,
+    nmi_rip = sym NMI_FAULT_RIP,
+    nmi_rsp = sym NMI_FAULT_RSP,
+    fault_total = sym HOST_FAULT_TOTAL,
+    first_vec = sym HOST_FIRST_FAULT_VECTOR,
+    first_rip = sym HOST_FIRST_FAULT_RIP,
+    first_rsp = sym HOST_FIRST_FAULT_RSP,
+    first_err = sym HOST_FIRST_FAULT_ERR,
+    first_cpu = sym HOST_FIRST_FAULT_CPU,
 );
 
 // ---------------------------------------------------------------------------
@@ -96,14 +168,40 @@ core::arch::global_asm!(
     "push rax",
     "push rcx",
     "push rdx",
-    // counter
+    // ---- per-vector counter ----
     "lea rax, [rip + {mc_count}]",
     "lock inc qword ptr [rax]",
-    // save interrupted RIP for diagnostics; #MC does not push an error code
+    // ---- global fault total ----
+    "lea rax, [rip + {fault_total}]",
+    "lock inc qword ptr [rax]",
+    // ---- record MC RIP + RSP (no error code) ----
     "mov rax, [rsp + 0x18]",
-    "lea rcx, [rip + {mc_rip}]",
-    "mov [rcx], rax",
-    // per-CPU flag via rdtscp (ECX = IA32_TSC_AUX = processor number)
+    "lea rdx, [rip + {mc_rip}]",
+    "mov [rdx], rax",
+    "mov rax, [rsp + 0x30]",
+    "lea rdx, [rip + {mc_rsp}]",
+    "mov [rdx], rax",
+    // ---- try to claim first-fault (vector 18) ----
+    "xor eax, eax",
+    "mov ecx, 18",
+    "lea rdx, [rip + {first_vec}]",
+    "lock cmpxchg qword ptr [rdx], rcx",
+    "jne 1f",
+    "mov rax, [rsp + 0x18]",
+    "lea rdx, [rip + {first_rip}]",
+    "mov [rdx], rax",
+    "mov rax, [rsp + 0x30]",
+    "lea rdx, [rip + {first_rsp}]",
+    "mov [rdx], rax",
+    "xor eax, eax",
+    "lea rdx, [rip + {first_err}]",
+    "mov [rdx], rax",
+    "rdtscp",
+    "and ecx, 0xFF",
+    "lea rdx, [rip + {first_cpu}]",
+    "mov [rdx], rcx",
+    "1:",
+    // ---- per-CPU MC-pending flag ----
     "rdtscp",
     "and ecx, 0xFF",
     "lea rax, [rip + {mc_flags}]",
@@ -115,6 +213,13 @@ core::arch::global_asm!(
     mc_flags = sym MC_FLAGS,
     mc_count = sym HOST_MC_COUNT,
     mc_rip   = sym MC_FAULT_RIP,
+    mc_rsp   = sym MC_FAULT_RSP,
+    fault_total = sym HOST_FAULT_TOTAL,
+    first_vec = sym HOST_FIRST_FAULT_VECTOR,
+    first_rip = sym HOST_FIRST_FAULT_RIP,
+    first_rsp = sym HOST_FIRST_FAULT_RSP,
+    first_err = sym HOST_FIRST_FAULT_ERR,
+    first_cpu = sym HOST_FIRST_FAULT_CPU,
 );
 
 // ---------------------------------------------------------------------------
@@ -142,14 +247,47 @@ core::arch::global_asm!(
     //   RSP         +0x38
     //   SS          +0x40
 
-    // counter
+    // ---- per-vector counter ----
     "lea rax, [rip + {gp_count}]",
     "lock inc qword ptr [rax]",
 
-    // save faulting RIP for diagnostics
+    // ---- global fault total ----
+    "lea rax, [rip + {fault_total}]",
+    "lock inc qword ptr [rax]",
+
+    // ---- save faulting RIP for diagnostics ----
     "mov rax, [rsp + 0x20]",
     "lea rcx, [rip + {gp_rip}]",
     "mov [rcx], rax",
+
+    // ---- save faulting RSP + error code ----
+    "mov rax, [rsp + 0x38]",
+    "lea rcx, [rip + {gp_rsp}]",
+    "mov [rcx], rax",
+    "mov rax, [rsp + 0x18]",
+    "lea rcx, [rip + {gp_err}]",
+    "mov [rcx], rax",
+
+    // ---- try to claim first-fault (vector 13) ----
+    "xor eax, eax",
+    "mov ecx, 13",
+    "lea rdx, [rip + {first_vec}]",
+    "lock cmpxchg qword ptr [rdx], rcx",
+    "jne 5f",
+    "mov rax, [rsp + 0x20]",
+    "lea rdx, [rip + {first_rip}]",
+    "mov [rdx], rax",
+    "mov rax, [rsp + 0x38]",
+    "lea rdx, [rip + {first_rsp}]",
+    "mov [rdx], rax",
+    "mov rax, [rsp + 0x18]",
+    "lea rdx, [rip + {first_err}]",
+    "mov [rdx], rax",
+    "rdtscp",
+    "and ecx, 0xFF",
+    "lea rdx, [rip + {first_cpu}]",
+    "mov [rdx], rcx",
+    "5:",
 
     // re-entrancy check via rdtscp
     "rdtscp",
@@ -210,7 +348,15 @@ core::arch::global_asm!(
 
     gp_count = sym HOST_GP_COUNT,
     gp_rip   = sym GP_FAULT_RIP,
+    gp_rsp   = sym GP_FAULT_RSP,
+    gp_err   = sym GP_FAULT_ERR,
     gp_reentrant = sym GP_REENTRANT,
+    fault_total = sym HOST_FAULT_TOTAL,
+    first_vec = sym HOST_FIRST_FAULT_VECTOR,
+    first_rip = sym HOST_FIRST_FAULT_RIP,
+    first_rsp = sym HOST_FIRST_FAULT_RSP,
+    first_err = sym HOST_FIRST_FAULT_ERR,
+    first_cpu = sym HOST_FIRST_FAULT_CPU,
 );
 
 // ---------------------------------------------------------------------------
@@ -231,8 +377,12 @@ core::arch::global_asm!(
     "push rcx",
     "push rdx",
 
-    // counter
+    // ---- per-vector counter ----
     "lea rax, [rip + {pf_count}]",
+    "lock inc qword ptr [rax]",
+
+    // ---- global fault total ----
+    "lea rax, [rip + {fault_total}]",
     "lock inc qword ptr [rax]",
 
     // After 3 pushes (+24), offsets shift:
@@ -246,6 +396,35 @@ core::arch::global_asm!(
     "mov rax, cr2",
     "lea rcx, [rip + {pf_cr2}]",
     "mov [rcx], rax",
+
+    // ---- save faulting RSP + error code ----
+    "mov rax, [rsp + 0x38]",
+    "lea rcx, [rip + {pf_rsp}]",
+    "mov [rcx], rax",
+    "mov rax, [rsp + 0x18]",
+    "lea rcx, [rip + {pf_err}]",
+    "mov [rcx], rax",
+
+    // ---- try to claim first-fault (vector 14) ----
+    "xor eax, eax",
+    "mov ecx, 14",
+    "lea rdx, [rip + {first_vec}]",
+    "lock cmpxchg qword ptr [rdx], rcx",
+    "jne 6f",
+    "mov rax, [rsp + 0x20]",
+    "lea rdx, [rip + {first_rip}]",
+    "mov [rdx], rax",
+    "mov rax, [rsp + 0x38]",
+    "lea rdx, [rip + {first_rsp}]",
+    "mov [rdx], rax",
+    "mov rax, [rsp + 0x18]",
+    "lea rdx, [rip + {first_err}]",
+    "mov [rdx], rax",
+    "rdtscp",
+    "and ecx, 0xFF",
+    "lea rdx, [rip + {first_cpu}]",
+    "mov [rdx], rcx",
+    "6:",
 
     // re-entrancy check via rdtscp
     "rdtscp",
@@ -311,7 +490,78 @@ core::arch::global_asm!(
     pf_count = sym HOST_PF_COUNT,
     pf_rip   = sym PF_FAULT_RIP,
     pf_cr2   = sym PF_FAULT_CR2,
+    pf_rsp   = sym PF_FAULT_RSP,
+    pf_err   = sym PF_FAULT_ERR,
     pf_reentrant = sym PF_REENTRANT,
+    fault_total = sym HOST_FAULT_TOTAL,
+    first_vec = sym HOST_FIRST_FAULT_VECTOR,
+    first_rip = sym HOST_FIRST_FAULT_RIP,
+    first_rsp = sym HOST_FIRST_FAULT_RSP,
+    first_err = sym HOST_FIRST_FAULT_ERR,
+    first_cpu = sym HOST_FIRST_FAULT_CPU,
+);
+
+// ---------------------------------------------------------------------------
+// Assembly: #DF handler (vector 8) — record + halt
+//
+// Double-fault means a fault fired inside another fault handler. Not
+// recoverable in VMX-root. Distinguish from default handler so we can tell
+// "cascaded" from "some unknown vector fired". #DF always pushes error
+// code = 0.
+// ---------------------------------------------------------------------------
+core::arch::global_asm!(
+    ".global host_df_handler",
+    "host_df_handler:",
+    "push rax",
+    "push rcx",
+    "push rdx",
+    // ---- counters ----
+    "lea rax, [rip + {df_count}]",
+    "lock inc qword ptr [rax]",
+    "lea rax, [rip + {fault_total}]",
+    "lock inc qword ptr [rax]",
+    // ---- record RIP + RSP (error code always 0) ----
+    "mov rax, [rsp + 0x20]",
+    "lea rdx, [rip + {df_rip}]",
+    "mov [rdx], rax",
+    "mov rax, [rsp + 0x38]",
+    "lea rdx, [rip + {df_rsp}]",
+    "mov [rdx], rax",
+    // ---- try to claim first-fault (vector 8) ----
+    "xor eax, eax",
+    "mov ecx, 8",
+    "lea rdx, [rip + {first_vec}]",
+    "lock cmpxchg qword ptr [rdx], rcx",
+    "jne 7f",
+    "mov rax, [rsp + 0x20]",
+    "lea rdx, [rip + {first_rip}]",
+    "mov [rdx], rax",
+    "mov rax, [rsp + 0x38]",
+    "lea rdx, [rip + {first_rsp}]",
+    "mov [rdx], rax",
+    "xor eax, eax",
+    "lea rdx, [rip + {first_err}]",
+    "mov [rdx], rax",
+    "rdtscp",
+    "and ecx, 0xFF",
+    "lea rdx, [rip + {first_cpu}]",
+    "mov [rdx], rcx",
+    "7:",
+    // ---- halt: #DF cannot be resumed ----
+    "vmxoff",
+    "sti",
+    "8:",
+    "hlt",
+    "jmp 8b",
+    df_count = sym HOST_DF_COUNT,
+    df_rip   = sym DF_FAULT_RIP,
+    df_rsp   = sym DF_FAULT_RSP,
+    fault_total = sym HOST_FAULT_TOTAL,
+    first_vec = sym HOST_FIRST_FAULT_VECTOR,
+    first_rip = sym HOST_FIRST_FAULT_RIP,
+    first_rsp = sym HOST_FIRST_FAULT_RSP,
+    first_err = sym HOST_FIRST_FAULT_ERR,
+    first_cpu = sym HOST_FIRST_FAULT_CPU,
 );
 
 // ---------------------------------------------------------------------------
@@ -321,18 +571,49 @@ core::arch::global_asm!(
 // have a specific handler for. Without this, the original Windows handler
 // runs on VmStack in VMX-root and tries to bugcheck → sends freeze IPI →
 // other cores in VMX-root can't ACK → complete system deadlock.
+//
+// Records best-effort RIP + RSP before halting. The IRET frame layout
+// depends on whether the interrupted vector pushed an error code, which
+// this stub cannot know for arbitrary vectors — offsets below assume the
+// no-error-code case (matches #UD/#NM/#BP/#OF/etc). For vectors that push
+// error codes and are not handled elsewhere (#TS/#NP/#SS/#AC/#VE/#CP/#SX),
+// the recorded RIP will be off by 8 bytes; the increment of
+// HOST_DEFAULT_COUNT still tells us "unknown vector fired here".
 // ---------------------------------------------------------------------------
 core::arch::global_asm!(
     ".global host_default_handler",
     "host_default_handler:",
+    "push rax",
+    "push rcx",
+    // ---- counters ----
     "lea rax, [rip + {default_count}]",
     "lock inc qword ptr [rax]",
+    "lea rax, [rip + {fault_total}]",
+    "lock inc qword ptr [rax]",
+    // ---- record RIP + RSP (best-effort; assumes no error code) ----
+    // Stack after 2 pushes with no error code:
+    //   [rsp+0x00] rcx (last push)
+    //   [rsp+0x08] rax
+    //   [rsp+0x10] RIP
+    //   [rsp+0x28] RSP
+    "mov rax, [rsp + 0x10]",
+    "lea rcx, [rip + {default_rip}]",
+    "mov [rcx], rax",
+    "mov rax, [rsp + 0x28]",
+    "lea rcx, [rip + {default_rsp}]",
+    "mov [rcx], rax",
+    // ---- halt ----
+    "pop rcx",
+    "pop rax",
     "vmxoff",
     "sti",
     "1:",
     "hlt",
     "jmp 1b",
     default_count = sym HOST_DEFAULT_COUNT,
+    default_rip = sym HOST_DEFAULT_RIP,
+    default_rsp = sym HOST_DEFAULT_RSP,
+    fault_total = sym HOST_FAULT_TOTAL,
 );
 
 // ---------------------------------------------------------------------------
@@ -414,6 +695,7 @@ pub fn patch_host_idt(idt: &mut [u64]) {
         patch_idt_entry(idt, vector, default);
     }
     patch_idt_entry(idt, 2, expected_nmi_handler());
+    patch_idt_entry(idt, 8, expected_df_handler());
     patch_idt_entry(idt, 13, expected_gp_handler());
     patch_idt_entry(idt, 14, expected_pf_handler());
     patch_idt_entry(idt, 18, expected_mc_handler());
@@ -488,6 +770,10 @@ pub fn expected_mc_handler() -> u64 {
     host_mc_handler as *const () as usize as u64
 }
 
+pub fn expected_df_handler() -> u64 {
+    host_df_handler as *const () as usize as u64
+}
+
 pub fn expected_default_handler() -> u64 {
     host_default_handler as *const () as usize as u64
 }
@@ -552,6 +838,7 @@ mod tests {
     fn blank_idt() -> alloc::vec::Vec<u64> {
         let mut idt = alloc::vec![0u64; 40];
         idt[2 * 2] = PRESERVED_BITS;
+        idt[8 * 2] = PRESERVED_BITS;
         idt[13 * 2] = PRESERVED_BITS;
         idt[14 * 2] = PRESERVED_BITS;
         idt[18 * 2] = PRESERVED_BITS;
@@ -572,6 +859,17 @@ mod tests {
         assert_eq!(idt[13 * 2] & 0x0000_FFFF_FFFF_0000, PRESERVED_BITS);
         assert_eq!(idt[14 * 2] & 0x0000_FFFF_FFFF_0000, PRESERVED_BITS);
         assert_eq!(idt[18 * 2] & 0x0000_FFFF_FFFF_0000, PRESERVED_BITS);
+    }
+
+    #[test]
+    fn patch_host_idt_installs_double_fault_handler() {
+        let mut idt = blank_idt();
+
+        patch_host_idt(&mut idt);
+
+        assert_eq!(idt_entry_handler(&idt, 8), Some(expected_df_handler()));
+        assert_eq!(idt[8 * 2] & 0x0000_FFFF_FFFF_0000, PRESERVED_BITS);
+        assert_ne!(expected_df_handler(), expected_default_handler());
     }
 
     #[test]

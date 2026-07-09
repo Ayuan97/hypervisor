@@ -124,6 +124,7 @@ impl VmExit {
         let exit_tsc_start = unsafe { x86::time::rdtsc() };
 
         let exit_reason = vmread_checked(ro::EXIT_REASON)? as u32;
+        diag::watchdog_handler_start(exit_tsc_start, exit_reason as u64);
         let vm_entry_failure = (exit_reason & 0x8000_0000) != 0;
         let basic_reason = exit_reason & 0xFFFF;
 
@@ -148,6 +149,7 @@ impl VmExit {
         {
             diag::cpu_enter_phase(diag::PHASE_FAST_CPUID);
             guest_registers.rip = vmread_checked(guest::RIP)?;
+            diag::observe_guest_rip_for_bugcheck(guest_registers.rip, guest_registers.rcx);
             diag::cpu_enter_phase(diag::PHASE_FAST_CPUID_DONE);
             let exit_type = handle_cpuid(guest_registers, vmx, exit_tsc_start);
             diag::cpu_enter_phase(diag::PHASE_FAST_RIP_ADV);
@@ -157,30 +159,35 @@ impl VmExit {
             reinject_idt_vectoring_event();
             super::host_idt::check_pending_nmi();
             diag::cpu_enter_phase(diag::PHASE_PRE_VMRESUME);
+            diag::watchdog_handler_finish(guest_registers.rip);
             return Ok(exit_type);
         }
         if basic_reason == 16
         /* RDTSC */
         {
             guest_registers.rip = vmread_checked(guest::RIP)?;
+            diag::observe_guest_rip_for_bugcheck(guest_registers.rip, guest_registers.rcx);
             let exit_type = handle_rdtsc(guest_registers, vmx);
             if exit_type_advances_rip(exit_type) {
                 self.advance_guest_rip(guest_registers)?;
             }
             reinject_idt_vectoring_event();
             super::host_idt::check_pending_nmi();
+            diag::watchdog_handler_finish(guest_registers.rip);
             return Ok(exit_type);
         }
         if basic_reason == 51
         /* RDTSCP */
         {
             guest_registers.rip = vmread_checked(guest::RIP)?;
+            diag::observe_guest_rip_for_bugcheck(guest_registers.rip, guest_registers.rcx);
             let exit_type = handle_rdtscp(guest_registers, vmx);
             if exit_type_advances_rip(exit_type) {
                 self.advance_guest_rip(guest_registers)?;
             }
             reinject_idt_vectoring_event();
             super::host_idt::check_pending_nmi();
+            diag::watchdog_handler_finish(guest_registers.rip);
             return Ok(exit_type);
         }
 
@@ -196,6 +203,7 @@ impl VmExit {
         guest_registers.rip = vmread_checked(guest::RIP)?;
         guest_registers.rsp = vmread_checked(guest::RSP)?;
         guest_registers.rflags = vmread_checked(guest::RFLAGS)?;
+        diag::observe_guest_rip_for_bugcheck(guest_registers.rip, guest_registers.rcx);
 
         let exit_qualification = vmread_checked(ro::EXIT_QUALIFICATION).unwrap_or(0);
 
@@ -369,6 +377,7 @@ impl VmExit {
         diag::cpu_enter_phase(diag::PHASE_CHECK_NMI);
         super::host_idt::check_pending_nmi();
         diag::cpu_enter_phase(diag::PHASE_PRE_VMRESUME);
+        diag::watchdog_handler_finish(guest_registers.rip);
 
         log::debug!(
             "Guest registers after handling vmexit: {:#x?}",

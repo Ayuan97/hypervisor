@@ -41,6 +41,9 @@ const CMD_REGISTER_BATCH_BUFFER: u64 = 0x26;
 const CMD_UNREGISTER_BATCH_BUFFER: u64 = 0x27;
 const CMD_GET_CPU_DIAG: u64 = 0x28;
 const CMD_READ_CMOS_FREEZE: u64 = 0x29;
+const CMD_GET_PER_CPU_RING: u64 = 0x2A;
+const CMD_GET_PER_CPU_RING_IDX: u64 = 0x2B;
+const CMD_GET_WATCHDOG: u64 = 0x2C;
 pub const CMD_DEVIRTUALIZE: u64 = 0xFF;
 const CLIENT_READ_ARM_TOKEN: u64 = 0xC17E_A2D5_90B4_6F31;
 
@@ -316,6 +319,18 @@ pub fn dispatch_command(guest_registers: &mut GuestRegisters, vmx: &mut Vmx) -> 
         }
         CMD_GET_RING => {
             guest_registers.rax = crate::intel::diag::ring_entry(arg1, arg2);
+            ExitType::IncrementRIP
+        }
+        CMD_GET_PER_CPU_RING => {
+            guest_registers.rax = crate::intel::diag::per_cpu_ring_entry(arg1, arg2, arg3);
+            ExitType::IncrementRIP
+        }
+        CMD_GET_PER_CPU_RING_IDX => {
+            guest_registers.rax = crate::intel::diag::per_cpu_ring_idx(arg1);
+            ExitType::IncrementRIP
+        }
+        CMD_GET_WATCHDOG => {
+            guest_registers.rax = crate::intel::diag::watchdog_field(arg1, arg2);
             ExitType::IncrementRIP
         }
         CMD_GET_CPU_DIAG => {

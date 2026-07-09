@@ -27,7 +27,10 @@ use {
             },
             vmm::Hypervisor,
         },
-        utils::{alloc::PhysicalAllocator, nt::update_ntoskrnl_cr3},
+        utils::{
+            alloc::PhysicalAllocator,
+            nt::{init_kebugcheckex_sentinel, update_ntoskrnl_cr3},
+        },
     },
     log::LevelFilter,
     wdk_sys::{
@@ -303,6 +306,7 @@ fn virtualize_system_claimed() -> NTSTATUS {
         return status;
     }
     update_ntoskrnl_cr3();
+    init_kebugcheckex_sentinel();
 
     if let Some(status) = boot_stage(240) {
         return status;

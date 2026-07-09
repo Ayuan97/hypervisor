@@ -58,6 +58,25 @@ static CPU_LAST_CPUID_LEAF: [AtomicU64; MAX_TRACKED_CPUS] = [ZERO_U64; MAX_TRACK
 static CPU_TIMER_RIP: [AtomicU64; MAX_TRACKED_CPUS] = [ZERO_U64; MAX_TRACKED_CPUS];
 static CPU_TIMER_RIP_COUNT: [AtomicU64; MAX_TRACKED_CPUS] = [ZERO_U64; MAX_TRACKED_CPUS];
 
+// ---------------------------------------------------------------------------
+// Per-CPU VM-exit ring (2026-07-09).
+//
+// The global RING_* buffers interleave exits from all CPUs, so during a freeze
+// we cannot tell which CPU wrote which entry. PER_CPU_RING_* stores the last
+// PER_CPU_RING_SIZE exits for each CPU independently, keyed by rdtscp AUX.
+// When a CPU gets stuck in a handler / spin-loop, we can read that CPU's ring
+// to see the sequence of VM-exits that led up to the freeze.
+//
+// The global RING_* buffers are kept for backward-compatible tooling.
+// ---------------------------------------------------------------------------
+pub const PER_CPU_RING_SIZE: usize = 16;
+const PER_CPU_RING_LEN: usize = MAX_TRACKED_CPUS * PER_CPU_RING_SIZE;
+static PER_CPU_RING_IDX: [AtomicU64; MAX_TRACKED_CPUS] = [ZERO_U64; MAX_TRACKED_CPUS];
+static PER_CPU_RING_REASON: [AtomicU64; PER_CPU_RING_LEN] = [ZERO_U64; PER_CPU_RING_LEN];
+static PER_CPU_RING_RIP: [AtomicU64; PER_CPU_RING_LEN] = [ZERO_U64; PER_CPU_RING_LEN];
+static PER_CPU_RING_QUAL: [AtomicU64; PER_CPU_RING_LEN] = [ZERO_U64; PER_CPU_RING_LEN];
+static PER_CPU_RING_RAX: [AtomicU64; PER_CPU_RING_LEN] = [ZERO_U64; PER_CPU_RING_LEN];
+
 pub const PHASE_VMEXIT_ENTRY: u64 = 0x10;
 pub const PHASE_FAST_CPUID: u64 = 0x40;
 pub const PHASE_FAST_CPUID_DONE: u64 = 0x50;
@@ -67,6 +86,148 @@ pub const PHASE_PRE_VMRESUME: u64 = 0x80;
 pub const PHASE_SLOW_PATH: u64 = 0x20;
 pub const PHASE_SLOW_HANDLER: u64 = 0x30;
 pub const PHASE_ERROR_HANDLER: u64 = 0xE0;
+
+// ---------------------------------------------------------------------------
+// Handler-duration watchdog (2026-07-09).
+//
+// A stuck VM-exit handler (spinlock deadlock, tight EPT-violation loop) never
+// returns to guest, so freeze_check_cpuid_stall sees the guest RIP stuck.
+// This watchdog complements that with a per-CPU tally of unusually long
+// handlers that *did* return, so we can spot the pattern of exit reasons that
+// are approaching the freeze threshold before the actual freeze.
+//
+// Threshold is expressed in TSC cycles; 50M cycles ≈ 14 ms at 3.5 GHz. This
+// is coarse — we do not calibrate per CPU frequency. Anything under a few
+// hundred µs is invisible.
+// ---------------------------------------------------------------------------
+pub const HANDLER_SLOW_THRESHOLD_CYCLES: u64 = 50_000_000;
+
+// ---------------------------------------------------------------------------
+// KeBugCheckEx sentinel (2026-07-09).
+//
+// If EAC really is triggering `KeBugCheckEx` (as the earlier memory theory
+// claimed), we should see guest RIP land inside its prologue at least once
+// before the freeze. If it never does, the freeze root cause is elsewhere
+// (spinlock deadlock inside HV handlers, cascaded fault, etc.).
+//
+// KEBUGCHECKEX_ADDR + KEBUGCHECKEX_SENTINEL are set once at driver init.
+// KEBUGCHECKEX_HITS increments each VM-exit whose guest RIP falls inside
+// [addr, addr + KEBUGCHECKEX_WATCH_LEN). KEBUGCHECKEX_HIT_CPU / RIP / TSC
+// capture the first observed hit.
+// ---------------------------------------------------------------------------
+pub const KEBUGCHECKEX_WATCH_LEN: u64 = 0x100; // 256 bytes covers the prologue
+pub static KEBUGCHECKEX_ADDR: AtomicU64 = AtomicU64::new(0);
+pub static KEBUGCHECKEX_SENTINEL: AtomicU64 = AtomicU64::new(0);
+pub static KEBUGCHECKEX_HITS: AtomicU64 = AtomicU64::new(0);
+pub static KEBUGCHECKEX_HIT_CPU: AtomicU64 = AtomicU64::new(0);
+pub static KEBUGCHECKEX_HIT_RIP: AtomicU64 = AtomicU64::new(0);
+pub static KEBUGCHECKEX_HIT_TSC: AtomicU64 = AtomicU64::new(0);
+pub static KEBUGCHECKEX_HIT_ARG0: AtomicU64 = AtomicU64::new(0);
+
+pub fn set_kebugcheckex_sentinel(addr: u64, first_qword: u64) {
+    KEBUGCHECKEX_ADDR.store(addr, Relaxed);
+    KEBUGCHECKEX_SENTINEL.store(first_qword, Relaxed);
+}
+
+/// Called from the VM-exit prologue with the current guest RIP and RCX. If
+/// RIP lies inside the watched KeBugCheckEx prologue, record a hit. RCX
+/// carries the bugcheck code in the Windows x64 calling convention, so
+/// capturing it tells us *which* bugcheck code was raised (0x139 is the
+/// KERNEL_SECURITY_CHECK_FAILURE we saw in Windows event log).
+#[inline]
+pub fn observe_guest_rip_for_bugcheck(guest_rip: u64, guest_rcx: u64) {
+    let base = KEBUGCHECKEX_ADDR.load(Relaxed);
+    if base == 0 {
+        return;
+    }
+    let end = base.wrapping_add(KEBUGCHECKEX_WATCH_LEN);
+    if guest_rip < base || guest_rip >= end {
+        return;
+    }
+    let count = KEBUGCHECKEX_HITS.fetch_add(1, Relaxed);
+    // Capture only the first hit's context so cascades do not overwrite it.
+    if count == 0 {
+        KEBUGCHECKEX_HIT_CPU.store(rdtscp_aux() as u64, Relaxed);
+        KEBUGCHECKEX_HIT_RIP.store(guest_rip, Relaxed);
+        KEBUGCHECKEX_HIT_TSC.store(rdtsc_now(), Relaxed);
+        KEBUGCHECKEX_HIT_ARG0.store(guest_rcx, Relaxed);
+    }
+}
+static HANDLER_START_TSC: [AtomicU64; MAX_TRACKED_CPUS] = [ZERO_U64; MAX_TRACKED_CPUS];
+static HANDLER_LAST_EXIT_REASON: [AtomicU64; MAX_TRACKED_CPUS] = [ZERO_U64; MAX_TRACKED_CPUS];
+static HANDLER_MAX_DELTA: [AtomicU64; MAX_TRACKED_CPUS] = [ZERO_U64; MAX_TRACKED_CPUS];
+static HANDLER_MAX_DELTA_REASON: [AtomicU64; MAX_TRACKED_CPUS] = [ZERO_U64; MAX_TRACKED_CPUS];
+static HANDLER_SLOW_COUNT: [AtomicU64; MAX_TRACKED_CPUS] = [ZERO_U64; MAX_TRACKED_CPUS];
+static HANDLER_LAST_SLOW_REASON: [AtomicU64; MAX_TRACKED_CPUS] = [ZERO_U64; MAX_TRACKED_CPUS];
+static HANDLER_LAST_SLOW_RIP: [AtomicU64; MAX_TRACKED_CPUS] = [ZERO_U64; MAX_TRACKED_CPUS];
+static HANDLER_LAST_SLOW_DELTA: [AtomicU64; MAX_TRACKED_CPUS] = [ZERO_U64; MAX_TRACKED_CPUS];
+
+/// Record VM-exit handler start. Called from `handle_vmexit` prologue with
+/// the TSC snapshot and current exit reason (from VMCS). Same CPU can call
+/// this recursively during nested VM-exits; only the newest start survives.
+#[inline]
+pub fn watchdog_handler_start(tsc: u64, exit_reason: u64) {
+    let cpu = rdtscp_aux() as usize % MAX_TRACKED_CPUS;
+    HANDLER_START_TSC[cpu].store(tsc, Relaxed);
+    HANDLER_LAST_EXIT_REASON[cpu].store(exit_reason, Relaxed);
+}
+
+/// Compute handler duration and update per-CPU watchdog counters. Called
+/// right before VMRESUME (e.g. from `check_pending_nmi`) so the delta
+/// captures the entire time in host mode for this VM-exit.
+#[inline]
+pub fn watchdog_handler_finish(guest_rip: u64) {
+    let cpu = rdtscp_aux() as usize % MAX_TRACKED_CPUS;
+    let start = HANDLER_START_TSC[cpu].load(Relaxed);
+    if start == 0 {
+        return;
+    }
+    let now = rdtsc_now();
+    let delta = now.wrapping_sub(start);
+    let reason = HANDLER_LAST_EXIT_REASON[cpu].load(Relaxed);
+    // Update per-CPU max (best-effort; racy across nested exits).
+    if delta > HANDLER_MAX_DELTA[cpu].load(Relaxed) {
+        HANDLER_MAX_DELTA[cpu].store(delta, Relaxed);
+        HANDLER_MAX_DELTA_REASON[cpu].store(reason, Relaxed);
+    }
+    if delta >= HANDLER_SLOW_THRESHOLD_CYCLES {
+        HANDLER_SLOW_COUNT[cpu].fetch_add(1, Relaxed);
+        HANDLER_LAST_SLOW_REASON[cpu].store(reason, Relaxed);
+        HANDLER_LAST_SLOW_RIP[cpu].store(guest_rip, Relaxed);
+        HANDLER_LAST_SLOW_DELTA[cpu].store(delta, Relaxed);
+    }
+    // Clear start so nested/spurious calls do not double-count.
+    HANDLER_START_TSC[cpu].store(0, Relaxed);
+}
+
+/// Read one field of watchdog state for a given CPU.
+///
+/// Fields:
+///  0 -> HANDLER_MAX_DELTA (TSC cycles)
+///  1 -> HANDLER_MAX_DELTA_REASON
+///  2 -> HANDLER_SLOW_COUNT
+///  3 -> HANDLER_LAST_SLOW_REASON
+///  4 -> HANDLER_LAST_SLOW_RIP
+///  5 -> HANDLER_LAST_SLOW_DELTA
+///  6 -> HANDLER_START_TSC (nonzero => currently inside a handler)
+///  7 -> HANDLER_LAST_EXIT_REASON
+pub fn watchdog_field(cpu: u64, field: u64) -> u64 {
+    let c = cpu as usize;
+    if c >= MAX_TRACKED_CPUS {
+        return u64::MAX;
+    }
+    match field {
+        0 => HANDLER_MAX_DELTA[c].load(Relaxed),
+        1 => HANDLER_MAX_DELTA_REASON[c].load(Relaxed),
+        2 => HANDLER_SLOW_COUNT[c].load(Relaxed),
+        3 => HANDLER_LAST_SLOW_REASON[c].load(Relaxed),
+        4 => HANDLER_LAST_SLOW_RIP[c].load(Relaxed),
+        5 => HANDLER_LAST_SLOW_DELTA[c].load(Relaxed),
+        6 => HANDLER_START_TSC[c].load(Relaxed),
+        7 => HANDLER_LAST_EXIT_REASON[c].load(Relaxed),
+        _ => u64::MAX,
+    }
+}
 
 #[inline]
 pub fn cpu_enter_phase(phase: u64) {
@@ -300,16 +461,28 @@ pub fn cpu_diag(cpu: u64, field: u64) -> u64 {
 }
 
 pub fn ring_record(exit_reason: u64, guest_rip: u64, exit_qual: u64, guest_rax: u64) {
+    // Global interleaved ring (legacy).
     let idx = RING_IDX.fetch_add(1, Relaxed) as usize % RING_SIZE;
     RING_REASON[idx].store(exit_reason, Relaxed);
     RING_RIP[idx].store(guest_rip, Relaxed);
     RING_QUAL[idx].store(exit_qual, Relaxed);
     RING_RAX[idx].store(guest_rax, Relaxed);
+
+    // Per-CPU ring keyed by rdtscp AUX.
+    let cpu = rdtscp_aux() as usize % MAX_TRACKED_CPUS;
+    let cpu_idx = PER_CPU_RING_IDX[cpu].fetch_add(1, Relaxed) as usize % PER_CPU_RING_SIZE;
+    let slot = cpu * PER_CPU_RING_SIZE + cpu_idx;
+    PER_CPU_RING_REASON[slot].store(exit_reason, Relaxed);
+    PER_CPU_RING_RIP[slot].store(guest_rip, Relaxed);
+    PER_CPU_RING_QUAL[slot].store(exit_qual, Relaxed);
+    PER_CPU_RING_RAX[slot].store(guest_rax, Relaxed);
 }
 
 pub fn ring_entry(slot: u64, field: u64) -> u64 {
     let s = slot as usize;
-    if s >= RING_SIZE { return u64::MAX; }
+    if s >= RING_SIZE {
+        return u64::MAX;
+    }
     match field {
         0 => RING_REASON[s].load(Relaxed),
         1 => RING_RIP[s].load(Relaxed),
@@ -321,6 +494,39 @@ pub fn ring_entry(slot: u64, field: u64) -> u64 {
 
 pub fn ring_current_idx() -> u64 {
     RING_IDX.load(Relaxed)
+}
+
+/// Read one field of one slot from a specific CPU's VM-exit ring.
+///
+/// `cpu` and `slot` are both 0-indexed; slots larger than `PER_CPU_RING_SIZE`
+/// or CPUs larger than `MAX_TRACKED_CPUS` return `u64::MAX`. Slot ordering is
+/// insertion order — the caller can pair with `per_cpu_ring_idx(cpu)` to
+/// locate the newest entry.
+pub fn per_cpu_ring_entry(cpu: u64, slot: u64, field: u64) -> u64 {
+    let c = cpu as usize;
+    let s = slot as usize;
+    if c >= MAX_TRACKED_CPUS || s >= PER_CPU_RING_SIZE {
+        return u64::MAX;
+    }
+    let idx = c * PER_CPU_RING_SIZE + s;
+    match field {
+        0 => PER_CPU_RING_REASON[idx].load(Relaxed),
+        1 => PER_CPU_RING_RIP[idx].load(Relaxed),
+        2 => PER_CPU_RING_QUAL[idx].load(Relaxed),
+        3 => PER_CPU_RING_RAX[idx].load(Relaxed),
+        _ => u64::MAX,
+    }
+}
+
+/// Total number of writes seen by `cpu`'s ring; low bits (mod PER_CPU_RING_SIZE)
+/// give the slot the NEXT write will land in, so `slot = (idx - 1) % SIZE` is
+/// the newest completed entry.
+pub fn per_cpu_ring_idx(cpu: u64) -> u64 {
+    let c = cpu as usize;
+    if c >= MAX_TRACKED_CPUS {
+        return u64::MAX;
+    }
+    PER_CPU_RING_IDX[c].load(Relaxed)
 }
 
 pub static CTL_PINBASED: AtomicU64 = AtomicU64::new(0);
@@ -575,6 +781,21 @@ fn rdtscp_aux() -> u32 {
     aux
 }
 
+#[inline]
+fn rdtsc_now() -> u64 {
+    let low: u32;
+    let high: u32;
+    unsafe {
+        core::arch::asm!(
+            "rdtsc",
+            out("eax") low,
+            out("edx") high,
+            options(nomem, nostack),
+        );
+    }
+    ((high as u64) << 32) | (low as u64)
+}
+
 pub fn counter(id: u64) -> u64 {
     match id {
         0 => EXIT_TOTAL.load(Relaxed),
@@ -695,6 +916,116 @@ mod tests {
         assert_eq!(breadcrumb(MAX_BREADCRUMB_CPUS as u64, 0), u64::MAX);
         assert_eq!(breadcrumb(0, BREADCRUMB_FIELD_LIMIT as u64), u64::MAX);
     }
+
+    #[test]
+    fn per_cpu_ring_records_and_returns_written_entry() {
+        reset_per_cpu_ring_for_test();
+
+        // Directly poke slot 0 of CPU 7 to avoid depending on rdtscp.
+        let base = 7 * PER_CPU_RING_SIZE;
+        PER_CPU_RING_REASON[base].store(0x1234_5678, Relaxed);
+        PER_CPU_RING_RIP[base].store(0xdead_beef, Relaxed);
+        PER_CPU_RING_QUAL[base].store(0x4141, Relaxed);
+        PER_CPU_RING_RAX[base].store(0xcafe_babe, Relaxed);
+
+        assert_eq!(per_cpu_ring_entry(7, 0, 0), 0x1234_5678);
+        assert_eq!(per_cpu_ring_entry(7, 0, 1), 0xdead_beef);
+        assert_eq!(per_cpu_ring_entry(7, 0, 2), 0x4141);
+        assert_eq!(per_cpu_ring_entry(7, 0, 3), 0xcafe_babe);
+        // Unrelated CPU/slot remains zero.
+        assert_eq!(per_cpu_ring_entry(6, 0, 0), 0);
+        assert_eq!(per_cpu_ring_entry(7, 1, 0), 0);
+    }
+
+    #[test]
+    fn per_cpu_ring_rejects_out_of_range_indices() {
+        assert_eq!(per_cpu_ring_entry(MAX_TRACKED_CPUS as u64, 0, 0), u64::MAX);
+        assert_eq!(per_cpu_ring_entry(0, PER_CPU_RING_SIZE as u64, 0), u64::MAX);
+        assert_eq!(per_cpu_ring_entry(0, 0, 42), u64::MAX);
+        assert_eq!(per_cpu_ring_idx(MAX_TRACKED_CPUS as u64), u64::MAX);
+    }
+
+    #[test]
+    fn observe_guest_rip_flags_calls_inside_watched_range() {
+        let base = 0xFFFFF800_12340000;
+        set_kebugcheckex_sentinel(base, 0xCCCC_DDDD_EEEE_FFFF);
+        KEBUGCHECKEX_HITS.store(0, Relaxed);
+        KEBUGCHECKEX_HIT_CPU.store(0, Relaxed);
+        KEBUGCHECKEX_HIT_RIP.store(0, Relaxed);
+        KEBUGCHECKEX_HIT_TSC.store(0, Relaxed);
+        KEBUGCHECKEX_HIT_ARG0.store(0, Relaxed);
+
+        // Below range — no hit.
+        observe_guest_rip_for_bugcheck(base - 1, 0x139);
+        assert_eq!(KEBUGCHECKEX_HITS.load(Relaxed), 0);
+
+        // Inside prologue window — first hit captures context.
+        observe_guest_rip_for_bugcheck(base + 4, 0x139);
+        assert_eq!(KEBUGCHECKEX_HITS.load(Relaxed), 1);
+        assert_eq!(KEBUGCHECKEX_HIT_RIP.load(Relaxed), base + 4);
+        assert_eq!(KEBUGCHECKEX_HIT_ARG0.load(Relaxed), 0x139);
+        let first_hit_rip = KEBUGCHECKEX_HIT_RIP.load(Relaxed);
+
+        // Second hit increments counter but does not overwrite first context.
+        observe_guest_rip_for_bugcheck(base + 20, 0x1AB);
+        assert_eq!(KEBUGCHECKEX_HITS.load(Relaxed), 2);
+        assert_eq!(KEBUGCHECKEX_HIT_RIP.load(Relaxed), first_hit_rip);
+
+        // Just past window — no hit.
+        observe_guest_rip_for_bugcheck(base + KEBUGCHECKEX_WATCH_LEN, 0);
+        assert_eq!(KEBUGCHECKEX_HITS.load(Relaxed), 2);
+
+        // Reset for other tests.
+        KEBUGCHECKEX_ADDR.store(0, Relaxed);
+        KEBUGCHECKEX_SENTINEL.store(0, Relaxed);
+        KEBUGCHECKEX_HITS.store(0, Relaxed);
+        KEBUGCHECKEX_HIT_CPU.store(0, Relaxed);
+        KEBUGCHECKEX_HIT_RIP.store(0, Relaxed);
+        KEBUGCHECKEX_HIT_TSC.store(0, Relaxed);
+        KEBUGCHECKEX_HIT_ARG0.store(0, Relaxed);
+    }
+
+    #[test]
+    fn observe_guest_rip_is_noop_before_sentinel_set() {
+        KEBUGCHECKEX_ADDR.store(0, Relaxed);
+        KEBUGCHECKEX_HITS.store(0, Relaxed);
+        observe_guest_rip_for_bugcheck(0xdeadbeef, 0);
+        assert_eq!(KEBUGCHECKEX_HITS.load(Relaxed), 0);
+    }
+
+    #[test]
+    fn watchdog_field_reports_written_state_and_rejects_out_of_range() {
+        HANDLER_MAX_DELTA[9].store(0xdeadbeef, Relaxed);
+        HANDLER_MAX_DELTA_REASON[9].store(42, Relaxed);
+        HANDLER_SLOW_COUNT[9].store(3, Relaxed);
+        HANDLER_LAST_SLOW_REASON[9].store(48, Relaxed);
+        HANDLER_LAST_SLOW_RIP[9].store(0x1122_3344, Relaxed);
+        HANDLER_LAST_SLOW_DELTA[9].store(0x99, Relaxed);
+        HANDLER_START_TSC[9].store(0xa5a5, Relaxed);
+        HANDLER_LAST_EXIT_REASON[9].store(10, Relaxed);
+
+        assert_eq!(watchdog_field(9, 0), 0xdeadbeef);
+        assert_eq!(watchdog_field(9, 1), 42);
+        assert_eq!(watchdog_field(9, 2), 3);
+        assert_eq!(watchdog_field(9, 3), 48);
+        assert_eq!(watchdog_field(9, 4), 0x1122_3344);
+        assert_eq!(watchdog_field(9, 5), 0x99);
+        assert_eq!(watchdog_field(9, 6), 0xa5a5);
+        assert_eq!(watchdog_field(9, 7), 10);
+
+        assert_eq!(watchdog_field(9, 42), u64::MAX);
+        assert_eq!(watchdog_field(MAX_TRACKED_CPUS as u64, 0), u64::MAX);
+
+        // Reset so cross-test contamination does not leak.
+        HANDLER_MAX_DELTA[9].store(0, Relaxed);
+        HANDLER_MAX_DELTA_REASON[9].store(0, Relaxed);
+        HANDLER_SLOW_COUNT[9].store(0, Relaxed);
+        HANDLER_LAST_SLOW_REASON[9].store(0, Relaxed);
+        HANDLER_LAST_SLOW_RIP[9].store(0, Relaxed);
+        HANDLER_LAST_SLOW_DELTA[9].store(0, Relaxed);
+        HANDLER_START_TSC[9].store(0, Relaxed);
+        HANDLER_LAST_EXIT_REASON[9].store(0, Relaxed);
+    }
 }
 
 pub fn control(id: u64) -> u64 {
@@ -729,6 +1060,33 @@ pub fn control(id: u64) -> u64 {
         27 => super::host_idt::HOST_PF_COUNT.load(Relaxed),
         28 => super::host_idt::PF_FAULT_RIP.load(Relaxed),
         29 => super::host_idt::PF_FAULT_CR2.load(Relaxed),
+        30 => super::host_idt::HOST_FAULT_TOTAL.load(Relaxed),
+        31 => super::host_idt::HOST_FIRST_FAULT_VECTOR.load(Relaxed),
+        32 => super::host_idt::HOST_FIRST_FAULT_RIP.load(Relaxed),
+        33 => super::host_idt::HOST_FIRST_FAULT_RSP.load(Relaxed),
+        34 => super::host_idt::HOST_FIRST_FAULT_ERR.load(Relaxed),
+        35 => super::host_idt::HOST_FIRST_FAULT_CPU.load(Relaxed),
+        36 => super::host_idt::NMI_FAULT_RIP.load(Relaxed),
+        37 => super::host_idt::NMI_FAULT_RSP.load(Relaxed),
+        38 => super::host_idt::GP_FAULT_RSP.load(Relaxed),
+        39 => super::host_idt::GP_FAULT_ERR.load(Relaxed),
+        40 => super::host_idt::PF_FAULT_RSP.load(Relaxed),
+        41 => super::host_idt::PF_FAULT_ERR.load(Relaxed),
+        42 => super::host_idt::MC_FAULT_RSP.load(Relaxed),
+        43 => super::host_idt::HOST_DF_COUNT.load(Relaxed),
+        44 => super::host_idt::DF_FAULT_RIP.load(Relaxed),
+        45 => super::host_idt::DF_FAULT_RSP.load(Relaxed),
+        46 => super::host_idt::HOST_DEFAULT_RIP.load(Relaxed),
+        47 => super::host_idt::HOST_DEFAULT_RSP.load(Relaxed),
+        48 => PER_CPU_RING_SIZE as u64,
+        49 => MAX_TRACKED_CPUS as u64,
+        50 => KEBUGCHECKEX_ADDR.load(Relaxed),
+        51 => KEBUGCHECKEX_SENTINEL.load(Relaxed),
+        52 => KEBUGCHECKEX_HITS.load(Relaxed),
+        53 => KEBUGCHECKEX_HIT_CPU.load(Relaxed),
+        54 => KEBUGCHECKEX_HIT_RIP.load(Relaxed),
+        55 => KEBUGCHECKEX_HIT_TSC.load(Relaxed),
+        56 => KEBUGCHECKEX_HIT_ARG0.load(Relaxed),
         _ => u64::MAX,
     }
 }
@@ -748,5 +1106,18 @@ pub fn reset_breadcrumbs_for_test() {
         BREADCRUMB_GUEST_RCX[cpu].store(0, Relaxed);
         BREADCRUMB_GUEST_RDX[cpu].store(0, Relaxed);
         BREADCRUMB_DETAIL[cpu].store(0, Relaxed);
+    }
+}
+
+#[cfg(test)]
+pub fn reset_per_cpu_ring_for_test() {
+    for slot in 0..PER_CPU_RING_LEN {
+        PER_CPU_RING_REASON[slot].store(0, Relaxed);
+        PER_CPU_RING_RIP[slot].store(0, Relaxed);
+        PER_CPU_RING_QUAL[slot].store(0, Relaxed);
+        PER_CPU_RING_RAX[slot].store(0, Relaxed);
+    }
+    for cpu in 0..MAX_TRACKED_CPUS {
+        PER_CPU_RING_IDX[cpu].store(0, Relaxed);
     }
 }
