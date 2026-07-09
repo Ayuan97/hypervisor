@@ -1,5 +1,6 @@
 use std::{
     arch::asm,
+    convert::TryInto,
     env,
     ffi::c_void,
     time::{Duration, Instant},
