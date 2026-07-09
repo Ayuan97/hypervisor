@@ -1341,6 +1341,8 @@ pub fn control(id: u64) -> u64 {
         63 => LBR_STACK_READ_COUNT.load(Relaxed),
         64 => LBR_DEBUGCTL_SHADOW.load(Relaxed),
         65 => BUGCHECK_CALLBACK_FIRED.load(Relaxed),
+        66 => super::host_idt::HOST_DEFAULT_SOFT_COUNT.load(Relaxed),
+        67 => super::host_idt::HOST_DEFAULT_SOFT_RIP.load(Relaxed),
         _ => u64::MAX,
     }
 }

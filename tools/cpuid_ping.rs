@@ -728,6 +728,17 @@ fn main() {
         println!("  RAM=0  CMOS=0x{:02x}  (not fired this session or last)", bugcheck_cb_cmos);
     }
 
+    // === Soft default handler (2026-07-09) ===
+    let soft_count = hv_cmd(CMD_GET_CTL, 66);
+    let soft_rip = hv_cmd(CMD_GET_CTL, 67);
+    println!("\n=== Host default_soft (reserved/external vector IRETs) ===");
+    println!("  fired={} last_rip={:#018x}", soft_count, soft_rip);
+    if soft_count > 0 {
+        println!("  [i] Some reserved/external vector hit host mode and IRETed.");
+        println!("      Non-zero here is the fix that keeps vector 23 style events");
+        println!("      from halting a CPU. Compare against HOST_DEFAULT_COUNT (id 25).");
+    }
+
     // === P2 stealth MSR counters (2026-07-09) ===
     let efer_r = hv_cmd(CMD_GET_CTL, 57);
     let efer_w = hv_cmd(CMD_GET_CTL, 58);

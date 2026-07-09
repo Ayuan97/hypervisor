@@ -73,6 +73,8 @@ pub static DF_FAULT_RIP: AtomicU64 = AtomicU64::new(0);
 pub static DF_FAULT_RSP: AtomicU64 = AtomicU64::new(0);
 pub static HOST_DEFAULT_RIP: AtomicU64 = AtomicU64::new(0);
 pub static HOST_DEFAULT_RSP: AtomicU64 = AtomicU64::new(0);
+pub static HOST_DEFAULT_SOFT_COUNT: AtomicU64 = AtomicU64::new(0);
+pub static HOST_DEFAULT_SOFT_RIP: AtomicU64 = AtomicU64::new(0);
 
 pub const HOST_IDT_PATCH_NMI_MATCH: u64 = 1 << 0;
 pub const HOST_IDT_PATCH_GP_MATCH: u64 = 1 << 1;
@@ -94,6 +96,7 @@ extern "C" {
     fn host_mc_handler();
     fn host_df_handler();
     fn host_default_handler();
+    fn host_default_soft_handler();
 }
 
 // ---------------------------------------------------------------------------
@@ -617,6 +620,40 @@ core::arch::global_asm!(
 );
 
 // ---------------------------------------------------------------------------
+// Assembly: SOFT default handler for Intel-reserved / external-interrupt
+// vectors (installed for 22-31 and 32-255).
+//
+// The R5 EAC session (2026-07-09) froze after ~30 min of idle in-game with
+// HOST_FIRST_FAULT_VECTOR=23, HOST_FAULT_TOTAL=58 in CMOS. Vector 23 is
+// "Intel reserved" architecturally but Windows can route a LAPIC LVT there,
+// and external interrupts (32-255) also had the same fatal `vmxoff+hlt`
+// behaviour — so any interrupt that hit host mode during a VM-exit killed
+// the CPU. This soft handler records diagnostics and IRETs so the interrupt
+// source can re-fire naturally instead of halting us.
+//
+// Assumes no error code (correct for vectors 22-31 as Intel-reserved and for
+// 32-255 as external interrupts per SDM). Architectural exceptions with real
+// error codes (10-14, 17, 20-21, 30) still route to `host_default_handler`
+// or their specific handler.
+// ---------------------------------------------------------------------------
+core::arch::global_asm!(
+    ".global host_default_soft_handler",
+    "host_default_soft_handler:",
+    "push rax",
+    "push rcx",
+    "lea rax, [rip + {soft_count}]",
+    "lock inc qword ptr [rax]",
+    "mov rax, [rsp + 0x10]",
+    "lea rcx, [rip + {soft_rip}]",
+    "mov [rcx], rax",
+    "pop rcx",
+    "pop rax",
+    "iretq",
+    soft_count = sym HOST_DEFAULT_SOFT_COUNT,
+    soft_rip = sym HOST_DEFAULT_SOFT_RIP,
+);
+
+// ---------------------------------------------------------------------------
 // Rust helpers
 // ---------------------------------------------------------------------------
 
@@ -690,9 +727,17 @@ pub fn check_pending_nmi() {
 /// in VMX-root with IF=0.
 pub fn patch_host_idt(idt: &mut [u64]) {
     let default = expected_default_handler();
+    let soft = expected_default_soft_handler();
     let max_vectors = idt.len() / 2;
+    // Vectors 0-21 (real architectural exceptions we don't handle specifically)
+    // get the halting default handler — if any of them fires in host mode it
+    // is almost certainly a bug that we want to freeze on to preserve state.
+    // Vectors 22-31 (Intel reserved — no defined error code) and 32-255
+    // (external interrupts — no error code by SDM) get the SOFT handler that
+    // just IRETs, so a stray LAPIC-routed vector cannot silently halt a CPU.
     for vector in 0..max_vectors.min(256) {
-        patch_idt_entry(idt, vector, default);
+        let handler = if vector < 22 { default } else { soft };
+        patch_idt_entry(idt, vector, handler);
     }
     patch_idt_entry(idt, 2, expected_nmi_handler());
     patch_idt_entry(idt, 8, expected_df_handler());
@@ -776,6 +821,10 @@ pub fn expected_df_handler() -> u64 {
 
 pub fn expected_default_handler() -> u64 {
     host_default_handler as *const () as usize as u64
+}
+
+pub fn expected_default_soft_handler() -> u64 {
+    host_default_soft_handler as *const () as usize as u64
 }
 
 fn host_idt_patch_mask(idt: &[u64], base: u64, limit: u64) -> u64 {
@@ -870,6 +919,48 @@ mod tests {
         assert_eq!(idt_entry_handler(&idt, 8), Some(expected_df_handler()));
         assert_eq!(idt[8 * 2] & 0x0000_FFFF_FFFF_0000, PRESERVED_BITS);
         assert_ne!(expected_df_handler(), expected_default_handler());
+    }
+
+    #[test]
+    fn patch_host_idt_uses_soft_handler_for_reserved_and_external_vectors() {
+        // Full 256-vector IDT: 256 entries * 2 u64 each = 512 u64.
+        let mut idt = alloc::vec![0u64; 512];
+        patch_host_idt(&mut idt);
+
+        // Intel-reserved vectors 22-31 must NOT use the halting default —
+        // that is what killed us with vector 23 in the 2026-07-09 R5 test.
+        for vector in 22..=31 {
+            assert_eq!(
+                idt_entry_handler(&idt, vector),
+                Some(expected_default_soft_handler()),
+                "vector {} must use soft handler",
+                vector
+            );
+        }
+        // External-interrupt vectors 32, 128, 255 sample the whole range.
+        for vector in [32, 128, 255] {
+            assert_eq!(
+                idt_entry_handler(&idt, vector),
+                Some(expected_default_soft_handler()),
+                "external vector {} must use soft handler",
+                vector
+            );
+        }
+        // Vectors 0-21 (except our specific handlers) still get the halting
+        // default — real architectural bugs should freeze host state.
+        for vector in [0, 1, 3, 4, 5, 6, 7, 9, 10, 11, 12, 15, 16, 17, 19, 20, 21] {
+            assert_eq!(
+                idt_entry_handler(&idt, vector),
+                Some(expected_default_handler()),
+                "vector {} must keep the halting default",
+                vector
+            );
+        }
+    }
+
+    #[test]
+    fn expected_default_soft_handler_differs_from_halting_default() {
+        assert_ne!(expected_default_soft_handler(), expected_default_handler());
     }
 
     #[test]
