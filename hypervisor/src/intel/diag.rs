@@ -161,6 +161,36 @@ const CMOS_OFF_FIRST_CPU: u8 = 0x19;
 static CMOS_LAST_HITS: AtomicU64 = AtomicU64::new(u64::MAX);
 static CMOS_LAST_VECTOR: AtomicU64 = AtomicU64::new(u64::MAX);
 static CMOS_LAST_TOTAL: AtomicU64 = AtomicU64::new(u64::MAX);
+static CMOS_BASELINE_LOADED: AtomicBool = AtomicBool::new(false);
+
+/// Populate the CMOS_LAST_* shadows from whatever bytes currently sit in the
+/// extended-CMOS Step 4 area. Must be called before the first VM-exit so the
+/// change-detect sync does not clobber last-session's freeze data with the
+/// current session's zeroed RAM baseline. Idempotent.
+pub fn cmos_load_step4_baseline() {
+    if CMOS_BASELINE_LOADED
+        .compare_exchange(false, true, Relaxed, Relaxed)
+        .is_err()
+    {
+        return;
+    }
+    let magic = ext_cmos_read(CMOS_OFF_MAGIC);
+    if magic == CMOS_MAGIC_STEP4 {
+        let hits = ext_cmos_read(CMOS_OFF_KBCHK_HITS) as u64;
+        let vec = ext_cmos_read(CMOS_OFF_FIRST_VEC) as u64;
+        let lo = ext_cmos_read(CMOS_OFF_TOTAL_LO) as u64;
+        let hi = ext_cmos_read(CMOS_OFF_TOTAL_HI) as u64;
+        let total = lo | (hi << 8);
+        CMOS_LAST_HITS.store(hits, Relaxed);
+        CMOS_LAST_VECTOR.store(vec, Relaxed);
+        CMOS_LAST_TOTAL.store(total, Relaxed);
+    } else {
+        // No magic or corrupted — treat as clean slate.
+        CMOS_LAST_HITS.store(0, Relaxed);
+        CMOS_LAST_VECTOR.store(0, Relaxed);
+        CMOS_LAST_TOTAL.store(0, Relaxed);
+    }
+}
 
 /// Snapshot the freeze-critical Step 1-4 fields into extended CMOS. Called
 /// on every VM-exit return path via `watchdog_handler_finish`; writes only
@@ -168,6 +198,10 @@ static CMOS_LAST_TOTAL: AtomicU64 = AtomicU64::new(u64::MAX);
 /// normal runtime and only kicks in when something interesting fires.
 #[inline]
 pub fn cmos_sync_step4_state() {
+    // Ensure the CMOS_LAST_* shadows reflect the actual on-disk CMOS bytes
+    // before the first change-detect fires. Without this, a driver load
+    // would clobber last session's freeze data on the first VM-exit.
+    cmos_load_step4_baseline();
     let hits = KEBUGCHECKEX_HITS.load(Relaxed);
     if hits != CMOS_LAST_HITS.load(Relaxed) {
         ext_cmos_write(CMOS_OFF_MAGIC, CMOS_MAGIC_STEP4);
