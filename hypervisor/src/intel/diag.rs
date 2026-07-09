@@ -41,6 +41,27 @@ pub static MSR_READ_COUNT: AtomicU64 = AtomicU64::new(0);
 pub static MSR_WRITE_COUNT: AtomicU64 = AtomicU64::new(0);
 pub static MSR_GP_INJECTED: AtomicU64 = AtomicU64::new(0);
 
+// ---------------------------------------------------------------------------
+// P2 stealth MSR counters (2026-07-09).
+// Track how often EAC / anti-cheat code polls the MSRs known to be used as
+// hypervisor-detection vectors. Non-zero counts point at whichever detection
+// path is actively firing so we can prioritise stealth work.
+// ---------------------------------------------------------------------------
+pub static EFER_READ_COUNT: AtomicU64 = AtomicU64::new(0);
+pub static EFER_WRITE_COUNT: AtomicU64 = AtomicU64::new(0);
+pub static APERF_READ_COUNT: AtomicU64 = AtomicU64::new(0);
+pub static MPERF_READ_COUNT: AtomicU64 = AtomicU64::new(0);
+pub static DEBUGCTL_READ_COUNT: AtomicU64 = AtomicU64::new(0);
+pub static DEBUGCTL_WRITE_COUNT: AtomicU64 = AtomicU64::new(0);
+pub static LBR_STACK_READ_COUNT: AtomicU64 = AtomicU64::new(0);
+
+/// Shadow value returned to the guest on IA32_DEBUGCTL reads. Guest writes
+/// virtualise into this shadow rather than reaching hardware, so host branches
+/// executed between VM-exit and VM-entry cannot corrupt the guest's LBR view.
+/// Starts at 0 (LBR disabled from the guest's perspective); guest software may
+/// enable it and read back exactly what it wrote.
+pub static LBR_DEBUGCTL_SHADOW: AtomicU64 = AtomicU64::new(0);
+
 pub static LAST_HANDLER_ID: AtomicU64 = AtomicU64::new(0);
 pub static LAST_HANDLER_DETAIL: AtomicU64 = AtomicU64::new(0);
 
@@ -1288,6 +1309,14 @@ pub fn control(id: u64) -> u64 {
         54 => KEBUGCHECKEX_HIT_RIP.load(Relaxed),
         55 => KEBUGCHECKEX_HIT_TSC.load(Relaxed),
         56 => KEBUGCHECKEX_HIT_ARG0.load(Relaxed),
+        57 => EFER_READ_COUNT.load(Relaxed),
+        58 => EFER_WRITE_COUNT.load(Relaxed),
+        59 => APERF_READ_COUNT.load(Relaxed),
+        60 => MPERF_READ_COUNT.load(Relaxed),
+        61 => DEBUGCTL_READ_COUNT.load(Relaxed),
+        62 => DEBUGCTL_WRITE_COUNT.load(Relaxed),
+        63 => LBR_STACK_READ_COUNT.load(Relaxed),
+        64 => LBR_DEBUGCTL_SHADOW.load(Relaxed),
         _ => u64::MAX,
     }
 }

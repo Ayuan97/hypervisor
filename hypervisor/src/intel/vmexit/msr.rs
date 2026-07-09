@@ -26,6 +26,13 @@ const IA32_RTIT_STATUS_MSR: u32 = 0x571;
 const IA32_RTIT_CR3_MATCH_MSR: u32 = 0x572;
 const IA32_RTIT_ADDR_MSR_START: u32 = 0x580;
 const IA32_RTIT_ADDR_MSR_END: u32 = 0x58f;
+const IA32_EFER: u32 = 0xC000_0080;
+const IA32_MPERF: u32 = 0xE7;
+const IA32_APERF: u32 = 0xE8;
+const IA32_DEBUGCTL: u32 = 0x1D9;
+const IA32_LASTBRANCH_TOS: u32 = 0x1C9;
+const IA32_LBR_STACK_START: u32 = 0x680;
+const IA32_LBR_STACK_END: u32 = 0x6BF;
 
 /// Enum representing the type of MSR access.
 ///
@@ -65,6 +72,7 @@ pub fn handle_msr_access(
         guest_registers,
         access_type,
         |msr| unsafe { msr::rdmsr(msr) },
+        |msr, value| unsafe { msr::wrmsr(msr, value) },
         |code| {
             diag::MSR_GP_INJECTED.fetch_add(1, Relaxed);
             EventInjection::vmentry_inject_gp(code);
@@ -72,14 +80,16 @@ pub fn handle_msr_access(
     )
 }
 
-fn handle_msr_access_with<R, G>(
+fn handle_msr_access_with<R, W, G>(
     guest_registers: &mut GuestRegisters,
     access_type: MsrAccessType,
     read_msr: R,
+    write_msr: W,
     inject_gp: G,
 ) -> ExitType
 where
     R: FnOnce(u32) -> u64,
+    W: FnOnce(u32, u64),
     G: FnOnce(u32),
 {
     let msr = guest_registers.rcx as u32;
@@ -145,6 +155,98 @@ where
         return ExitType::Continue;
     }
 
+    // ── P2 stealth MSRs (secret.club EAC detection vectors) ──
+
+    // IA32_EFER: pass through both directions. Guest sees real SCE bit so
+    // syscall works; counting reads reveals whether EAC is polling EFER for
+    // its 30-min syscall-hook check.
+    if msr == IA32_EFER {
+        match access_type {
+            MsrAccessType::Read => {
+                let value = read_msr(msr);
+                guest_registers.rax = value & 0xFFFF_FFFF;
+                guest_registers.rdx = value >> 32;
+                super::super::diag::EFER_READ_COUNT
+                    .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                return ExitType::IncrementRIP;
+            }
+            MsrAccessType::Write => {
+                let value =
+                    ((guest_registers.rdx as u64) << 32) | (guest_registers.rax as u64 & 0xFFFF_FFFF);
+                write_msr(msr, value);
+                super::super::diag::EFER_WRITE_COUNT
+                    .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                return ExitType::IncrementRIP;
+            }
+        }
+    }
+
+    // APERF / MPERF: pass through reads (very low VM-exit rate means ratio
+    // stays close to bare metal). Just count so we can tell if EAC polls
+    // them — writes are not intercepted at all.
+    if msr == IA32_APERF || msr == IA32_MPERF {
+        if matches!(access_type, MsrAccessType::Read) {
+            let value = read_msr(msr);
+            guest_registers.rax = value & 0xFFFF_FFFF;
+            guest_registers.rdx = value >> 32;
+            if msr == IA32_APERF {
+                super::super::diag::APERF_READ_COUNT
+                    .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            } else {
+                super::super::diag::MPERF_READ_COUNT
+                    .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            }
+            return ExitType::IncrementRIP;
+        }
+    }
+
+    // IA32_DEBUGCTL: guest read gets back a shadow (initially 0), guest
+    // write is virtualized (stored in shadow, not applied to hardware) so
+    // host code that runs between VM-exit and VM-entry does not corrupt LBR
+    // state from the guest's point of view.
+    if msr == IA32_DEBUGCTL {
+        match access_type {
+            MsrAccessType::Read => {
+                let shadow = super::super::diag::LBR_DEBUGCTL_SHADOW
+                    .load(core::sync::atomic::Ordering::Relaxed);
+                guest_registers.rax = shadow & 0xFFFF_FFFF;
+                guest_registers.rdx = shadow >> 32;
+                super::super::diag::DEBUGCTL_READ_COUNT
+                    .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                return ExitType::IncrementRIP;
+            }
+            MsrAccessType::Write => {
+                let value =
+                    ((guest_registers.rdx as u64) << 32) | (guest_registers.rax as u64 & 0xFFFF_FFFF);
+                super::super::diag::LBR_DEBUGCTL_SHADOW
+                    .store(value, core::sync::atomic::Ordering::Relaxed);
+                super::super::diag::DEBUGCTL_WRITE_COUNT
+                    .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                return ExitType::IncrementRIP;
+            }
+        }
+    }
+
+    // LBR TOS and LBR stack: return 0 on read, silently absorb writes. This
+    // hides any host branches that may have leaked into LBR while the
+    // handler was running.
+    if msr == IA32_LASTBRANCH_TOS
+        || (IA32_LBR_STACK_START..=IA32_LBR_STACK_END).contains(&msr)
+    {
+        match access_type {
+            MsrAccessType::Read => {
+                guest_registers.rax = 0;
+                guest_registers.rdx = 0;
+                super::super::diag::LBR_STACK_READ_COUNT
+                    .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                return ExitType::IncrementRIP;
+            }
+            MsrAccessType::Write => {
+                return ExitType::IncrementRIP;
+            }
+        }
+    }
+
     inject_gp(0);
     ExitType::Continue
 }
@@ -172,6 +274,21 @@ fn intel_pt_msr_is_virtualized(msr: u32) -> bool {
 mod tests {
     use super::*;
 
+    /// Test helper: forwards to `handle_msr_access_with` with a no-op write_msr
+    /// closure. Lets existing 4-arg tests keep their signature.
+    fn handle_msr_access_test<R, G>(
+        guest_registers: &mut GuestRegisters,
+        access_type: MsrAccessType,
+        read_msr: R,
+        inject_gp: G,
+    ) -> ExitType
+    where
+        R: FnOnce(u32) -> u64,
+        G: FnOnce(u32),
+    {
+        handle_msr_access_with(guest_registers, access_type, read_msr, |_, _| (), inject_gp)
+    }
+
     #[test]
     fn out_of_range_rdmsr_injects_gp_instead_of_faking_zero() {
         let mut regs = GuestRegisters::default();
@@ -180,7 +297,7 @@ mod tests {
         regs.rdx = 0x2222;
         let mut injected_error = None;
 
-        let exit = handle_msr_access_with(
+        let exit = handle_msr_access_test(
             &mut regs,
             MsrAccessType::Read,
             |_| 0,
@@ -199,7 +316,7 @@ mod tests {
         regs.rcx = 0x4000_0000;
         let mut injected_error = None;
 
-        let exit = handle_msr_access_with(
+        let exit = handle_msr_access_test(
             &mut regs,
             MsrAccessType::Write,
             |_| 0,
@@ -216,7 +333,7 @@ mod tests {
         regs.rcx = IA32_FEATURE_CONTROL_MSR as u64;
         let mut injected_error = None;
 
-        let exit = handle_msr_access_with(
+        let exit = handle_msr_access_test(
             &mut regs,
             MsrAccessType::Read,
             |_| 0x1234_0000_0000_0007,
@@ -234,7 +351,7 @@ mod tests {
         let mut regs = GuestRegisters::default();
         regs.rcx = IA32_FEATURE_CONTROL_MSR as u64;
 
-        let exit = handle_msr_access_with(
+        let exit = handle_msr_access_test(
             &mut regs,
             MsrAccessType::Read,
             |_| 0xffff_ffff_ffff_ffff,
@@ -255,7 +372,7 @@ mod tests {
         regs.rdx = 0x2222;
         let mut injected_error = None;
 
-        let exit = handle_msr_access_with(
+        let exit = handle_msr_access_test(
             &mut regs,
             MsrAccessType::Read,
             |_| panic!("Intel PT MSR read should not reach hardware"),
@@ -274,7 +391,7 @@ mod tests {
         regs.rcx = IA32_TSC_AUX as u64;
         let mut injected_error = None;
 
-        let exit = handle_msr_access_with(
+        let exit = handle_msr_access_test(
             &mut regs,
             MsrAccessType::Write,
             |_| panic!("TSC_AUX write should not reach hardware"),
@@ -291,7 +408,7 @@ mod tests {
         regs.rcx = 0x570;
         let mut injected_error = None;
 
-        let exit = handle_msr_access_with(
+        let exit = handle_msr_access_test(
             &mut regs,
             MsrAccessType::Write,
             |_| panic!("Intel PT MSR write should not reach hardware"),
@@ -312,7 +429,7 @@ mod tests {
         regs.rcx = 0x480; // IA32_VMX_BASIC
         let mut injected_error = None;
 
-        let exit = handle_msr_access_with(
+        let exit = handle_msr_access_test(
             &mut regs,
             MsrAccessType::Read,
             |_| panic!("VMX MSR read must not reach hardware"),
@@ -329,7 +446,7 @@ mod tests {
         regs.rcx = 0x480;
         let mut injected_error = None;
 
-        let exit = handle_msr_access_with(
+        let exit = handle_msr_access_test(
             &mut regs,
             MsrAccessType::Write,
             |_| panic!("VMX MSR write should not reach hardware"),
@@ -338,6 +455,106 @@ mod tests {
 
         assert_eq!(exit, ExitType::Continue);
         assert_eq!(injected_error, Some(0));
+    }
+
+    #[test]
+    fn efer_read_passes_through_hardware_value() {
+        let mut regs = GuestRegisters::default();
+        regs.rcx = IA32_EFER as u64;
+        let exit = handle_msr_access_test(
+            &mut regs,
+            MsrAccessType::Read,
+            |m| {
+                assert_eq!(m, IA32_EFER);
+                0xDEAD_BEEF_1234_5678
+            },
+            |_| panic!("EFER read must not #GP"),
+        );
+        assert_eq!(exit, ExitType::IncrementRIP);
+        assert_eq!(regs.rax, 0x1234_5678);
+        assert_eq!(regs.rdx, 0xDEAD_BEEF);
+    }
+
+    #[test]
+    fn aperf_and_mperf_reads_pass_through() {
+        for msr in [IA32_APERF, IA32_MPERF] {
+            let mut regs = GuestRegisters::default();
+            regs.rcx = msr as u64;
+            let exit = handle_msr_access_test(
+                &mut regs,
+                MsrAccessType::Read,
+                |_| 0xCAFE_BABE_DEAD_BEEF,
+                |_| panic!("APERF/MPERF read must not #GP for {:#x}", msr),
+            );
+            assert_eq!(exit, ExitType::IncrementRIP);
+            assert_eq!(regs.rax, 0xDEAD_BEEF);
+            assert_eq!(regs.rdx, 0xCAFE_BABE);
+        }
+    }
+
+    #[test]
+    fn debugctl_read_returns_zero_shadow_by_default() {
+        crate::intel::diag::LBR_DEBUGCTL_SHADOW.store(0, core::sync::atomic::Ordering::Relaxed);
+        let mut regs = GuestRegisters::default();
+        regs.rcx = IA32_DEBUGCTL as u64;
+        let exit = handle_msr_access_test(
+            &mut regs,
+            MsrAccessType::Read,
+            |_| panic!("DEBUGCTL must not read hardware"),
+            |_| panic!("DEBUGCTL read must not #GP"),
+        );
+        assert_eq!(exit, ExitType::IncrementRIP);
+        assert_eq!(regs.rax, 0);
+        assert_eq!(regs.rdx, 0);
+    }
+
+    #[test]
+    fn debugctl_write_stores_shadow_not_hardware() {
+        crate::intel::diag::LBR_DEBUGCTL_SHADOW.store(0, core::sync::atomic::Ordering::Relaxed);
+        let mut regs = GuestRegisters::default();
+        regs.rcx = IA32_DEBUGCTL as u64;
+        regs.rax = 0x0000_00FF;
+        regs.rdx = 0x1122_3344;
+        let exit = handle_msr_access_test(
+            &mut regs,
+            MsrAccessType::Write,
+            |_| panic!("DEBUGCTL write must not touch hardware"),
+            |_| panic!("DEBUGCTL write must not #GP"),
+        );
+        assert_eq!(exit, ExitType::IncrementRIP);
+        assert_eq!(
+            crate::intel::diag::LBR_DEBUGCTL_SHADOW
+                .load(core::sync::atomic::Ordering::Relaxed),
+            0x1122_3344_0000_00FF
+        );
+    }
+
+    #[test]
+    fn lbr_stack_reads_return_zero_and_writes_are_silently_absorbed() {
+        for msr in [IA32_LASTBRANCH_TOS, IA32_LBR_STACK_START, 0x69F, IA32_LBR_STACK_END] {
+            let mut regs = GuestRegisters::default();
+            regs.rcx = msr as u64;
+            let read_exit = handle_msr_access_test(
+                &mut regs,
+                MsrAccessType::Read,
+                |_| panic!("LBR stack must not read hardware for {:#x}", msr),
+                |_| panic!("LBR stack read must not #GP"),
+            );
+            assert_eq!(read_exit, ExitType::IncrementRIP);
+            assert_eq!(regs.rax, 0);
+            assert_eq!(regs.rdx, 0);
+
+            let mut regs = GuestRegisters::default();
+            regs.rcx = msr as u64;
+            regs.rax = 0xdead;
+            let write_exit = handle_msr_access_test(
+                &mut regs,
+                MsrAccessType::Write,
+                |_| panic!("LBR stack write must not reach hardware"),
+                |_| panic!("LBR stack write must not #GP"),
+            );
+            assert_eq!(write_exit, ExitType::IncrementRIP);
+        }
     }
 
     #[test]
@@ -352,7 +569,7 @@ mod tests {
             let mut regs = GuestRegisters::default();
             regs.rcx = msr as u64;
             let mut injected_error = None;
-            let exit = handle_msr_access_with(
+            let exit = handle_msr_access_test(
                 &mut regs,
                 MsrAccessType::Read,
                 |_| panic!("VMX MSR read must not reach hardware for {:#x}", msr),
@@ -368,7 +585,7 @@ mod tests {
         let mut regs = GuestRegisters::default();
         regs.rcx = 0x8c;
 
-        let exit = handle_msr_access_with(
+        let exit = handle_msr_access_test(
             &mut regs,
             MsrAccessType::Read,
             |_| 0x1122_3344_5566_7788,

@@ -25,6 +25,13 @@ const IA32_RTIT_CR3_MATCH_MSR: u32 = 0x572;
 const IA32_RTIT_ADDR_MSR_START: u32 = 0x580;
 const IA32_RTIT_ADDR_MSR_END: u32 = 0x58f;
 const IA32_TSC_AUX: u32 = 0x103;
+const IA32_EFER: u32 = 0xC000_0080;
+const IA32_MPERF: u32 = 0xE7;
+const IA32_APERF: u32 = 0xE8;
+const IA32_DEBUGCTL: u32 = 0x1D9;
+const IA32_LASTBRANCH_TOS: u32 = 0x1C9;
+const IA32_LBR_STACK_START: u32 = 0x680;
+const IA32_LBR_STACK_END: u32 = 0x6BF;
 
 /// Represents the MSR Bitmap structure used in VMX.
 ///
@@ -129,6 +136,34 @@ impl MsrBitmap {
         // Intercept writes to IA32_TSC_AUX — host IDT handlers use rdtscp
         // for per-CPU indexing; a guest WRMSR would corrupt that index.
         set_msr_bitmap_bit(&mut self.write_high_msrs, IA32_TSC_AUX);
+
+        // ---- P2 stealth interception (secret.club EAC detection vectors) ----
+
+        // IA32_EFER (0xC000_0080). Falls in the high range (0xC0000000-0xC0001FFF).
+        // Read intercept lets us hand back a consistent EFER value and count how
+        // often EAC queries it; write intercept ensures guest cannot toggle SCE
+        // without our knowledge.
+        let efer_low = IA32_EFER - 0xC000_0000;
+        set_msr_bitmap_bit(&mut self.read_high_msrs, efer_low);
+        set_msr_bitmap_bit(&mut self.write_high_msrs, efer_low);
+
+        // APERF (0xE8) / MPERF (0xE7). BattlEye is known to use APERF-based
+        // timing (secret.club 2020). Count reads; reads pass through so ratio
+        // stays close to bare metal (our VM-exit rate is very low anyway).
+        set_msr_bitmap_bit(&mut self.read_low_msrs, IA32_MPERF);
+        set_msr_bitmap_bit(&mut self.read_low_msrs, IA32_APERF);
+
+        // IA32_DEBUGCTL (0x1D9) + LBR TOS + LBR stack (0x680-0x6BF). Intercept
+        // both directions so guest cannot observe host branches leaking into
+        // LBR after a VM-exit.
+        set_msr_bitmap_bit(&mut self.read_low_msrs, IA32_DEBUGCTL);
+        set_msr_bitmap_bit(&mut self.write_low_msrs, IA32_DEBUGCTL);
+        set_msr_bitmap_bit(&mut self.read_low_msrs, IA32_LASTBRANCH_TOS);
+        set_msr_bitmap_bit(&mut self.write_low_msrs, IA32_LASTBRANCH_TOS);
+        for msr in IA32_LBR_STACK_START..=IA32_LBR_STACK_END {
+            set_msr_bitmap_bit(&mut self.read_low_msrs, msr);
+            set_msr_bitmap_bit(&mut self.write_low_msrs, msr);
+        }
     }
 }
 
@@ -211,5 +246,40 @@ mod tests {
             msr_bitmap_size_bits(),
             (core::mem::size_of::<MsrBitmap>() * 8) as u32
         );
+    }
+
+    #[test]
+    fn efer_is_intercepted_in_high_range() {
+        let mut bitmap = empty_bitmap();
+        bitmap.intercept_vmx_msrs();
+
+        let efer_low = IA32_EFER - 0xC000_0000;
+        assert!(msr_bitmap_bit_is_set(&bitmap.read_high_msrs, efer_low));
+        assert!(msr_bitmap_bit_is_set(&bitmap.write_high_msrs, efer_low));
+    }
+
+    #[test]
+    fn aperf_and_mperf_reads_are_intercepted() {
+        let mut bitmap = empty_bitmap();
+        bitmap.intercept_vmx_msrs();
+
+        assert!(msr_bitmap_bit_is_set(&bitmap.read_low_msrs, IA32_MPERF));
+        assert!(msr_bitmap_bit_is_set(&bitmap.read_low_msrs, IA32_APERF));
+        // Writes to these are legal on bare metal; leave pass-through.
+        assert!(!msr_bitmap_bit_is_set(&bitmap.write_low_msrs, IA32_MPERF));
+        assert!(!msr_bitmap_bit_is_set(&bitmap.write_low_msrs, IA32_APERF));
+    }
+
+    #[test]
+    fn debugctl_and_lbr_stack_are_intercepted_both_ways() {
+        let mut bitmap = empty_bitmap();
+        bitmap.intercept_vmx_msrs();
+
+        for msr in [IA32_DEBUGCTL, IA32_LASTBRANCH_TOS, IA32_LBR_STACK_START, IA32_LBR_STACK_END] {
+            assert!(msr_bitmap_bit_is_set(&bitmap.read_low_msrs, msr), "read {:#x}", msr);
+            assert!(msr_bitmap_bit_is_set(&bitmap.write_low_msrs, msr), "write {:#x}", msr);
+        }
+        // Range boundary outside the LBR stack must not leak.
+        assert!(!msr_bitmap_bit_is_set(&bitmap.read_low_msrs, IA32_LBR_STACK_END + 1));
     }
 }
