@@ -123,11 +123,10 @@ impl VmExit {
     ) -> Result<ExitType, HypervisorError> {
         let exit_tsc_start = unsafe { x86::time::rdtsc() };
 
-        // P3.5 — vmexit_stub has already frozen hardware DEBUGCTL and
-        // stashed the original guest value in registers_saved_debugctl.
-        // Rust just decides whether to snapshot the stack contents. Zero
-        // MSR touches if guest didn't have LBR enabled. See intel/lbr.rs.
-        let lbr_saved = crate::intel::lbr::save_and_disable_lbr(guest_registers.saved_debugctl);
+        // Snapshot + freeze the LBR stack ASAP so host handler branches do
+        // not pollute what the guest reads back later. Cheap fast-path if
+        // LBR is disabled (single RDMSR). See intel/lbr.rs.
+        let lbr_saved = crate::intel::lbr::save_and_disable_lbr();
 
         let exit_reason = vmread_checked(ro::EXIT_REASON)? as u32;
         diag::watchdog_handler_start(exit_tsc_start, exit_reason as u64);

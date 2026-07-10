@@ -237,13 +237,7 @@ pub struct GuestRegisters {
     pub xmm15: M128A,
     pub mxcsr_guest: u32,
     pub _mxcsr_pad: u32,
-    /// P3.5 asm-level LBR freeze: the vmexit_stub asm samples DEBUGCTL and
-    /// stashes the guest value here before clearing the LBR bit, so the
-    /// Rust P3.1 save/restore can consult the ORIGINAL value (bit 0 tells
-    /// us whether guest had LBR enabled — decides if we save the stack).
-    /// vmexit_restore reads it back to restore guest DEBUGCTL right before
-    /// VMRESUME. Slot lives at offset 0x198 (see vmlaunch.rs asm consts).
-    pub saved_debugctl: u64,
+    pub _align_pad: u64,
 }
 const_assert_eq!(
     core::mem::size_of::<GuestRegisters>(),
