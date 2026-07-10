@@ -176,6 +176,14 @@ impl VmExit {
             // already run and would crash. Handle it here to keep parity with
             // the slow path.
             if exit_type == ExitType::ExitHypervisor {
+                // Fast path skipped populating rsp/rflags in guest_registers
+                // (only rip was read above). vmexit_devirtualize_restore uses
+                // both to build the IRET-like frame on the guest stack — if
+                // they are stale, the frame lands at a garbage address and
+                // the returning function trips Windows FAST_FAIL_INCORRECT_
+                // STACK (BSOD 0x139/0x04). Populate them here before we bail.
+                guest_registers.rsp = vmread_checked(guest::RSP)?;
+                guest_registers.rflags = vmread_checked(guest::RFLAGS)?;
                 if lbr_saved {
                     crate::intel::lbr::restore_lbr();
                 }
