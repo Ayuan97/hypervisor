@@ -454,9 +454,32 @@ impl VmExit {
             log::error!("Context invalidation before VMXOFF failed: {:?}", error);
         }
 
+        // Preserve the guest MXCSR across VMXOFF. Host handler code may have
+        // executed SSE instructions and mutated MXCSR (rounding mode, flush-to-
+        // zero, denormals-are-zero flags). Without saving it now and restoring
+        // it after `restore_after_vmxoff`, guest-side FPU/SSE state resumes
+        // with our HV's control bits, which can silently corrupt subsequent
+        // floating point results in the returning thread.
+        let saved_mxcsr = {
+            let mut buf: u32 = 0;
+            unsafe {
+                core::arch::asm!(
+                    "stmxcsr [{}]",
+                    in(reg) &mut buf,
+                    options(nostack, preserves_flags),
+                );
+            }
+            buf
+        };
+
         support::vmxoff()?;
         unsafe {
             guest_state.restore_after_vmxoff(vmx);
+            core::arch::asm!(
+                "ldmxcsr [{}]",
+                in(reg) &saved_mxcsr,
+                options(nostack, preserves_flags),
+            );
         }
         clear_virtualized();
         Ok(())

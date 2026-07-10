@@ -17,6 +17,8 @@ pub const VMCALL_MAGIC: u64 = 0xA3B7_E291_4F6D_8C15;
 pub const CPUID_COMM_LEAF: u32 = 0x4000_0000;
 const STATUS_ACCESS_DENIED: u64 = u64::MAX - 1;
 const STATUS_UNSUPPORTED_COMMAND: u64 = u64::MAX - 2;
+const STATUS_PHYSICAL_READ_FAILED: u64 = u64::MAX - 3;
+const STATUS_TRANSLATE_FAILED: u64 = u64::MAX - 4;
 
 const CMD_PING: u64 = 0x01;
 const CMD_READ_PHYS: u64 = 0x10;
@@ -236,7 +238,10 @@ pub fn dispatch_command(guest_registers: &mut GuestRegisters, vmx: &mut Vmx) -> 
                 if user_client_reads_are_enabled() && user_client_reads_are_armed() {
                     crate::intel::client_read::submit_physical_read(pa, size)
                 } else {
-                    read_phys_sized(pa, size).unwrap_or(0)
+                    // Failure must surface, not silently fold to 0 — the caller
+                    // needs to tell "read succeeded and value is 0" from
+                    // "read failed and I have no data".
+                    read_phys_sized(pa, size).unwrap_or(STATUS_PHYSICAL_READ_FAILED)
                 };
             ExitType::IncrementRIP
         }
@@ -292,7 +297,9 @@ pub fn dispatch_command(guest_registers: &mut GuestRegisters, vmx: &mut Vmx) -> 
         CMD_TRANSLATE_VA => {
             let cr3 = arg1;
             let va = arg2;
-            guest_registers.rax = translate_va_to_pa(cr3, va).unwrap_or(0);
+            // Same rationale as CMD_READ_PHYS: expose translation failure
+            // instead of pretending PA == 0 (which is a legit host page).
+            guest_registers.rax = translate_va_to_pa(cr3, va).unwrap_or(STATUS_TRANSLATE_FAILED);
             ExitType::IncrementRIP
         }
         CMD_GET_GUEST_CR3 => {
