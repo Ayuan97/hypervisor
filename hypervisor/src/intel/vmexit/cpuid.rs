@@ -116,8 +116,12 @@ pub fn handle_cpuid(guest_registers: &mut GuestRegisters, vmx: &mut Vmx, exit_ts
     guest_registers.rcx = r.ecx as u64;
     guest_registers.rdx = r.edx as u64;
 
-    // If guest is at HIGH_LEVEL (CR8=15), a bugcheck is likely in progress.
-    // Devirtualize so the bugcheck freeze IPI can complete → BSOD instead of lockup.
+    // If guest is at HIGH_LEVEL (CR8 == 15) the CPU is deep in a bugcheck
+    // path — either KeBugCheckEx itself or a freeze IPI recipient. The
+    // freeze IPI needs every CPU responsive AT bare-metal timing to
+    // complete the crash dump; leaving VMX-root turned ON is how sessions
+    // silently freeze without an event 1001 entry ever getting written.
+    // Devirtualize this CPU so bugcheck can finish → BSOD reaches disk.
     let cr8: u64;
     unsafe { core::arch::asm!("mov {}, cr8", out(reg) cr8, options(nomem, nostack)); }
     if cr8 >= 13 {
@@ -132,6 +136,11 @@ pub fn handle_cpuid(guest_registers: &mut GuestRegisters, vmx: &mut Vmx, exit_ts
             core::arch::asm!("out dx, al", in("dx") 0x71u16, in("al") leaf as u8, options(nomem, nostack));
             core::arch::asm!("out dx, al", in("dx") 0x70u16, in("al") 0x75u8, options(nomem, nostack));
             core::arch::asm!("out dx, al", in("dx") 0x71u16, in("al") (leaf >> 8) as u8, options(nomem, nostack));
+        }
+        if cr8 >= 15 {
+            // Do NOT re-enable RDTSC exiting after this — we're bailing out
+            // entirely. Return ExitHypervisor and let the caller unload.
+            return ExitType::ExitHypervisor;
         }
     }
 
