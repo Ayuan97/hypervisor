@@ -277,7 +277,13 @@ impl Vmcs {
         let requested_entry_ctl = requested_entry_controls();
         let exit_ctl = required_exit_controls();
         let requested_exit_ctl = requested_exit_controls();
-        let pinbased_ctl: u64 = if minimal_mode() {
+        let pinbased_ctl: u64 = if minimal_mode() || nmi_passthrough_mode() {
+            // Pass NMIs directly to the guest IDT[2] instead of exiting. This
+            // matches bare-metal behaviour so an EAC self-NMI probe measuring
+            // NMI-delivery latency cannot tell an HV is in the middle, and
+            // eliminates the tight VM-exit loop that the 2026-07-09 R6 EAC
+            // session saw (19+ NMIs before freeze). VIRTUAL_NMIS is coupled
+            // to NMI_EXITING per SDM, so both are cleared together.
             0
         } else {
             (vmcs::control::PinbasedControls::NMI_EXITING.bits()
@@ -455,6 +461,21 @@ fn ept_disabled() -> bool {
 
 fn minimal_mode() -> bool {
     option_env!("HV_MINIMAL").map_or(false, |v| v == "1")
+}
+
+/// P3.4 (2026-07-09): when true, don't request NMI-exiting / virtual-NMI
+/// so NMIs sent to the guest never cause a VM-exit. This defeats
+/// anti-cheat probes that measure NMI-delivery latency and stops the
+/// host-side NMI storm we observed just before the R6 EAC freeze.
+///
+/// Default enabled. Set `HV_NMI_EXIT=1` at build time to keep the
+/// legacy behaviour where every NMI causes a VM-exit and gets injected
+/// back into the guest by `check_pending_nmi()` (useful for A/B tests).
+fn nmi_passthrough_mode() -> bool {
+    match option_env!("HV_NMI_EXIT") {
+        Some(v) => v != "1",
+        None => true,
+    }
 }
 
 fn required_secondary_controls() -> u64 {
