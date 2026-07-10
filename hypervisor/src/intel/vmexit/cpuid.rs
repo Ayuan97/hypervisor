@@ -116,12 +116,13 @@ pub fn handle_cpuid(guest_registers: &mut GuestRegisters, vmx: &mut Vmx, exit_ts
     guest_registers.rcx = r.ecx as u64;
     guest_registers.rdx = r.edx as u64;
 
-    // If guest is at HIGH_LEVEL (CR8 == 15) the CPU is deep in a bugcheck
-    // path — either KeBugCheckEx itself or a freeze IPI recipient. The
-    // freeze IPI needs every CPU responsive AT bare-metal timing to
-    // complete the crash dump; leaving VMX-root turned ON is how sessions
-    // silently freeze without an event 1001 entry ever getting written.
-    // Devirtualize this CPU so bugcheck can finish → BSOD reaches disk.
+    // Record high-CR8 CPUIDs to CMOS purely as a diagnostic breadcrumb —
+    // don't act on them. Auto-devirtualizing at CR8 >= 15 seemed like a
+    // way to let a mid-flight bugcheck finish (see 22:14:46 session where
+    // it did produce a proper BSOD 0x139), but the follow-up run went
+    // straight to black-screen restart after ~46 s of gameplay: yanking
+    // a CPU out of VMX-root while Windows is at HIGH_LEVEL destabilises
+    // something we can't diagnose from here. Rolled back to record-only.
     let cr8: u64;
     unsafe { core::arch::asm!("mov {}, cr8", out(reg) cr8, options(nomem, nostack)); }
     if cr8 >= 13 {
@@ -136,11 +137,6 @@ pub fn handle_cpuid(guest_registers: &mut GuestRegisters, vmx: &mut Vmx, exit_ts
             core::arch::asm!("out dx, al", in("dx") 0x71u16, in("al") leaf as u8, options(nomem, nostack));
             core::arch::asm!("out dx, al", in("dx") 0x70u16, in("al") 0x75u8, options(nomem, nostack));
             core::arch::asm!("out dx, al", in("dx") 0x71u16, in("al") (leaf >> 8) as u8, options(nomem, nostack));
-        }
-        if cr8 >= 15 {
-            // Do NOT re-enable RDTSC exiting after this — we're bailing out
-            // entirely. Return ExitHypervisor and let the caller unload.
-            return ExitType::ExitHypervisor;
         }
     }
 
