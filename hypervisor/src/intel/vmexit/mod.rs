@@ -123,6 +123,11 @@ impl VmExit {
     ) -> Result<ExitType, HypervisorError> {
         let exit_tsc_start = unsafe { x86::time::rdtsc() };
 
+        // Snapshot + freeze the LBR stack ASAP so host handler branches do
+        // not pollute what the guest reads back later. Cheap fast-path if
+        // LBR is disabled (single RDMSR). See intel/lbr.rs.
+        let lbr_saved = crate::intel::lbr::save_and_disable_lbr();
+
         let exit_reason = vmread_checked(ro::EXIT_REASON)? as u32;
         diag::watchdog_handler_start(exit_tsc_start, exit_reason as u64);
         let vm_entry_failure = (exit_reason & 0x8000_0000) != 0;
@@ -160,6 +165,9 @@ impl VmExit {
             super::host_idt::check_pending_nmi();
             diag::cpu_enter_phase(diag::PHASE_PRE_VMRESUME);
             diag::watchdog_handler_finish(guest_registers.rip);
+            if lbr_saved {
+                crate::intel::lbr::restore_lbr();
+            }
             return Ok(exit_type);
         }
         if basic_reason == 16
@@ -174,6 +182,9 @@ impl VmExit {
             reinject_idt_vectoring_event();
             super::host_idt::check_pending_nmi();
             diag::watchdog_handler_finish(guest_registers.rip);
+            if lbr_saved {
+                crate::intel::lbr::restore_lbr();
+            }
             return Ok(exit_type);
         }
         if basic_reason == 51
@@ -188,6 +199,9 @@ impl VmExit {
             reinject_idt_vectoring_event();
             super::host_idt::check_pending_nmi();
             diag::watchdog_handler_finish(guest_registers.rip);
+            if lbr_saved {
+                crate::intel::lbr::restore_lbr();
+            }
             return Ok(exit_type);
         }
 
@@ -378,6 +392,9 @@ impl VmExit {
         super::host_idt::check_pending_nmi();
         diag::cpu_enter_phase(diag::PHASE_PRE_VMRESUME);
         diag::watchdog_handler_finish(guest_registers.rip);
+        if lbr_saved {
+            crate::intel::lbr::restore_lbr();
+        }
 
         log::debug!(
             "Guest registers after handling vmexit: {:#x?}",

@@ -728,6 +728,18 @@ fn main() {
         println!("  RAM=0  CMOS=0x{:02x}  (not fired this session or last)", bugcheck_cb_cmos);
     }
 
+    // === LBR VMCS save/restore (P3.1, 2026-07-09) ===
+    let lbr_save = hv_cmd(CMD_GET_CTL, 68);
+    let lbr_restore = hv_cmd(CMD_GET_CTL, 69);
+    println!("\n=== LBR save/restore (P3.1) ===");
+    println!("  save={} restore={}", lbr_save, lbr_restore);
+    if lbr_save > 0 {
+        println!("  [🎯] Guest had LBR enabled on {} VM-exits — save/restore active.", lbr_save);
+        println!("       Host branches during handler execution do NOT leak to guest LBR.");
+    } else {
+        println!("  [i] Guest never enabled LBR — fast path taken every exit.");
+    }
+
     // === Soft default handler (2026-07-09) ===
     let soft_count = hv_cmd(CMD_GET_CTL, 66);
     let soft_rip = hv_cmd(CMD_GET_CTL, 67);

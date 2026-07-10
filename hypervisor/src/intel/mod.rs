@@ -8,6 +8,7 @@ pub mod events;
 pub mod host_idt;
 pub mod invept;
 pub mod invvpid;
+pub mod lbr;
 pub mod msr_bitmap;
 pub mod paging;
 pub mod segmentation;

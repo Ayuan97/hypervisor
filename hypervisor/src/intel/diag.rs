@@ -54,6 +54,8 @@ pub static MPERF_READ_COUNT: AtomicU64 = AtomicU64::new(0);
 pub static DEBUGCTL_READ_COUNT: AtomicU64 = AtomicU64::new(0);
 pub static DEBUGCTL_WRITE_COUNT: AtomicU64 = AtomicU64::new(0);
 pub static LBR_STACK_READ_COUNT: AtomicU64 = AtomicU64::new(0);
+pub static LBR_SAVE_COUNT: AtomicU64 = AtomicU64::new(0);
+pub static LBR_RESTORE_COUNT: AtomicU64 = AtomicU64::new(0);
 
 /// Shadow value returned to the guest on IA32_DEBUGCTL reads. Guest writes
 /// virtualise into this shadow rather than reaching hardware, so host branches
@@ -1343,6 +1345,8 @@ pub fn control(id: u64) -> u64 {
         65 => BUGCHECK_CALLBACK_FIRED.load(Relaxed),
         66 => super::host_idt::HOST_DEFAULT_SOFT_COUNT.load(Relaxed),
         67 => super::host_idt::HOST_DEFAULT_SOFT_RIP.load(Relaxed),
+        68 => LBR_SAVE_COUNT.load(Relaxed),
+        69 => LBR_RESTORE_COUNT.load(Relaxed),
         _ => u64::MAX,
     }
 }
