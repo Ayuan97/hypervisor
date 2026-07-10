@@ -279,7 +279,8 @@ impl VmExit {
             return Err(HypervisorError::UnknownVMExitReason);
         };
 
-        use core::sync::atomic::Ordering::Relaxed;
+        // `Relaxed` is already imported at the top of the function for the
+        // fast-path counters; don't re-import at the slow-path scope.
         diag::EXIT_TOTAL.fetch_add(1, Relaxed);
         diag::LAST_EXIT_REASON.store(exit_reason as u64, Relaxed);
 
