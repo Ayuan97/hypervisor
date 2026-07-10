@@ -30,8 +30,13 @@ const IA32_MPERF: u32 = 0xE7;
 const IA32_APERF: u32 = 0xE8;
 const IA32_DEBUGCTL: u32 = 0x1D9;
 const IA32_LASTBRANCH_TOS: u32 = 0x1C9;
-const IA32_LBR_STACK_START: u32 = 0x680;
-const IA32_LBR_STACK_END: u32 = 0x6BF;
+// Intel SDM Vol 4: LASTBRANCH_FROM_i = 0x680 + i (32 entries), LASTBRANCH_TO_i = 0x6C0 + i (32 entries).
+// The gap 0x6A0-0x6BF holds LASTBRANCH_INFO_i / reserved — NOT the TO stack. Older code assumed
+// the two ranges were contiguous; correct intercept is two disjoint blocks.
+const IA32_LBR_FROM_START: u32 = 0x680;
+const IA32_LBR_FROM_END: u32 = 0x69F;
+const IA32_LBR_TO_START: u32 = 0x6C0;
+const IA32_LBR_TO_END: u32 = 0x6DF;
 
 /// Represents the MSR Bitmap structure used in VMX.
 ///
@@ -160,7 +165,11 @@ impl MsrBitmap {
         set_msr_bitmap_bit(&mut self.write_low_msrs, IA32_DEBUGCTL);
         set_msr_bitmap_bit(&mut self.read_low_msrs, IA32_LASTBRANCH_TOS);
         set_msr_bitmap_bit(&mut self.write_low_msrs, IA32_LASTBRANCH_TOS);
-        for msr in IA32_LBR_STACK_START..=IA32_LBR_STACK_END {
+        for msr in IA32_LBR_FROM_START..=IA32_LBR_FROM_END {
+            set_msr_bitmap_bit(&mut self.read_low_msrs, msr);
+            set_msr_bitmap_bit(&mut self.write_low_msrs, msr);
+        }
+        for msr in IA32_LBR_TO_START..=IA32_LBR_TO_END {
             set_msr_bitmap_bit(&mut self.read_low_msrs, msr);
             set_msr_bitmap_bit(&mut self.write_low_msrs, msr);
         }
@@ -275,11 +284,21 @@ mod tests {
         let mut bitmap = empty_bitmap();
         bitmap.intercept_vmx_msrs();
 
-        for msr in [IA32_DEBUGCTL, IA32_LASTBRANCH_TOS, IA32_LBR_STACK_START, IA32_LBR_STACK_END] {
+        for msr in [
+            IA32_DEBUGCTL,
+            IA32_LASTBRANCH_TOS,
+            IA32_LBR_FROM_START,
+            IA32_LBR_FROM_END,
+            IA32_LBR_TO_START,
+            IA32_LBR_TO_END,
+        ] {
             assert!(msr_bitmap_bit_is_set(&bitmap.read_low_msrs, msr), "read {:#x}", msr);
             assert!(msr_bitmap_bit_is_set(&bitmap.write_low_msrs, msr), "write {:#x}", msr);
         }
-        // Range boundary outside the LBR stack must not leak.
-        assert!(!msr_bitmap_bit_is_set(&bitmap.read_low_msrs, IA32_LBR_STACK_END + 1));
+        // The gap 0x6A0-0x6BF (LASTBRANCH_INFO / reserved) is deliberately NOT intercepted.
+        assert!(!msr_bitmap_bit_is_set(&bitmap.read_low_msrs, 0x6A0));
+        assert!(!msr_bitmap_bit_is_set(&bitmap.read_low_msrs, 0x6BF));
+        // Immediately past the TO block also must not leak.
+        assert!(!msr_bitmap_bit_is_set(&bitmap.read_low_msrs, IA32_LBR_TO_END + 1));
     }
 }

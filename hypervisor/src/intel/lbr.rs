@@ -43,7 +43,11 @@ use {
 const IA32_DEBUGCTL: u32 = 0x1D9;
 const IA32_LASTBRANCH_TOS: u32 = 0x1C9;
 const IA32_LASTBRANCH_FROM_BASE: u32 = 0x680;
-const IA32_LASTBRANCH_TO_BASE: u32 = 0x6A0;
+/// LASTBRANCH_TO_i lives at `0x6C0 + i` on Nehalem-and-later (Intel SDM Vol 4).
+/// An earlier version of this file mistakenly used `0x6A0`, which is the
+/// LASTBRANCH_INFO_i / reserved region — so P3.1 save/restore silently
+/// missed the actual TO stack and host branches still leaked to the guest.
+const IA32_LASTBRANCH_TO_BASE: u32 = 0x6C0;
 
 /// Number of LBR entries on Raptor Lake / Alder Lake — the target CPU. Older
 /// (< Skylake) or newer CPUs may support fewer or more, but 32 is the safe

@@ -161,6 +161,19 @@ impl VmExit {
             if exit_type_advances_rip(exit_type) {
                 self.advance_guest_rip(guest_registers)?;
             }
+            // `handle_cpuid` can dispatch the diag-channel VMCALL commands via
+            // `dispatch_command`, including CMD_DEVIRTUALIZE which returns
+            // ExitHypervisor. The fast path used to skip `leave_vmx_root()`
+            // entirely, so the `launch_vm` return stub would assume VMXOFF had
+            // already run and would crash. Handle it here to keep parity with
+            // the slow path.
+            if exit_type == ExitType::ExitHypervisor {
+                if lbr_saved {
+                    crate::intel::lbr::restore_lbr();
+                }
+                self.leave_vmx_root(vmx)?;
+                return Ok(exit_type);
+            }
             reinject_idt_vectoring_event();
             super::host_idt::check_pending_nmi();
             diag::cpu_enter_phase(diag::PHASE_PRE_VMRESUME);

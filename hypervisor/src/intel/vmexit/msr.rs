@@ -31,8 +31,13 @@ const IA32_MPERF: u32 = 0xE7;
 const IA32_APERF: u32 = 0xE8;
 const IA32_DEBUGCTL: u32 = 0x1D9;
 const IA32_LASTBRANCH_TOS: u32 = 0x1C9;
-const IA32_LBR_STACK_START: u32 = 0x680;
-const IA32_LBR_STACK_END: u32 = 0x6BF;
+// Intel SDM Vol 4: 32-entry LBR stack is split into two disjoint MSR blocks —
+// LASTBRANCH_FROM_i at 0x680+i and LASTBRANCH_TO_i at 0x6C0+i. The gap 0x6A0-0x6BF
+// is LASTBRANCH_INFO / reserved and MUST NOT be treated as part of the TO stack.
+const IA32_LBR_FROM_START: u32 = 0x680;
+const IA32_LBR_FROM_END: u32 = 0x69F;
+const IA32_LBR_TO_START: u32 = 0x6C0;
+const IA32_LBR_TO_END: u32 = 0x6DF;
 
 /// Enum representing the type of MSR access.
 ///
@@ -232,7 +237,8 @@ where
     // read broke kernel LBR/BTB users at boot (2026-07-09 BSOD 0x50 at
     // fffff8057ea8086f). Counters still tell us if EAC polls LBR stack.
     if msr == IA32_LASTBRANCH_TOS
-        || (IA32_LBR_STACK_START..=IA32_LBR_STACK_END).contains(&msr)
+        || (IA32_LBR_FROM_START..=IA32_LBR_FROM_END).contains(&msr)
+        || (IA32_LBR_TO_START..=IA32_LBR_TO_END).contains(&msr)
     {
         match access_type {
             MsrAccessType::Read => {
@@ -542,7 +548,13 @@ mod tests {
 
     #[test]
     fn lbr_stack_reads_pass_through_hardware() {
-        for msr in [IA32_LASTBRANCH_TOS, IA32_LBR_STACK_START, 0x69F, IA32_LBR_STACK_END] {
+        for msr in [
+            IA32_LASTBRANCH_TOS,
+            IA32_LBR_FROM_START,
+            IA32_LBR_FROM_END,
+            IA32_LBR_TO_START,
+            IA32_LBR_TO_END,
+        ] {
             let mut regs = GuestRegisters::default();
             regs.rcx = msr as u64;
             let read_exit = handle_msr_access_test(
@@ -563,7 +575,7 @@ mod tests {
     #[test]
     fn lbr_stack_writes_reach_hardware() {
         let mut regs = GuestRegisters::default();
-        regs.rcx = IA32_LBR_STACK_START as u64;
+        regs.rcx = IA32_LBR_FROM_START as u64;
         regs.rax = 0x1234_5678;
         regs.rdx = 0x9abc_def0;
         let mut hw_wrote = None;
@@ -575,7 +587,7 @@ mod tests {
             |_| panic!("LBR stack write must not #GP"),
         );
         assert_eq!(exit, ExitType::IncrementRIP);
-        assert_eq!(hw_wrote, Some((IA32_LBR_STACK_START, 0x9abc_def0_1234_5678)));
+        assert_eq!(hw_wrote, Some((IA32_LBR_FROM_START, 0x9abc_def0_1234_5678)));
     }
 
     #[test]

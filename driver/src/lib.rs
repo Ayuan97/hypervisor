@@ -316,6 +316,7 @@ fn virtualize_system_claimed() -> NTSTATUS {
     register_bugcheck_callback();
 
     if let Some(status) = boot_stage(240) {
+        deregister_bugcheck_callback();
         return status;
     }
     match hv.virtualize_core() {
@@ -333,6 +334,10 @@ fn virtualize_system_claimed() -> NTSTATUS {
                 let hv = Box::new(hv);
                 HYPERVISOR.store(Box::into_raw(hv), Ordering::Release);
             }
+            // We are about to unload the driver image but the callback record
+            // still points into it — deregister first or the next bugcheck
+            // would call into freed pages.
+            deregister_bugcheck_callback();
             return status;
         }
     }

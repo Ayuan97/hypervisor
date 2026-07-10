@@ -127,8 +127,8 @@ if exist "%PROBE%" (
 
 echo.
 echo [6/7] Ready check complete.
-if 1==1 (
-    echo [!] DIAG MODE: diagnostic channel left open for monitoring.
+if defined HV_NO_SEAL (
+    echo [!] HV_NO_SEAL set: diagnostic channel left open for monitoring.
 ) else (
     echo [7/7] Sealing diagnostic channel...
     if exist "%PING%" (
