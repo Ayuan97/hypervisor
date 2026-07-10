@@ -122,7 +122,12 @@ unsafe fn register_driver_unload(driver_object: PDRIVER_OBJECT) {
 unsafe extern "C" fn driver_unload(_driver_object: PDRIVER_OBJECT) {
     // Deregister the bug-check callback before releasing driver memory —
     // a stale entry in the kernel callback list would fire into freed pages.
-    deregister_bugcheck_callback();
+    // We cannot actually abort unload if this fails (Windows does not honor
+    // a rejection here); the best we can do is loud logging so the crash
+    // dump has a hint.
+    if !deregister_bugcheck_callback() {
+        log::error!("driver_unload proceeding with bug-check callback still linked");
+    }
     hypervisor::intel::client_read::stop_worker();
     let hv = HYPERVISOR.swap(null_mut(), Ordering::AcqRel);
     if !hv.is_null() && hv != hypervisor_initializing() {

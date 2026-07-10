@@ -213,15 +213,28 @@ pub fn register_bugcheck_callback() {
 
 /// Deregister the bug-check callback. Must run before driver unload —
 /// leaving a stale callback in the kernel list would fire into freed memory.
-pub fn deregister_bugcheck_callback() {
+///
+/// Returns true iff the callback was successfully deregistered (or was not
+/// registered in the first place). A false return means the kernel refused
+/// deregistration and the callback record is still linked in — proceeding
+/// with driver unload in that state is dangerous.
+pub fn deregister_bugcheck_callback() -> bool {
     if !BUGCHECK_CALLBACK_REGISTERED.load(Ordering::Acquire) {
-        return;
+        return true;
     }
     let record = BUGCHECK_CALLBACK_RECORD.0.get();
-    unsafe {
-        KeDeregisterBugCheckCallback(record as PKBUGCHECK_CALLBACK_RECORD);
+    let ok = unsafe { KeDeregisterBugCheckCallback(record as PKBUGCHECK_CALLBACK_RECORD) };
+    if ok != 0 {
+        BUGCHECK_CALLBACK_REGISTERED.store(false, Ordering::Release);
+        true
+    } else {
+        // Keep REGISTERED=true so any subsequent unload attempts try again
+        // rather than assuming the record is safely unlinked.
+        log::error!(
+            "KeDeregisterBugCheckCallback failed; bug-check record still linked into kernel list"
+        );
+        false
     }
-    BUGCHECK_CALLBACK_REGISTERED.store(false, Ordering::Release);
 }
 
 #[link(name = "ntoskrnl")]
