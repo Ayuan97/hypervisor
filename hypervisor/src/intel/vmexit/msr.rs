@@ -3,10 +3,10 @@
 //! intercepted and handled, with support for injecting faults for unauthorized accesses.
 
 use crate::{
-    intel::{events::EventInjection, vmexit::ExitType},
+    intel::{events::EventInjection, support, vmexit::ExitType},
     utils::capture::GuestRegisters,
 };
-use x86::msr;
+use x86::{msr, vmx::vmcs};
 
 const IA32_FEATURE_CONTROL_MSR: u32 = 0x3a;
 const IA32_TSC_AUX: u32 = 0xC000_0103;
@@ -205,15 +205,21 @@ where
         }
     }
 
-    // IA32_DEBUGCTL: pass through both directions after the first attempt
-    // to shadow-virtualise triggered a boot-time PAGE_FAULT_IN_NONPAGED_AREA
-    // (2026-07-09). Windows kernel relies on DEBUGCTL bits being consistent
-    // with the actual hardware state for LBR / BTS. Counters still fire so
-    // we can see whether EAC probes DEBUGCTL.
+    // IA32_DEBUGCTL: route through the VMCS guest-state field, NOT bare
+    // hardware. On VM-exit, Intel SDM 27.5.1 unconditionally clears the
+    // *hardware* IA32_DEBUGCTL to 0; the guest's real value is saved to
+    // GUEST_IA32_DEBUGCTL_FULL (SAVE_DEBUG_CONTROLS is default-1). If we
+    // read hardware here, the guest sees 0 no matter what they wrote.
+    // If we write hardware here, VM-entry immediately overwrites it from
+    // the guest area on the next VMRESUME so the guest still sees the
+    // stale value. EAC probes DEBUGCTL specifically to check
+    // write-then-read consistency — the old handler flunked that check,
+    // exposing us as a hypervisor and triggering a bugcheck-IPI freeze.
     if msr == IA32_DEBUGCTL {
         match access_type {
             MsrAccessType::Read => {
-                let value = read_msr(msr);
+                let value = support::vmread_checked(vmcs::guest::IA32_DEBUGCTL_FULL)
+                    .unwrap_or(0);
                 guest_registers.rax = value & 0xFFFF_FFFF;
                 guest_registers.rdx = value >> 32;
                 super::super::diag::DEBUGCTL_READ_COUNT
@@ -223,7 +229,7 @@ where
             MsrAccessType::Write => {
                 let value =
                     ((guest_registers.rdx as u64) << 32) | (guest_registers.rax as u64 & 0xFFFF_FFFF);
-                write_msr(msr, value);
+                let _ = support::vmwrite_checked(vmcs::guest::IA32_DEBUGCTL_FULL, value);
                 super::super::diag::LBR_DEBUGCTL_SHADOW
                     .store(value, core::sync::atomic::Ordering::Relaxed);
                 super::super::diag::DEBUGCTL_WRITE_COUNT
@@ -503,48 +509,12 @@ mod tests {
         }
     }
 
-    #[test]
-    fn debugctl_read_passes_through_hardware_value() {
-        let mut regs = GuestRegisters::default();
-        regs.rcx = IA32_DEBUGCTL as u64;
-        let exit = handle_msr_access_with(
-            &mut regs,
-            MsrAccessType::Read,
-            |m| {
-                assert_eq!(m, IA32_DEBUGCTL);
-                0x0000_0000_0000_0055
-            },
-            |_, _| panic!("DEBUGCTL read must not touch write closure"),
-            |_| panic!("DEBUGCTL read must not #GP"),
-        );
-        assert_eq!(exit, ExitType::IncrementRIP);
-        assert_eq!(regs.rax, 0x55);
-        assert_eq!(regs.rdx, 0);
-    }
-
-    #[test]
-    fn debugctl_write_reaches_hardware_and_updates_shadow() {
-        crate::intel::diag::LBR_DEBUGCTL_SHADOW.store(0, core::sync::atomic::Ordering::Relaxed);
-        let mut regs = GuestRegisters::default();
-        regs.rcx = IA32_DEBUGCTL as u64;
-        regs.rax = 0x0000_00FF;
-        regs.rdx = 0x1122_3344;
-        let mut hw_wrote = None;
-        let exit = handle_msr_access_with(
-            &mut regs,
-            MsrAccessType::Write,
-            |_| panic!("DEBUGCTL write must not read hardware"),
-            |m, v| hw_wrote = Some((m, v)),
-            |_| panic!("DEBUGCTL write must not #GP"),
-        );
-        assert_eq!(exit, ExitType::IncrementRIP);
-        assert_eq!(hw_wrote, Some((IA32_DEBUGCTL, 0x1122_3344_0000_00FF)));
-        assert_eq!(
-            crate::intel::diag::LBR_DEBUGCTL_SHADOW
-                .load(core::sync::atomic::Ordering::Relaxed),
-            0x1122_3344_0000_00FF
-        );
-    }
+    // DEBUGCTL read/write now bypass the `read_msr`/`write_msr` closures
+    // entirely: they go through `support::vmread_checked` /
+    // `vmwrite_checked` on the VMCS guest-state field, which the unit
+    // tests can't mock without a live VMCS. Exercise this path in the
+    // Windows integration self-check (`cpuid_ping` DEBUGCTL counters
+    // reflect that guest writes now round-trip back correctly) instead.
 
     #[test]
     fn lbr_stack_reads_pass_through_hardware() {
