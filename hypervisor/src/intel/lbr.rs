@@ -10,22 +10,24 @@
 //! session eventually froze even though the P1 CPUID/MSR consistency was
 //! clean.
 //!
-//! Strategy on every VM-exit:
-//! 1. Read guest `IA32_DEBUGCTL`. If LBR bit (0) is clear, guest is not
-//!    using LBR — skip everything. Zero-cost fast path.
-//! 2. Otherwise snapshot all 32 pairs of LBR stack MSRs plus TOS to a
-//!    per-CPU buffer, then clear the LBR bit in DEBUGCTL so host code that
-//!    runs between here and VMRESUME does NOT pollute the stack.
-//! 3. Before VMRESUME, write the saved values back and restore DEBUGCTL.
-//!    Guest wakes up seeing the LBR state it had at the moment of VM-exit,
-//!    with zero host branches leaked.
+//! Strategy on every VM-exit (P3.5 asm-freeze + Rust stack save layout):
+//! 1. `vmexit_stub` in vmlaunch.rs samples DEBUGCTL and unconditionally
+//!    clears bit 0 (LBR) BEFORE any conditional/call runs, then stashes the
+//!    original DEBUGCTL into `GuestRegisters::saved_debugctl`.
+//! 2. Rust's `save_and_disable_lbr(guest_debugctl)` reads that stashed
+//!    value. If bit 0 was clear, guest was not recording — nothing to save.
+//!    Otherwise snapshot all 32 pairs of LBR stack MSRs plus TOS to a
+//!    per-CPU buffer. Hardware is already frozen so no host branch will
+//!    overwrite the snapshot between here and VMRESUME.
+//! 3. Before VMRESUME the mirror `restore_lbr()` writes the stack MSRs
+//!    back if we saved. `vmexit_restore` in vmlaunch.rs then rewrites
+//!    hardware DEBUGCTL with the stashed guest value, re-arming LBR
+//!    if the guest had it on.
 //!
-//! There is still a *small* leak window between VMX-root entry (top of the
-//! asm VM-exit stub) and the point where `save_and_disable_lbr()` runs. A
-//! future pass could hoist the save into the assembly stub itself for a
-//! fully clean picture; the current Rust-level approach cuts leakage down
-//! from "every host branch in the exit handler" to "the ~20-30 branches of
-//! the asm stub", which is enough to break the detection pattern EAC used.
+//! Leak window before P3.5: ~20-30 host branches from Rust prologue to
+//! save call would land in the LBR stack. After P3.5: zero host branches
+//! reach LBR — asm freezes hardware in straight-line code before any
+//! branch executes, and Rust never touches DEBUGCTL bit 0 again.
 //!
 //! Cost: 66 RDMSR + 66 WRMSR per VM-exit (~6600 cycles). Only paid when
 //! the guest actually has LBR enabled — Windows kernel does not turn it on
@@ -40,7 +42,9 @@ use {
     },
 };
 
-const IA32_DEBUGCTL: u32 = 0x1D9;
+// IA32_DEBUGCTL (0x1D9) is no longer touched from Rust — vmexit_stub /
+// vmexit_restore own the freeze+restore. Left as a comment marker so
+// grep(1) can still find the ownership handoff.
 const IA32_LASTBRANCH_TOS: u32 = 0x1C9;
 const IA32_LASTBRANCH_FROM_BASE: u32 = 0x680;
 /// LASTBRANCH_TO_i lives at `0x6C0 + i` on Nehalem-and-later (Intel SDM Vol 4).
@@ -113,20 +117,27 @@ fn cpu_slot() -> &'static mut LbrSlot {
     unsafe { &mut *SLOTS.0[cpu_index()].get() }
 }
 
-/// If the guest currently has LBR recording enabled, snapshot the entire
-/// LBR stack + DEBUGCTL to a per-CPU buffer and disable recording so host
-/// handler branches do not leak into it. Called from the VM-exit prologue.
+/// Snapshot the LBR stack to a per-CPU buffer if the guest had LBR
+/// recording on. Called from the VM-exit prologue after the asm stub has
+/// already frozen hardware DEBUGCTL bit 0 and stashed the original guest
+/// value in `GuestRegisters::saved_debugctl`.
 ///
-/// Returns true iff the state was saved (i.e. `restore_lbr()` must run
+/// `guest_debugctl` is that stashed original — bit 0 tells us whether the
+/// guest had LBR enabled (i.e. whether the current stack contents belong
+/// to the guest and must be preserved across the VM-exit round-trip).
+///
+/// Returns true iff the stack was saved (i.e. `restore_lbr()` must run
 /// before VMRESUME to reverse this).
 #[inline]
-pub fn save_and_disable_lbr() -> bool {
-    let debugctl = unsafe { x86::msr::rdmsr(IA32_DEBUGCTL) };
+pub fn save_and_disable_lbr(guest_debugctl: u64) -> bool {
+    // NB: hardware DEBUGCTL bit 0 is already 0 at this point (asm cleared
+    // it). We do NOT touch DEBUGCTL from Rust anymore — vmexit_restore
+    // rewrites the stashed original just before VMRESUME.
     let slot = cpu_slot();
-    slot.debugctl = debugctl;
-    if (debugctl & 1) == 0 {
-        // LBR was not on; nothing to save and no host branches would land
-        // in the stack anyway. Fast path — 1 RDMSR total.
+    slot.debugctl = guest_debugctl;
+    if (guest_debugctl & 1) == 0 {
+        // LBR was not on for the guest; stack contents are stale garbage
+        // from prior state, not worth saving. Fast path — zero MSRs.
         return false;
     }
     slot.tos = unsafe { x86::msr::rdmsr(IA32_LASTBRANCH_TOS) };
@@ -136,31 +147,25 @@ pub fn save_and_disable_lbr() -> bool {
         slot.to[i] = unsafe { x86::msr::rdmsr(IA32_LASTBRANCH_TO_BASE + i as u32) };
         i += 1;
     }
-    // Freeze LBR recording while we're in host mode so subsequent branches
-    // do not overwrite the stack we just captured.
-    unsafe { x86::msr::wrmsr(IA32_DEBUGCTL, debugctl & !1) };
     diag::LBR_SAVE_COUNT.fetch_add(1, Relaxed);
     true
 }
 
-/// Restore the LBR stack + DEBUGCTL captured by the matching
-/// `save_and_disable_lbr()`. Called just before VMRESUME so the guest sees
-/// the branch history it had at the moment of VM-exit — with no host code
-/// stitched into the middle of the stack.
+/// Restore the LBR stack captured by the matching `save_and_disable_lbr()`.
+/// Called just before VMRESUME so the guest sees the branch history it had
+/// at the moment of VM-exit — with no host code stitched into it.
 ///
 /// Safe to call unconditionally; if `save_and_disable_lbr()` returned false
-/// (i.e. LBR wasn't enabled), this restores DEBUGCTL to what the guest had
-/// and does not touch the stack MSRs.
+/// (i.e. LBR wasn't enabled), this is a no-op — vmexit_restore's WRMSR to
+/// DEBUGCTL is what re-arms LBR on the guest side.
 #[inline]
 pub fn restore_lbr() {
     let slot = cpu_slot();
     let debugctl = slot.debugctl;
     if (debugctl & 1) == 0 {
-        // LBR wasn't recording at exit; nothing to restore beyond DEBUGCTL
-        // itself. Even that write is only needed if host code touched it,
-        // which we don't do in the fast path — but write anyway to be
-        // strictly correct.
-        unsafe { x86::msr::wrmsr(IA32_DEBUGCTL, debugctl) };
+        // Guest didn't have LBR on; nothing in the stack belongs to it.
+        // vmexit_restore will still WRMSR the original DEBUGCTL for us so
+        // guest state is coherent — we just don't touch stack MSRs.
         return;
     }
     unsafe { x86::msr::wrmsr(IA32_LASTBRANCH_TOS, slot.tos) };
@@ -170,7 +175,5 @@ pub fn restore_lbr() {
         unsafe { x86::msr::wrmsr(IA32_LASTBRANCH_TO_BASE + i as u32, slot.to[i]) };
         i += 1;
     }
-    // Re-enable LBR by writing back the original DEBUGCTL last.
-    unsafe { x86::msr::wrmsr(IA32_DEBUGCTL, debugctl) };
     diag::LBR_RESTORE_COUNT.fetch_add(1, Relaxed);
 }

@@ -76,6 +76,7 @@ core::arch::global_asm!(
 .set registers_xmm15, 0x180
 .set registers_mxcsr, 0x190
 .set mxcsr_safe_scratch, 0x194
+.set registers_saved_debugctl, 0x198
 .set vmstack_original_rsp, 0x8
 .set vmstack_host_xmm6, 0x10
 .set vmstack_host_xmm7, 0x20
@@ -251,6 +252,19 @@ vmexit_stub:
     mov     dword ptr [r15 + mxcsr_safe_scratch], 0x1F80
     ldmxcsr [r15 + mxcsr_safe_scratch]
 
+    // P3.5 LBR asm-level freeze: sample DEBUGCTL and unconditionally clear
+    // bit 0 (LBR) so no Rust-side branch pollutes the LBR stack. The
+    // original value is stashed in registers_saved_debugctl for the
+    // symmetric restore right before VMRESUME. Straight-line code (no
+    // conditional jumps) so we do not create the very LBR entry we are
+    // trying to avoid.
+    mov     ecx, 0x1D9                          // IA32_DEBUGCTL
+    rdmsr                                       // edx:eax = current DEBUGCTL
+    mov     [r15 + registers_saved_debugctl], eax
+    mov     [r15 + registers_saved_debugctl + 4], edx
+    and     eax, 0xFFFFFFFE                     // clear LBR bit (bit 0)
+    wrmsr                                       // hardware LBR now frozen
+
     // Set rcx to point to the saved guest registers for `vmexit_handler` (1st parameter).
     mov rcx, r15
 
@@ -286,6 +300,15 @@ vmexit_stub:
 vmexit_restore:
     // Retrieve pointer to guest registers for restoration.
     mov     r15, [rsp]
+
+    // P3.5 LBR asm-level restore: rewrite DEBUGCTL with the original guest
+    // value we stashed on VM-exit. WRMSR clobbers eax/ecx/edx but the guest
+    // rax/rcx/rdx are restored right below, so the clobber is invisible.
+    // Straight-line — no conditional jump — matches the freeze side.
+    mov     ecx, 0x1D9                          // IA32_DEBUGCTL
+    mov     eax, [r15 + registers_saved_debugctl]
+    mov     edx, [r15 + registers_saved_debugctl + 4]
+    wrmsr
 
     // Restore guest registers for next VM entry.
     mov     rax, [r15 + registers_rax]
@@ -329,6 +352,14 @@ vmexit_restore:
 vmexit_devirtualize_restore:
     // Retrieve pointer to guest registers for restoration.
     mov     r15, [rsp]
+
+    // P3.5 LBR restore for the devirtualize path — this branch bypasses
+    // vmexit_restore and would otherwise leave hardware DEBUGCTL with bit
+    // 0 cleared, permanently disabling guest LBR after the HV unloads.
+    mov     ecx, 0x1D9                          // IA32_DEBUGCTL
+    mov     eax, [r15 + registers_saved_debugctl]
+    mov     edx, [r15 + registers_saved_debugctl + 4]
+    wrmsr
 
     // Build an iret-like tail on the guest stack: RFLAGS then RIP.
     mov     rax, [r15 + registers_rsp]
