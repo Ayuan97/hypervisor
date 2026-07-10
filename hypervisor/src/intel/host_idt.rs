@@ -97,6 +97,7 @@ extern "C" {
     fn host_df_handler();
     fn host_default_handler();
     fn host_default_soft_handler();
+    fn host_default_soft_ext_handler();
 }
 
 // ---------------------------------------------------------------------------
@@ -654,6 +655,45 @@ core::arch::global_asm!(
 );
 
 // ---------------------------------------------------------------------------
+// Assembly: SOFT handler for external interrupt vectors 32-255.
+//
+// Same as the arch soft handler above but also writes to the x2APIC EOI MSR
+// (IA32_X2APIC_EOI = 0x80B) before IRET. Without EOI the LAPIC ISR bit for
+// the current vector stays set and same-or-lower-priority interrupts get
+// blocked on this CPU until the next IRQL fence, which manifests as a
+// gradual APIC starve — one of the possible R6 freeze contributors.
+//
+// The 13700KF target we ship on always runs in x2APIC mode (Windows 10+
+// requires it on Ice Lake+). Assumes x2APIC without checking `IA32_APIC_BASE.EXTD`
+// (bit 10) — on the rare xAPIC-only system this WRMSR would #GP and our #GP
+// handler would tear down the CPU. Given the deployment target that trade
+// is acceptable.
+// ---------------------------------------------------------------------------
+core::arch::global_asm!(
+    ".global host_default_soft_ext_handler",
+    "host_default_soft_ext_handler:",
+    "push rax",
+    "push rcx",
+    "push rdx",
+    "lea rax, [rip + {soft_count}]",
+    "lock inc qword ptr [rax]",
+    "mov rax, [rsp + 0x18]",       // RIP (no error code for external ints)
+    "lea rcx, [rip + {soft_rip}]",
+    "mov [rcx], rax",
+    // x2APIC EOI: WRMSR 0x80B with edx:eax = 0
+    "mov ecx, 0x80B",
+    "xor eax, eax",
+    "xor edx, edx",
+    "wrmsr",
+    "pop rdx",
+    "pop rcx",
+    "pop rax",
+    "iretq",
+    soft_count = sym HOST_DEFAULT_SOFT_COUNT,
+    soft_rip = sym HOST_DEFAULT_SOFT_RIP,
+);
+
+// ---------------------------------------------------------------------------
 // Rust helpers
 // ---------------------------------------------------------------------------
 
@@ -727,16 +767,24 @@ pub fn check_pending_nmi() {
 /// in VMX-root with IF=0.
 pub fn patch_host_idt(idt: &mut [u64]) {
     let default = expected_default_handler();
-    let soft = expected_default_soft_handler();
+    let soft_arch = expected_default_soft_handler();
+    let soft_ext = expected_default_soft_ext_handler();
     let max_vectors = idt.len() / 2;
-    // Vectors 0-21 (real architectural exceptions we don't handle specifically)
-    // get the halting default handler — if any of them fires in host mode it
-    // is almost certainly a bug that we want to freeze on to preserve state.
-    // Vectors 22-31 (Intel reserved — no defined error code) and 32-255
-    // (external interrupts — no error code by SDM) get the SOFT handler that
-    // just IRETs, so a stray LAPIC-routed vector cannot silently halt a CPU.
+    // Vectors 0-21: real architectural exceptions we don't handle specifically —
+    //   halting default handler preserves state on host-side bugs.
+    // Vectors 22-31: Intel reserved — no defined error code, not LAPIC-delivered,
+    //   so a plain IRET (no EOI) is the safe choice.
+    // Vectors 32-255: external interrupts delivered via LAPIC — need an x2APIC
+    //   EOI before IRET or LAPIC ISR stays set and starves subsequent interrupts
+    //   at the same priority level.
     for vector in 0..max_vectors.min(256) {
-        let handler = if vector < 22 { default } else { soft };
+        let handler = if vector < 22 {
+            default
+        } else if vector < 32 {
+            soft_arch
+        } else {
+            soft_ext
+        };
         patch_idt_entry(idt, vector, handler);
     }
     patch_idt_entry(idt, 2, expected_nmi_handler());
@@ -825,6 +873,10 @@ pub fn expected_default_handler() -> u64 {
 
 pub fn expected_default_soft_handler() -> u64 {
     host_default_soft_handler as *const () as usize as u64
+}
+
+pub fn expected_default_soft_ext_handler() -> u64 {
+    host_default_soft_ext_handler as *const () as usize as u64
 }
 
 fn host_idt_patch_mask(idt: &[u64], base: u64, limit: u64) -> u64 {
@@ -922,32 +974,30 @@ mod tests {
     }
 
     #[test]
-    fn patch_host_idt_uses_soft_handler_for_reserved_and_external_vectors() {
+    fn patch_host_idt_splits_soft_handlers_by_vector_class() {
         // Full 256-vector IDT: 256 entries * 2 u64 each = 512 u64.
         let mut idt = alloc::vec![0u64; 512];
         patch_host_idt(&mut idt);
 
-        // Intel-reserved vectors 22-31 must NOT use the halting default —
-        // that is what killed us with vector 23 in the 2026-07-09 R5 test.
+        // Intel-reserved vectors 22-31: soft-arch (plain IRET, no EOI).
         for vector in 22..=31 {
             assert_eq!(
                 idt_entry_handler(&idt, vector),
                 Some(expected_default_soft_handler()),
-                "vector {} must use soft handler",
+                "reserved vector {} must use soft-arch handler",
                 vector
             );
         }
-        // External-interrupt vectors 32, 128, 255 sample the whole range.
+        // External-interrupt vectors 32-255: soft-ext (EOI + IRET).
         for vector in [32, 128, 255] {
             assert_eq!(
                 idt_entry_handler(&idt, vector),
-                Some(expected_default_soft_handler()),
-                "external vector {} must use soft handler",
+                Some(expected_default_soft_ext_handler()),
+                "external vector {} must use soft-ext handler (EOI)",
                 vector
             );
         }
-        // Vectors 0-21 (except our specific handlers) still get the halting
-        // default — real architectural bugs should freeze host state.
+        // Vectors 0-21 (except specific handlers) keep the halting default.
         for vector in [0, 1, 3, 4, 5, 6, 7, 9, 10, 11, 12, 15, 16, 17, 19, 20, 21] {
             assert_eq!(
                 idt_entry_handler(&idt, vector),
@@ -959,8 +1009,16 @@ mod tests {
     }
 
     #[test]
-    fn expected_default_soft_handler_differs_from_halting_default() {
+    fn expected_default_soft_handlers_are_distinct_from_halting_default() {
         assert_ne!(expected_default_soft_handler(), expected_default_handler());
+        assert_ne!(
+            expected_default_soft_ext_handler(),
+            expected_default_handler()
+        );
+        assert_ne!(
+            expected_default_soft_handler(),
+            expected_default_soft_ext_handler()
+        );
     }
 
     #[test]

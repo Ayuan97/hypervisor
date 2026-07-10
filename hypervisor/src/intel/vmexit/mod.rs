@@ -149,9 +149,17 @@ impl VmExit {
         }
 
         // ── Fast path: CPUID / RDTSC / RDTSCP ──
+        // The slow path bumps EXIT_TOTAL / per-reason counters after
+        // decoding — fast paths skip that block, so they used to be
+        // invisible to `GET_COUNTER` and the freeze/watchdog logic.
+        // Bump the matching counters here so diagnostics stay honest.
+        use core::sync::atomic::Ordering::Relaxed;
         if basic_reason == 10
         /* CPUID */
         {
+            diag::EXIT_TOTAL.fetch_add(1, Relaxed);
+            diag::EXIT_CPUID.fetch_add(1, Relaxed);
+            diag::LAST_EXIT_REASON.store(exit_reason as u64, Relaxed);
             diag::cpu_enter_phase(diag::PHASE_FAST_CPUID);
             guest_registers.rip = vmread_checked(guest::RIP)?;
             diag::observe_guest_rip_for_bugcheck(guest_registers.rip, guest_registers.rcx);
@@ -186,6 +194,9 @@ impl VmExit {
         if basic_reason == 16
         /* RDTSC */
         {
+            diag::EXIT_TOTAL.fetch_add(1, Relaxed);
+            diag::EXIT_RDTSC.fetch_add(1, Relaxed);
+            diag::LAST_EXIT_REASON.store(exit_reason as u64, Relaxed);
             guest_registers.rip = vmread_checked(guest::RIP)?;
             diag::observe_guest_rip_for_bugcheck(guest_registers.rip, guest_registers.rcx);
             let exit_type = handle_rdtsc(guest_registers, vmx);
@@ -203,6 +214,9 @@ impl VmExit {
         if basic_reason == 51
         /* RDTSCP */
         {
+            diag::EXIT_TOTAL.fetch_add(1, Relaxed);
+            diag::EXIT_RDTSC.fetch_add(1, Relaxed);
+            diag::LAST_EXIT_REASON.store(exit_reason as u64, Relaxed);
             guest_registers.rip = vmread_checked(guest::RIP)?;
             diag::observe_guest_rip_for_bugcheck(guest_registers.rip, guest_registers.rcx);
             let exit_type = handle_rdtscp(guest_registers, vmx);

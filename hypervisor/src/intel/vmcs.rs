@@ -277,7 +277,7 @@ impl Vmcs {
         let requested_entry_ctl = requested_entry_controls();
         let exit_ctl = required_exit_controls();
         let requested_exit_ctl = requested_exit_controls();
-        let pinbased_ctl: u64 = if minimal_mode() || nmi_passthrough_mode() {
+        let mut pinbased_ctl: u64 = if minimal_mode() || nmi_passthrough_mode() {
             // Pass NMIs directly to the guest IDT[2] instead of exiting. This
             // matches bare-metal behaviour so an EAC self-NMI probe measuring
             // NMI-delivery latency cannot tell an HV is in the middle, and
@@ -289,6 +289,16 @@ impl Vmcs {
             (vmcs::control::PinbasedControls::NMI_EXITING.bits()
                 | vmcs::control::PinbasedControls::VIRTUAL_NMIS.bits()) as u64
         };
+        // Enable the VMX preemption timer so the freeze-stall detector in
+        // diag::freeze_check_cpuid_stall actually receives periodic exits.
+        // Without this pin-based bit set the value we write to
+        // GUEST_VMX_PREEMPTION_TIMER never counts down, EXIT_PREEMPT stays
+        // 0, and the CPUID-stall check never runs. Not requesting when
+        // minimal_mode() is on — that path deliberately keeps controls
+        // empty.
+        if !minimal_mode() {
+            pinbased_ctl |= vmcs::control::PinbasedControls::VMX_PREEMPTION_TIMER.bits() as u64;
+        }
 
         use crate::intel::diag_trace as dt;
         dt::trace("vmcs: adjusting controls");
