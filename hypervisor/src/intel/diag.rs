@@ -451,28 +451,27 @@ pub fn cpu_set_cpuid_leaf(leaf: u64) {
 }
 
 /// Called from the preemption timer handler to record where the guest was executing.
-/// Returns true if NMI should be injected (freeze detected).
+/// The counter is still updated so `GET_CTL 4` can surface long-idle CPUs for
+/// diagnostics, but we never return true — the automatic NMI-injection path
+/// turned out to be a self-inflicted BSOD 0x80 NMI_HARDWARE_FAILURE on any
+/// CPU that legitimately stayed in a HLT/MWAIT idle loop long enough (~9-15s
+/// of uninterrupted deep C-state) to trip the 200-fire threshold. Every
+/// silent freeze we chased for weeks may have been us NMI-ing our own guest.
+/// A future real-freeze detector needs a signal that can distinguish idle
+/// from stall (e.g. VM-exit rate on the same CPU), not just guest RIP.
 #[inline]
 pub fn cpu_record_timer_rip(rip: u64) -> bool {
     let cpu = rdtscp_aux() as usize & 0x3F;
     let prev = CPU_TIMER_RIP[cpu].swap(rip, Relaxed);
     if (prev >> 7) == (rip >> 7) {
-        let count = CPU_TIMER_RIP_COUNT[cpu].fetch_add(1, Relaxed) + 1;
-        // After 200 consecutive fires in same 128B block (~15s):
-        // inject NMI to force BSOD + crash dump (normal idle max ~45)
-        if count == 200 && !FREEZE_NMI_FIRED.load(Relaxed) {
-            if FREEZE_NMI_FIRED.compare_exchange(false, true, Relaxed, Relaxed).is_ok() {
-                FREEZE_DETECTED.store(true, Relaxed);
-                return true;
-            }
-        }
+        CPU_TIMER_RIP_COUNT[cpu].fetch_add(1, Relaxed);
     } else {
         CPU_TIMER_RIP_COUNT[cpu].store(0, Relaxed);
     }
     false
 }
 
-static FREEZE_NMI_FIRED: AtomicBool = AtomicBool::new(false);
+// FREEZE_NMI_FIRED removed — gated the auto-NMI path that BSOD'd on idle.
 
 /// Write just this CPU's RIP to CMOS. Uses extended CMOS (ports 0x72/0x73)
 /// which BIOS POST typically does NOT clear.
