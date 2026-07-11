@@ -67,11 +67,22 @@ static HOOK_LATCHED: AtomicBool = AtomicBool::new(false);
 
 const WATCH_LEN: u64 = 128; // same conservative window diag.rs uses
 
+/// When set at compile time via `HV_NO_ENTRY_HOOK=1 cargo build ...` the
+/// entry hook installation is skipped so runs measuring overhead-free
+/// baseline behaviour aren't paying the spurious-step-through cost. We
+/// leave the code path in place because we still need CTL ids 70-76 to
+/// return the sentinel state (all zero) that cpuid_ping expects.
+const HOOK_DISABLED: bool = option_env!("HV_NO_ENTRY_HOOK").is_some();
+
 /// Resolve KeBugCheckEx, split the containing 2 MiB EPT entry, and cloak
 /// the 4 KiB page (READ_WRITE only — no execute). Idempotent: if the
 /// address cannot be resolved or the page split fails, the hook is simply
 /// left disabled (HOOK_PAGE_PA stays 0). Never fatal to driver init.
 pub fn install(ept: &mut Ept) {
+    if HOOK_DISABLED {
+        log::info!("bugcheck_hook: HV_NO_ENTRY_HOOK set, install skipped");
+        return;
+    }
     let addr = get_ntoskrnl_export("KeBugCheckEx");
     if addr.is_null() {
         log::warn!("bugcheck_hook: KeBugCheckEx resolution failed, hook disabled");
