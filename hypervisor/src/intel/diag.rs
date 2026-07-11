@@ -672,7 +672,7 @@ pub fn cmos_read_freeze(field: u64) -> u64 {
             let b3 = cmos_read(0x75) as u64;
             b0 | (b1 << 8) | (b2 << 16) | (b3 << 24)
         }
-        6 | 7 | 8 | 9 => cmos_read_step4(field),
+        6 | 7 | 8 | 9 | 10 => cmos_read_step4(field),
         _ => u64::MAX,
     }
 }
