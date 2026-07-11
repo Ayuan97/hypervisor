@@ -346,6 +346,7 @@ pub fn cmos_read_step4(field: u64) -> u64 {
             ext_cmos_write(CMOS_OFF_KBCHK_ARG0_3, 0);
             ext_cmos_write(CMOS_OFF_FIRST_CPU, 0);
             ext_cmos_write(CMOS_OFF_BUGCHECK_ENTRY_HOOK, 0);
+            ext_cmos_write(CMOS_OFF_BUGCHECK_CB_FLAG, 0);
             CMOS_LAST_HITS.store(u64::MAX, Relaxed);
             CMOS_LAST_VECTOR.store(u64::MAX, Relaxed);
             CMOS_LAST_TOTAL.store(u64::MAX, Relaxed);
