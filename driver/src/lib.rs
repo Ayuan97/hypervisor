@@ -297,6 +297,11 @@ fn virtualize_system_claimed() -> NTSTATUS {
         return 0xE0030000u32 as NTSTATUS;
     }
 
+    // Install EPT-execute hook on nt!KeBugCheckEx BEFORE handing the EPT
+    // off to SharedData::new — that consumes primary_ept into a Box and we
+    // lose &mut access. Failure to install is non-fatal (hook stays off).
+    hypervisor::intel::bugcheck_hook::install(&mut *primary_ept);
+
     if let Some(status) = boot_stage(220) {
         return status;
     }

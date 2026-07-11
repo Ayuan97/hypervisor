@@ -1,7 +1,9 @@
 use {
     crate::{
         intel::{
+            bugcheck_hook,
             events::EventInjection,
+            invept::invept_all_contexts,
             support::{vmread_checked, vmwrite_checked},
             vmerror::EptViolationExitQualification,
             vmexit::ExitType,
@@ -9,17 +11,13 @@ use {
         },
         utils::capture::GuestRegisters,
     },
-    x86::vmx::vmcs,
+    x86::vmx::vmcs::{self, guest as vmcs_guest},
 };
-
-#[cfg(feature = "secondary-ept")]
-use crate::intel::invept::invept_all_contexts;
 
 fn monitor_trap_flag_bit() -> u64 {
     vmcs::control::PrimaryControls::MONITOR_TRAP_FLAG.bits() as u64
 }
 
-#[cfg(any(feature = "secondary-ept", test))]
 fn enable_monitor_trap_flag(proc_ctl: u64) -> u64 {
     proc_ctl | monitor_trap_flag_bit()
 }
@@ -63,6 +61,44 @@ pub fn handle_ept_violation(_guest_registers: &mut GuestRegisters, _vmx: &mut Vm
         log::error!("EPT violation: unmapped PA {:#x} (no RWX)", guest_physical_address);
         EventInjection::vmentry_inject_gp(0);
         return ExitType::Continue;
+    }
+
+    // KeBugCheckEx entry-hook: cloak page (RW only) triggers instruction-
+    // fetch violations. If guest RIP is inside the watched function, latch
+    // the hit and permanently uncloak; otherwise MTF single-step past the
+    // neighbouring instruction and re-cloak in the MTF handler.
+    if eq.instruction_fetch && bugcheck_hook::matches(guest_physical_address) {
+        let guest_rip = vmread_checked(vmcs_guest::RIP).unwrap_or(0);
+        let ept = &mut *_vmx.shared_data_mut().primary_ept;
+        match bugcheck_hook::check_ept_violation(guest_physical_address, guest_rip, ept) {
+            bugcheck_hook::HookOutcome::Latched => {
+                return ExitType::Continue;
+            }
+            bugcheck_hook::HookOutcome::NeedsStep => {
+                let proc_ctl = match vmread_checked(vmcs::control::PRIMARY_PROCBASED_EXEC_CONTROLS) {
+                    Ok(v) => v,
+                    Err(_) => {
+                        // Arm state is inconsistent; leave the page executable and
+                        // give up on re-cloaking rather than corrupt guest state.
+                        return ExitType::Continue;
+                    }
+                };
+                if vmwrite_checked(
+                    vmcs::control::PRIMARY_PROCBASED_EXEC_CONTROLS,
+                    enable_monitor_trap_flag(proc_ctl),
+                )
+                .is_err()
+                {
+                    return ExitType::Continue;
+                }
+                _vmx.bugcheck_hook_mtf_recloak = true;
+                return ExitType::Continue;
+            }
+            bugcheck_hook::HookOutcome::NotOurs => {
+                // Fall through — shouldn't happen given the matches() gate
+                // above, but be safe.
+            }
+        }
     }
 
     #[cfg(feature = "secondary-ept")]
@@ -144,6 +180,13 @@ pub fn handle_mtf(vmx: &mut Vmx) -> ExitType {
             }
             invept_all_contexts();
         }
+    }
+
+    if vmx.bugcheck_hook_mtf_recloak {
+        vmx.bugcheck_hook_mtf_recloak = false;
+        let ept = &mut *vmx.shared_data_mut().primary_ept;
+        bugcheck_hook::recloak_after_step(ept);
+        invept_all_contexts();
     }
 
     let proc_ctl = match vmread_checked(vmcs::control::PRIMARY_PROCBASED_EXEC_CONTROLS) {

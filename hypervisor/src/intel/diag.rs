@@ -169,6 +169,26 @@ pub fn note_bugcheck_callback_fired() {
     ext_cmos_write(CMOS_OFF_BUGCHECK_CB_FLAG, CMOS_MAGIC_BUGCHECK_CB);
 }
 
+/// CMOS extended offset 0x1E carries a `0xE1` magic once the EPT-execute
+/// hook installed on `nt!KeBugCheckEx` has recorded a confirmed hit — i.e.
+/// the guest actually entered KeBugCheckEx (before any callback dispatch,
+/// so this fires strictly earlier than `BUGCHECK_CALLBACK_FIRED`). Read
+/// via `CMD_READ_CMOS_FREEZE` field 10.
+const CMOS_OFF_BUGCHECK_ENTRY_HOOK: u8 = 0x1E;
+const CMOS_MAGIC_BUGCHECK_ENTRY_HOOK: u8 = 0xE1;
+
+pub static BUGCHECK_ENTRY_HOOK_FIRED: AtomicU64 = AtomicU64::new(0);
+
+/// Called from `bugcheck_hook::latch_and_uncloak` when the EPT-execute hook
+/// catches guest RIP inside the KeBugCheckEx watch window. Same idea as
+/// `note_bugcheck_callback_fired` but fires at bugcheck ENTRY rather than
+/// at callback dispatch — the two together let us tell "bugcheck never
+/// started" from "bugcheck started but hung before finishing".
+pub fn note_bugcheck_entry_hook_fired() {
+    BUGCHECK_ENTRY_HOOK_FIRED.fetch_add(1, Relaxed);
+    ext_cmos_write(CMOS_OFF_BUGCHECK_ENTRY_HOOK, CMOS_MAGIC_BUGCHECK_ENTRY_HOOK);
+}
+
 pub fn set_kebugcheckex_sentinel(addr: u64, first_qword: u64) {
     KEBUGCHECKEX_ADDR.store(addr, Relaxed);
     KEBUGCHECKEX_SENTINEL.store(first_qword, Relaxed);
@@ -311,6 +331,7 @@ pub fn cmos_read_step4(field: u64) -> u64 {
             b0 | (b1 << 8) | (b2 << 16) | (b3 << 24)
         }
         9 => ext_cmos_read(CMOS_OFF_BUGCHECK_CB_FLAG) as u64,
+        10 => ext_cmos_read(CMOS_OFF_BUGCHECK_ENTRY_HOOK) as u64,
         8 => {
             // Clear all Step 1-4 CMOS bytes and reset the change-detect shadows
             // so the next boot starts from a clean slate.
@@ -324,6 +345,7 @@ pub fn cmos_read_step4(field: u64) -> u64 {
             ext_cmos_write(CMOS_OFF_KBCHK_ARG0_2, 0);
             ext_cmos_write(CMOS_OFF_KBCHK_ARG0_3, 0);
             ext_cmos_write(CMOS_OFF_FIRST_CPU, 0);
+            ext_cmos_write(CMOS_OFF_BUGCHECK_ENTRY_HOOK, 0);
             CMOS_LAST_HITS.store(u64::MAX, Relaxed);
             CMOS_LAST_VECTOR.store(u64::MAX, Relaxed);
             CMOS_LAST_TOTAL.store(u64::MAX, Relaxed);
@@ -1346,6 +1368,13 @@ pub fn control(id: u64) -> u64 {
         67 => super::host_idt::HOST_DEFAULT_SOFT_RIP.load(Relaxed),
         68 => LBR_SAVE_COUNT.load(Relaxed),
         69 => LBR_RESTORE_COUNT.load(Relaxed),
+        70 => super::bugcheck_hook::HOOK_PAGE_PA.load(Relaxed),
+        71 => super::bugcheck_hook::HOOK_FN_START_VA.load(Relaxed),
+        72 => super::bugcheck_hook::HOOK_FIRED_TSC.load(Relaxed),
+        73 => super::bugcheck_hook::HOOK_FIRED_RIP.load(Relaxed),
+        74 => super::bugcheck_hook::HOOK_FIRED_CPU.load(Relaxed),
+        75 => super::bugcheck_hook::HOOK_SPURIOUS_COUNT.load(Relaxed),
+        76 => BUGCHECK_ENTRY_HOOK_FIRED.load(Relaxed),
         _ => u64::MAX,
     }
 }

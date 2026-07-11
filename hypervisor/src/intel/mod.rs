@@ -1,3 +1,4 @@
+pub mod bugcheck_hook;
 pub mod client_read;
 pub mod controls;
 pub mod descriptor;

@@ -77,6 +77,11 @@ pub struct Vmx {
     /// Guest PA to re-cloak after MTF single-step completes.
     pub mtf_recloak_pa: Option<u64>,
 
+    /// True when the previous EPT violation on this CPU was a spurious hit
+    /// on the KeBugCheckEx cloak page (see `bugcheck_hook`), MTF is armed,
+    /// and the following MTF exit must re-cloak the page (X→0).
+    pub bugcheck_hook_mtf_recloak: bool,
+
     /// Cumulative guest TSC offset used to hide unavoidable CPUID VM-exit cost.
     pub tsc_offset: u64,
 
@@ -143,6 +148,7 @@ impl Vmx {
             guest_registers,
             shared_data: unsafe { NonNull::new_unchecked(shared_data as *mut _) },
             mtf_recloak_pa: None,
+            bugcheck_hook_mtf_recloak: false,
             tsc_offset: 0,
             cpuid_entry_tsc: 0,
         };
