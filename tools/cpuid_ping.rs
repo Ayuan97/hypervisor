@@ -721,11 +721,38 @@ fn main() {
     let bugcheck_cb_cmos = hv_cmd(CMD_READ_CMOS_FREEZE, 9);
     println!("\n=== KeBugCheckCallback ===");
     if bugcheck_cb_ram > 0 || bugcheck_cb_cmos == 0xB1 {
-        println!("  [🚨] Bug-check callback fired");
+        println!("  [!!] Bug-check callback fired");
         println!("  RAM count:  {}", bugcheck_cb_ram);
         println!("  CMOS mark:  0x{:02x} (0xB1 = fired last session)", bugcheck_cb_cmos);
     } else {
         println!("  RAM=0  CMOS=0x{:02x}  (not fired this session or last)", bugcheck_cb_cmos);
+    }
+
+    // === Bugcheck ENTRY hook (EPT-execute cloak on nt!KeBugCheckEx) ===
+    let hook_page_pa = hv_cmd(CMD_GET_CTL, 70);
+    let hook_fn_start = hv_cmd(CMD_GET_CTL, 71);
+    let hook_fired_tsc = hv_cmd(CMD_GET_CTL, 72);
+    let hook_fired_rip = hv_cmd(CMD_GET_CTL, 73);
+    let hook_fired_cpu = hv_cmd(CMD_GET_CTL, 74);
+    let hook_spurious = hv_cmd(CMD_GET_CTL, 75);
+    let hook_fired_ram = hv_cmd(CMD_GET_CTL, 76);
+    let hook_fired_cmos = hv_cmd(CMD_READ_CMOS_FREEZE, 10);
+    println!("\n=== KeBugCheckEx entry hook (EPT) ===");
+    if hook_page_pa == 0 {
+        println!("  hook NOT installed (address resolution or split failed)");
+    } else {
+        println!("  page_pa=0x{:x}  fn_start_va=0x{:x}", hook_page_pa, hook_fn_start);
+        println!("  spurious step-through count: {}", hook_spurious);
+        if hook_fired_ram > 0 || hook_fired_cmos == 0xE1 {
+            println!("  [!!] KeBugCheckEx WAS entered!");
+            println!("  RAM count:  {}", hook_fired_ram);
+            println!("  CMOS mark:  0x{:02x} (0xE1 = fired last session)", hook_fired_cmos);
+            println!("  First hit:  RIP=0x{:x}  CPU=#{}  TSC=0x{:x}",
+                hook_fired_rip, hook_fired_cpu, hook_fired_tsc);
+        } else {
+            println!("  RAM=0  CMOS=0x{:02x}  (KeBugCheckEx not entered this session or last)",
+                hook_fired_cmos);
+        }
     }
 
     // === LBR VMCS save/restore (P3.1, 2026-07-09) ===
