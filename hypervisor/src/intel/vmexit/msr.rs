@@ -29,13 +29,6 @@ const IA32_RTIT_ADDR_MSR_END: u32 = 0x58f;
 const IA32_EFER: u32 = 0xC000_0080;
 const IA32_MPERF: u32 = 0xE7;
 const IA32_APERF: u32 = 0xE8;
-/// `MSR_PKG_CST_CONFIG_CONTROL` on Intel Sandy Bridge+ platforms. Bits [2:0]
-/// advertise/limit the deepest package C-state the OS is allowed to request:
-///   000 = no limit, 001 = C1, 010 = C2, 011 = C3, 110 = C6 retention,
-///   111 = C7/C8/no limit (per model). BIOS often sets bit 15 (CFG_LOCK)
-///   to freeze the register — we shadow reads so guest OS sees a C1-only
-///   value regardless, and swallow writes so we never trip #GP on a lock.
-const MSR_PKG_CST_CONFIG_CONTROL: u32 = 0xE2;
 const IA32_DEBUGCTL: u32 = 0x1D9;
 const IA32_LASTBRANCH_TOS: u32 = 0x1C9;
 // Intel SDM Vol 4: 32-entry LBR stack is split into two disjoint MSR blocks —
@@ -212,28 +205,10 @@ where
         }
     }
 
-    // MSR_PKG_CST_CONFIG_CONTROL (0xE2): shadow reads to advertise
-    // package C-state limit = C1 (bits [2:0] = 001) regardless of what
-    // BIOS actually programmed, and swallow writes so we never trip
-    // #GP on the CFG_LOCK bit. This tells the Windows kernel not to
-    // target deep package C-states (RPL038/044 avoidance) even before
-    // the MWAIT VM-exit clamp fires. Preserve all upper bits from the
-    // hardware read so bits BIOS uses for other config stay coherent.
-    if msr == MSR_PKG_CST_CONFIG_CONTROL {
-        match access_type {
-            MsrAccessType::Read => {
-                let hw = read_msr(msr);
-                let value = (hw & !0x7) | 0x1;
-                guest_registers.rax = value & 0xFFFF_FFFF;
-                guest_registers.rdx = value >> 32;
-                return ExitType::IncrementRIP;
-            }
-            MsrAccessType::Write => {
-                // Silently drop — never touch the hardware CFG_LOCK'd MSR.
-                return ExitType::IncrementRIP;
-            }
-        }
-    }
+    // MSR_PKG_CST_CONFIG_CONTROL (0xE2) is no longer intercepted — see
+    // msr_bitmap.rs for the removal rationale. Any RDMSR/WRMSR on 0xE2
+    // that reaches here would be a bug in the bitmap, so fall through
+    // to the default #GP path below rather than silently pretending.
 
     // IA32_DEBUGCTL: route through the VMCS guest-state field, NOT bare
     // hardware. On VM-exit, Intel SDM 27.5.1 unconditionally clears the

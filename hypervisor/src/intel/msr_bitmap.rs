@@ -28,7 +28,6 @@ const IA32_TSC_AUX: u32 = 0x103;
 const IA32_EFER: u32 = 0xC000_0080;
 const IA32_MPERF: u32 = 0xE7;
 const IA32_APERF: u32 = 0xE8;
-const MSR_PKG_CST_CONFIG_CONTROL: u32 = 0xE2;
 const IA32_DEBUGCTL: u32 = 0x1D9;
 const IA32_LASTBRANCH_TOS: u32 = 0x1C9;
 // Intel SDM Vol 4: LASTBRANCH_FROM_i = 0x680 + i (32 entries), LASTBRANCH_TO_i = 0x6C0 + i (32 entries).
@@ -170,14 +169,19 @@ impl MsrBitmap {
         // by turning the intercept back on for a single measurement run
         // if we ever need it again.
 
-        // MSR_PKG_CST_CONFIG_CONTROL (0xE2). Shadow reads so the guest OS
-        // sees a package C-state limit of C1 regardless of the BIOS value —
-        // this pairs with the MWAIT/MONITOR VM-exit clamp to make sure
-        // Windows never asks for C6/C7/C8 (Raptor Lake RPL038/044 hang).
-        // Swallow writes so BIOS's CFG_LOCK bit can't fault us either.
-        set_msr_bitmap_bit(&mut self.read_low_msrs, MSR_PKG_CST_CONFIG_CONTROL);
-        set_msr_bitmap_bit(&mut self.write_low_msrs, MSR_PKG_CST_CONFIG_CONTROL);
-
+        // MSR_PKG_CST_CONFIG_CONTROL (0xE2) — NOT intercepted.
+        //
+        // Was added 2026-07-12 (5668ac1) to shadow a "limit = C1" read back
+        // to the guest, alongside a swallowed write. In practice the write
+        // path is unreachable because BIOS locks the MSR (CFG_LOCK bit 15)
+        // long before we boot, so the intercept only ever changed READS —
+        // and lying to the Windows power-management driver about the deepest
+        // supported C-state turned out to correlate with the regression from
+        // "5-hour stable HV+EAC session" to "freezes inside 2 minutes" on
+        // the same day. Removing the intercept restores what the driver
+        // actually sees on bare metal, without giving up any real
+        // stealth (0xE2's value on this box is 0-limit either way).
+        //
         // IA32_DEBUGCTL (0x1D9) + LBR TOS + LBR stack (0x680-0x6BF). Intercept
         // both directions so guest cannot observe host branches leaking into
         // LBR after a VM-exit.
@@ -288,15 +292,28 @@ mod tests {
     }
 
     #[test]
-    fn aperf_and_mperf_reads_are_intercepted() {
+    fn aperf_and_mperf_are_never_intercepted() {
+        // Windows scheduler polls both MSRs on every tick per logical CPU;
+        // intercepting them scaled to millions of exits/sec under EAC load.
+        // Both directions must stay pass-through — see msr_bitmap.rs comment.
         let mut bitmap = empty_bitmap();
         bitmap.intercept_vmx_msrs();
 
-        assert!(msr_bitmap_bit_is_set(&bitmap.read_low_msrs, IA32_MPERF));
-        assert!(msr_bitmap_bit_is_set(&bitmap.read_low_msrs, IA32_APERF));
-        // Writes to these are legal on bare metal; leave pass-through.
+        assert!(!msr_bitmap_bit_is_set(&bitmap.read_low_msrs, IA32_MPERF));
+        assert!(!msr_bitmap_bit_is_set(&bitmap.read_low_msrs, IA32_APERF));
         assert!(!msr_bitmap_bit_is_set(&bitmap.write_low_msrs, IA32_MPERF));
         assert!(!msr_bitmap_bit_is_set(&bitmap.write_low_msrs, IA32_APERF));
+    }
+
+    #[test]
+    fn pkg_cst_config_control_is_not_intercepted() {
+        // 0xE2 shadow was linked to the 5h→2min regression on 2026-07-12
+        // and removed. The intercept must not come back accidentally.
+        let mut bitmap = empty_bitmap();
+        bitmap.intercept_vmx_msrs();
+
+        assert!(!msr_bitmap_bit_is_set(&bitmap.read_low_msrs, 0xE2));
+        assert!(!msr_bitmap_bit_is_set(&bitmap.write_low_msrs, 0xE2));
     }
 
     #[test]
