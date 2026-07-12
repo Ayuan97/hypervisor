@@ -1380,6 +1380,11 @@ pub fn control(id: u64) -> u64 {
         81 => super::vmexit::idle::MWAIT_CLAMPED.load(Relaxed),
         82 => super::vmexit::idle::MONITOR_EXITS.load(Relaxed),
         83 => super::vmexit::idle::MWAIT_MAX_REQUESTED_CSTATE.load(Relaxed),
+        // Hardware MSR_PKG_CST_CONFIG_CONTROL raw read — bypasses the
+        // guest-facing shadow so we can tell whether BIOS actually set
+        // Package C State Limit or the shadow is doing all the work.
+        // bits[2:0]: 000=no limit, 001=C1, 010=C2, 011=C3, 110=C6, 111=C7/C8.
+        84 => unsafe { x86::msr::rdmsr(0xE2) },
         _ => u64::MAX,
     }
 }
