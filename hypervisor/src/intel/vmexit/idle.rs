@@ -63,9 +63,18 @@ pub static MWAIT_MAX_REQUESTED_CSTATE: AtomicU64 = AtomicU64::new(0);
 ///     7 → C7/C7s
 ///     8 → C8
 ///
-/// We clamp any request for C2+ down to C1 and satisfy the wait with a
-/// host-side `hlt`. C0/C1 requests execute the equivalent host `hlt` too —
-/// splitting the fast paths adds complexity without any measurable win.
+/// Behaviour: record diagnostics + advance guest RIP. **No host sleep.**
+/// The previous version issued `sti; hlt; cli` inside the handler; on the
+/// 2026-07-12 test that hung every CPU immediately after HV load — an
+/// interrupt path in VMX-root context we couldn't safely close from here.
+/// Advancing RIP alone gives the guest a rapid MWAIT return: Windows'
+/// idle loop treats it as a spurious wake and re-evaluates the ready
+/// queue. The guest CPU stays at C0 (spin) between real work but the
+/// physical package **never enters C6/C8** because we never issue MWAIT
+/// with those hints ourselves and MSR 0xE2 is shadowed to advertise
+/// C1-only back to the guest kernel. Combined with BIOS-level
+/// `Package C State Limit = C1`, hardware simply cannot reach the RPL038/
+/// RPL044 error window.
 #[inline]
 pub fn handle_mwait(guest_registers: &mut GuestRegisters, _vmx: &mut Vmx) -> ExitType {
     MWAIT_EXITS.fetch_add(1, Relaxed);
@@ -95,27 +104,13 @@ pub fn handle_mwait(guest_registers: &mut GuestRegisters, _vmx: &mut Vmx) -> Exi
 
     diag::cpu_enter_phase(diag::PHASE_PRE_VMRESUME);
 
-    // Host-side wait: sti + hlt + cli. This puts the physical core into
-    // C1 (or C0 if any interrupt is already pending) and returns as soon
-    // as any host-visible interrupt fires. We never enter package C6/C8
-    // because we never issue MWAIT with those hints, and MSR 0xE2 is
-    // shadowed to advertise the same clamp back to the guest OS.
-    unsafe {
-        core::arch::asm!(
-            "sti",
-            "hlt",
-            "cli",
-            options(nomem, nostack),
-        );
-    }
-
     ExitType::IncrementRIP
 }
 
-/// MONITOR VM-exit handler. Called from `handle_vmexit` when basic exit
-/// reason == 39 (MONITOR). We don't need the address the guest is arming —
-/// our MWAIT handler falls back to plain HLT, which wakes on any interrupt
-/// regardless of memory-write triggers. Skip past the instruction.
+/// MONITOR VM-exit handler. Guest already executed MONITOR to arm an
+/// address, but VM-exit clears the physical monitor state (SDM 4.20).
+/// We advance RIP and let the paired MWAIT handler (above) skip the
+/// wait entirely — no memory-write wake needed because we never sleep.
 #[inline]
 pub fn handle_monitor(_guest_registers: &mut GuestRegisters, _vmx: &mut Vmx) -> ExitType {
     MONITOR_EXITS.fetch_add(1, Relaxed);
