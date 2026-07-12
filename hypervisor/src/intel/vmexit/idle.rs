@@ -50,6 +50,9 @@ pub static MONITOR_EXITS: AtomicU64 = AtomicU64::new(0);
 /// Exposed via CTL id 83.
 pub static MWAIT_MAX_REQUESTED_CSTATE: AtomicU64 = AtomicU64::new(0);
 
+/// Number of HLT VM-exits handled. Exposed via CTL id 85.
+pub static HLT_EXITS: AtomicU64 = AtomicU64::new(0);
+
 /// MWAIT VM-exit handler. Called from `handle_vmexit` when basic exit
 /// reason == 36 (MWAIT). The guest's chosen C-state hint sits in EAX (Intel
 /// SDM Vol 2A Table 4-30):
@@ -114,5 +117,24 @@ pub fn handle_mwait(guest_registers: &mut GuestRegisters, _vmx: &mut Vmx) -> Exi
 #[inline]
 pub fn handle_monitor(_guest_registers: &mut GuestRegisters, _vmx: &mut Vmx) -> ExitType {
     MONITOR_EXITS.fetch_add(1, Relaxed);
+    ExitType::IncrementRIP
+}
+
+/// HLT VM-exit handler. Same rationale as MWAIT: never let the
+/// physical package transition into deep idle. Package C6/C8 can be
+/// reached via the "all cores HLTed" pathway even when MWAIT is
+/// intercepted — hardware coordinates package-level idle regardless
+/// of which idle instruction each core chose. Intercepting HLT and
+/// returning immediately keeps at least one virtual CPU appearing
+/// awake to the package idle coordinator.
+///
+/// Cost: guest idle loop sees a HLT that returns instantly, so CPU
+/// stays at C0 in a spin between real work — same trade-off as MWAIT.
+/// The BIOS-level Package C State Limit is still the preferred
+/// primary fix; this handler is the fallback when BIOS can't (or
+/// wasn't) set correctly.
+#[inline]
+pub fn handle_hlt(_guest_registers: &mut GuestRegisters, _vmx: &mut Vmx) -> ExitType {
+    HLT_EXITS.fetch_add(1, Relaxed);
     ExitType::IncrementRIP
 }

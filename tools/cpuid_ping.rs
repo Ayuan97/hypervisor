@@ -760,7 +760,9 @@ fn main() {
     let mwait_clamped = hv_cmd(CMD_GET_CTL, 81);
     let monitor_exits = hv_cmd(CMD_GET_CTL, 82);
     let max_cstate = hv_cmd(CMD_GET_CTL, 83);
-    println!("\n=== C-state clamp (MWAIT/MONITOR + MSR 0xE2) ===");
+    let hlt_exits = hv_cmd(CMD_GET_CTL, 85);
+    let raw_e2 = hv_cmd(CMD_GET_CTL, 84);
+    println!("\n=== C-state clamp (MWAIT/MONITOR/HLT + MSR 0xE2) ===");
     if mwait_exits == u64::MAX {
         println!("  clamp NOT compiled in (HV_NO_CSTATE_CLAMP set at build)");
     } else {
@@ -769,7 +771,23 @@ fn main() {
             mwait_clamped,
             if mwait_exits > 0 { mwait_clamped * 100 / mwait_exits } else { 0 });
         println!("  MONITOR exits skipped:  {}", monitor_exits);
+        println!("  HLT exits skipped:      {}", hlt_exits);
         println!("  Deepest C-state asked:  C{}  (raw bits[7:4] = {})", max_cstate, max_cstate);
+        if raw_e2 != u64::MAX {
+            let bits = raw_e2 & 0x7;
+            let label = match bits {
+                0 => "No limit (BIOS did NOT set Package C limit) [!!]",
+                1 => "C1 max ✓ BIOS enforced",
+                2 => "C2 max",
+                3 => "C3 max",
+                6 => "C6 max — BIOS still allows C6",
+                7 => "C7/C8 no limit",
+                _ => "unknown",
+            };
+            println!("  MSR_PKG_CST_CONFIG raw = 0x{:x}  bits[2:0]={} → {}", raw_e2, bits, label);
+            println!("  CFG_LOCK bit 15        = {} {}", (raw_e2 >> 15) & 1,
+                if (raw_e2 >> 15) & 1 == 1 { "(HV cannot write, BIOS-locked)" } else { "" });
+        }
         if max_cstate >= 6 {
             println!("  [!!] Windows targeted C{} — WITHOUT clamp we'd have hit RPL038/044.", max_cstate);
         } else if max_cstate >= 2 {

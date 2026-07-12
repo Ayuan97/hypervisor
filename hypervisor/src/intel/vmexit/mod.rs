@@ -346,6 +346,11 @@ impl VmExit {
                 idle::handle_monitor(guest_registers, vmx)
             }
 
+            VmxBasicExitReason::Hlt => {
+                diag::LAST_HANDLER_ID.store(62, Relaxed);
+                idle::handle_hlt(guest_registers, vmx)
+            }
+
             VmxBasicExitReason::Rdmsr => {
                 diag::EXIT_MSR.fetch_add(1, Relaxed);
                 diag::LAST_HANDLER_ID.store(8, Relaxed);

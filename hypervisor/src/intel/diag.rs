@@ -1385,6 +1385,7 @@ pub fn control(id: u64) -> u64 {
         // Package C State Limit or the shadow is doing all the work.
         // bits[2:0]: 000=no limit, 001=C1, 010=C2, 011=C3, 110=C6, 111=C7/C8.
         84 => unsafe { x86::msr::rdmsr(0xE2) },
+        85 => super::vmexit::idle::HLT_EXITS.load(Relaxed),
         _ => u64::MAX,
     }
 }
