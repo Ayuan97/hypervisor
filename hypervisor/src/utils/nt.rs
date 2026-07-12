@@ -179,10 +179,26 @@ unsafe extern "C" fn bugcheck_callback(_buffer: PVOID, _length: ULONG) {
     crate::intel::diag::note_bugcheck_callback_fired();
 }
 
-/// Register the bug-check callback. Idempotent — calling twice is a no-op.
-/// Must be called after the hypervisor is up so that `KeRegisterBugCheckCallback`
-/// itself (which lives in ntoskrnl.exe) is reachable through the guest CR3.
+/// Register the bug-check callback. **Stealth-gated no-op.**
+///
+/// The original implementation called `KeRegisterBugCheckCallback` and left
+/// a record in `nt!KeBugCheckCallbackListHead` bearing a `Component =
+/// "matrix"` string. Any anti-cheat that walks that list (trivial: scan
+/// non-paged pool, follow LIST_ENTRY.Flink) has an instant HV signature.
+/// The callback also fires strictly after crash-dump write, so it only
+/// tells us bug check reached its tail — the EPT-execute hook we
+/// installed on `nt!KeBugCheckEx` (see `intel::bugcheck_hook`) covers the
+/// same signal at bug-check ENTRY, before we register any visible state.
+///
+/// Setting `HV_ENABLE_BUGCHECK_CALLBACK=1` at build time restores the old
+/// registration for developers who need callback dispatch to fire.
+const REGISTRATION_ENABLED: bool = option_env!("HV_ENABLE_BUGCHECK_CALLBACK").is_some();
+
 pub fn register_bugcheck_callback() {
+    if !REGISTRATION_ENABLED {
+        log::info!("KeRegisterBugCheckCallback skipped for stealth (set HV_ENABLE_BUGCHECK_CALLBACK=1 to enable)");
+        return;
+    }
     if BUGCHECK_CALLBACK_REGISTERED.load(Ordering::Acquire) {
         return;
     }
