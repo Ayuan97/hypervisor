@@ -28,6 +28,7 @@ const IA32_TSC_AUX: u32 = 0x103;
 const IA32_EFER: u32 = 0xC000_0080;
 const IA32_MPERF: u32 = 0xE7;
 const IA32_APERF: u32 = 0xE8;
+const MSR_PKG_CST_CONFIG_CONTROL: u32 = 0xE2;
 const IA32_DEBUGCTL: u32 = 0x1D9;
 const IA32_LASTBRANCH_TOS: u32 = 0x1C9;
 // Intel SDM Vol 4: LASTBRANCH_FROM_i = 0x680 + i (32 entries), LASTBRANCH_TO_i = 0x6C0 + i (32 entries).
@@ -157,6 +158,14 @@ impl MsrBitmap {
         // stays close to bare metal (our VM-exit rate is very low anyway).
         set_msr_bitmap_bit(&mut self.read_low_msrs, IA32_MPERF);
         set_msr_bitmap_bit(&mut self.read_low_msrs, IA32_APERF);
+
+        // MSR_PKG_CST_CONFIG_CONTROL (0xE2). Shadow reads so the guest OS
+        // sees a package C-state limit of C1 regardless of the BIOS value —
+        // this pairs with the MWAIT/MONITOR VM-exit clamp to make sure
+        // Windows never asks for C6/C7/C8 (Raptor Lake RPL038/044 hang).
+        // Swallow writes so BIOS's CFG_LOCK bit can't fault us either.
+        set_msr_bitmap_bit(&mut self.read_low_msrs, MSR_PKG_CST_CONFIG_CONTROL);
+        set_msr_bitmap_bit(&mut self.write_low_msrs, MSR_PKG_CST_CONFIG_CONTROL);
 
         // IA32_DEBUGCTL (0x1D9) + LBR TOS + LBR stack (0x680-0x6BF). Intercept
         // both directions so guest cannot observe host branches leaking into

@@ -755,6 +755,30 @@ fn main() {
         }
     }
 
+    // === C-state clamp (RPL038/044 workaround, 2026-07-12) ===
+    let mwait_exits = hv_cmd(CMD_GET_CTL, 80);
+    let mwait_clamped = hv_cmd(CMD_GET_CTL, 81);
+    let monitor_exits = hv_cmd(CMD_GET_CTL, 82);
+    let max_cstate = hv_cmd(CMD_GET_CTL, 83);
+    println!("\n=== C-state clamp (MWAIT/MONITOR + MSR 0xE2) ===");
+    if mwait_exits == u64::MAX {
+        println!("  clamp NOT compiled in (HV_NO_CSTATE_CLAMP set at build)");
+    } else {
+        println!("  MWAIT exits total:      {}", mwait_exits);
+        println!("  MWAIT clamped to C1:    {}  ({}% of exits)",
+            mwait_clamped,
+            if mwait_exits > 0 { mwait_clamped * 100 / mwait_exits } else { 0 });
+        println!("  MONITOR exits skipped:  {}", monitor_exits);
+        println!("  Deepest C-state asked:  C{}  (raw bits[7:4] = {})", max_cstate, max_cstate);
+        if max_cstate >= 6 {
+            println!("  [!!] Windows targeted C{} — WITHOUT clamp we'd have hit RPL038/044.", max_cstate);
+        } else if max_cstate >= 2 {
+            println!("  [i] Windows targeted C{}. Clamped to C1 to avoid deep-idle MCE.", max_cstate);
+        } else {
+            println!("  [i] Windows only asked for C0/C1 — clamp passing through.");
+        }
+    }
+
     // === LBR VMCS save/restore (P3.1, 2026-07-09) ===
     let lbr_save = hv_cmd(CMD_GET_CTL, 68);
     let lbr_restore = hv_cmd(CMD_GET_CTL, 69);

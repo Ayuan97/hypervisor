@@ -460,9 +460,18 @@ impl Vmcs {
 }
 
 fn required_primary_controls() -> u64 {
-    (vmcs::control::PrimaryControls::SECONDARY_CONTROLS.bits()
+    let mut bits = vmcs::control::PrimaryControls::SECONDARY_CONTROLS.bits()
         | vmcs::control::PrimaryControls::USE_MSR_BITMAPS.bits()
-        | vmcs::control::PrimaryControls::USE_TSC_OFFSETTING.bits()) as u64
+        | vmcs::control::PrimaryControls::USE_TSC_OFFSETTING.bits();
+    // MWAIT/MONITOR exiting: clamp guest package C-state hints to C1 in
+    // the exit handler, working around Intel Raptor Lake erratum
+    // RPL038/044 (C6/C8 entry/exit MCE hang). Skipped in minimal_mode /
+    // HV_NO_CSTATE_CLAMP so we can A/B test whether the clamp is needed.
+    if !minimal_mode() && option_env!("HV_NO_CSTATE_CLAMP").is_none() {
+        bits |= vmcs::control::PrimaryControls::MWAIT_EXITING.bits();
+        bits |= vmcs::control::PrimaryControls::MONITOR_EXITING.bits();
+    }
+    bits as u64
 }
 
 fn ept_disabled() -> bool {
@@ -584,10 +593,13 @@ fn pinbased_interrupt_exiting_ready(effective_pinbased: u64) -> bool {
 }
 
 fn unsupported_primary_exit_controls(effective_primary: u64) -> u64 {
+    // MWAIT_EXITING and MONITOR_EXITING moved OUT of this list: we now
+    // enable both to clamp guest package C-state hints to C1 in the exit
+    // handler, working around Intel Raptor Lake erratum RPL038/044 (C6/C8
+    // entry/exit MCE). See `vmexit::idle::handle_mwait` for the intercept.
     let unsupported = (vmcs::control::PrimaryControls::INTERRUPT_WINDOW_EXITING.bits()
         | vmcs::control::PrimaryControls::HLT_EXITING.bits()
         | vmcs::control::PrimaryControls::INVLPG_EXITING.bits()
-        | vmcs::control::PrimaryControls::MWAIT_EXITING.bits()
         | vmcs::control::PrimaryControls::RDPMC_EXITING.bits()
         | vmcs::control::PrimaryControls::CR3_LOAD_EXITING.bits()
         | vmcs::control::PrimaryControls::CR3_STORE_EXITING.bits()
@@ -598,7 +610,6 @@ fn unsupported_primary_exit_controls(effective_primary: u64) -> u64 {
         | vmcs::control::PrimaryControls::UNCOND_IO_EXITING.bits()
         | vmcs::control::PrimaryControls::USE_IO_BITMAPS.bits()
         | vmcs::control::PrimaryControls::MONITOR_TRAP_FLAG.bits()
-        | vmcs::control::PrimaryControls::MONITOR_EXITING.bits()
         | vmcs::control::PrimaryControls::PAUSE_EXITING.bits()) as u64;
 
     effective_primary & unsupported

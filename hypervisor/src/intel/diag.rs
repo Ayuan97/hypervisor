@@ -1376,6 +1376,10 @@ pub fn control(id: u64) -> u64 {
         74 => super::bugcheck_hook::HOOK_FIRED_CPU.load(Relaxed),
         75 => super::bugcheck_hook::HOOK_SPURIOUS_COUNT.load(Relaxed),
         76 => BUGCHECK_ENTRY_HOOK_FIRED.load(Relaxed),
+        80 => super::vmexit::idle::MWAIT_EXITS.load(Relaxed),
+        81 => super::vmexit::idle::MWAIT_CLAMPED.load(Relaxed),
+        82 => super::vmexit::idle::MONITOR_EXITS.load(Relaxed),
+        83 => super::vmexit::idle::MWAIT_MAX_REQUESTED_CSTATE.load(Relaxed),
         _ => u64::MAX,
     }
 }

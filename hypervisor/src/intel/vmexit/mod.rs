@@ -41,6 +41,7 @@ pub mod cpuid;
 pub mod cr;
 pub mod ept;
 pub mod exception;
+pub mod idle;
 pub mod invd;
 pub mod invept;
 pub mod invvpid;
@@ -333,6 +334,16 @@ impl VmExit {
             VmxBasicExitReason::MonitorTrapFlag => {
                 diag::LAST_HANDLER_ID.store(7, Relaxed);
                 handle_mtf(vmx)
+            }
+
+            VmxBasicExitReason::Mwait => {
+                diag::LAST_HANDLER_ID.store(60, Relaxed);
+                idle::handle_mwait(guest_registers, vmx)
+            }
+
+            VmxBasicExitReason::Monitor => {
+                diag::LAST_HANDLER_ID.store(61, Relaxed);
+                idle::handle_monitor(guest_registers, vmx)
             }
 
             VmxBasicExitReason::Rdmsr => {
