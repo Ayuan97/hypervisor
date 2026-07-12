@@ -470,7 +470,8 @@ fn required_primary_controls() -> u64 {
     if !minimal_mode() && option_env!("HV_NO_CSTATE_CLAMP").is_none() {
         bits |= vmcs::control::PrimaryControls::MWAIT_EXITING.bits();
         bits |= vmcs::control::PrimaryControls::MONITOR_EXITING.bits();
-        bits |= vmcs::control::PrimaryControls::HLT_EXITING.bits();
+        // HLT_EXITING intentionally NOT enabled — see note in
+        // `unsupported_primary_exit_controls` above.
     }
     bits as u64
 }
@@ -594,14 +595,15 @@ fn pinbased_interrupt_exiting_ready(effective_pinbased: u64) -> bool {
 }
 
 fn unsupported_primary_exit_controls(effective_primary: u64) -> u64 {
-    // MWAIT_EXITING, MONITOR_EXITING, HLT_EXITING moved OUT of this list:
-    // we enable all three to keep the guest away from package C6/C8
-    // hardware paths — the errata window Raptor Lake RPL038/044 sits in.
-    // HLT is the "second door" (after MWAIT) into deep idle: when every
-    // logical processor is HLTed, hardware may transition the whole
-    // package to a C6/C8 state regardless of what MWAIT was asked for.
-    // See `vmexit::idle::{handle_mwait,handle_monitor,handle_hlt}`.
+    // MWAIT_EXITING and MONITOR_EXITING are enabled by default to clamp
+    // guest package C-state hints to C1 in the exit handler. HLT_EXITING
+    // was tried too (2026-07-12) but pushed the VM-exit rate to ~10M/sec
+    // and destabilised the guest inside 22 min — Windows kernel timing
+    // could not keep up. Reverted; MWAIT clamp alone was empirically
+    // stable for 45 min prior. See `vmexit::idle::{handle_mwait,
+    // handle_monitor}`.
     let unsupported = (vmcs::control::PrimaryControls::INTERRUPT_WINDOW_EXITING.bits()
+        | vmcs::control::PrimaryControls::HLT_EXITING.bits()
         | vmcs::control::PrimaryControls::INVLPG_EXITING.bits()
         | vmcs::control::PrimaryControls::RDPMC_EXITING.bits()
         | vmcs::control::PrimaryControls::CR3_LOAD_EXITING.bits()
