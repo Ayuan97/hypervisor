@@ -33,11 +33,12 @@
 //! trade ~6% CPU for stealth on that specific detection path.
 
 use {
-    crate::intel::diag,
+    crate::intel::{diag, support::vmread_checked},
     core::{
         cell::UnsafeCell,
         sync::atomic::Ordering::Relaxed,
     },
+    x86::vmx::vmcs::guest as vmcs_guest,
 };
 
 const IA32_DEBUGCTL: u32 = 0x1D9;
@@ -121,14 +122,26 @@ fn cpu_slot() -> &'static mut LbrSlot {
 /// before VMRESUME to reverse this).
 #[inline]
 pub fn save_and_disable_lbr() -> bool {
-    let debugctl = unsafe { x86::msr::rdmsr(IA32_DEBUGCTL) };
+    // Read the GUEST's DEBUGCTL from the VMCS, not the hardware register.
+    // Per Intel SDM 27.5.1 the host IA32_DEBUGCTL is cleared to 0 on
+    // VM-exit, so rdmsr here would always report LBR=off and the save
+    // path would never fire — the LBR stack was intended to be preserved
+    // whenever the *guest* had LBR enabled. VMCS guest-state field
+    // IA32_DEBUGCTL_FULL holds that value (SAVE_DEBUG_CONTROLS is
+    // default-1 on our target, confirmed via VM-Exit control 0x01036ffb).
+    let debugctl = vmread_checked(vmcs_guest::IA32_DEBUGCTL_FULL).unwrap_or(0);
     let slot = cpu_slot();
     slot.debugctl = debugctl;
     if (debugctl & 1) == 0 {
-        // LBR was not on; nothing to save and no host branches would land
-        // in the stack anyway. Fast path — 1 RDMSR total.
+        // Guest didn't have LBR on; nothing to save. Fast path — 0 MSRs.
         return false;
     }
+    // Guest had LBR on. Host DEBUGCTL bit 0 is already 0 (hardware
+    // cleared it on VM-exit), so host branches do NOT record into the
+    // LBR stack — the stack contents are exactly what the guest saw at
+    // the moment of exit. Snapshot them so we can restore them verbatim
+    // before VMRESUME even if some host code path (e.g. our own MSR
+    // handler) touches the stack.
     slot.tos = unsafe { x86::msr::rdmsr(IA32_LASTBRANCH_TOS) };
     let mut i = 0;
     while i < LBR_NR_ENTRIES {
@@ -136,9 +149,6 @@ pub fn save_and_disable_lbr() -> bool {
         slot.to[i] = unsafe { x86::msr::rdmsr(IA32_LASTBRANCH_TO_BASE + i as u32) };
         i += 1;
     }
-    // Freeze LBR recording while we're in host mode so subsequent branches
-    // do not overwrite the stack we just captured.
-    unsafe { x86::msr::wrmsr(IA32_DEBUGCTL, debugctl & !1) };
     diag::LBR_SAVE_COUNT.fetch_add(1, Relaxed);
     true
 }
@@ -154,15 +164,16 @@ pub fn save_and_disable_lbr() -> bool {
 #[inline]
 pub fn restore_lbr() {
     let slot = cpu_slot();
-    let debugctl = slot.debugctl;
-    if (debugctl & 1) == 0 {
-        // LBR wasn't recording at exit; nothing to restore beyond DEBUGCTL
-        // itself. Even that write is only needed if host code touched it,
-        // which we don't do in the fast path — but write anyway to be
-        // strictly correct.
-        unsafe { x86::msr::wrmsr(IA32_DEBUGCTL, debugctl) };
+    if (slot.debugctl & 1) == 0 {
+        // Guest didn't have LBR on at exit — nothing to restore. DEBUGCTL
+        // is auto-restored by VM-entry via LOAD_DEBUG_CONTROLS = 1 from
+        // GUEST_IA32_DEBUGCTL_FULL, so we don't touch it either.
         return;
     }
+    // Rewrite the LBR stack MSRs back to the guest snapshot. VM-entry
+    // will re-arm DEBUGCTL bit 0 for us via the LOAD_DEBUG_CONTROLS
+    // control, resuming recording from the very address the guest was
+    // about to execute.
     unsafe { x86::msr::wrmsr(IA32_LASTBRANCH_TOS, slot.tos) };
     let mut i = 0;
     while i < LBR_NR_ENTRIES {
@@ -170,7 +181,5 @@ pub fn restore_lbr() {
         unsafe { x86::msr::wrmsr(IA32_LASTBRANCH_TO_BASE + i as u32, slot.to[i]) };
         i += 1;
     }
-    // Re-enable LBR by writing back the original DEBUGCTL last.
-    unsafe { x86::msr::wrmsr(IA32_DEBUGCTL, debugctl) };
     diag::LBR_RESTORE_COUNT.fetch_add(1, Relaxed);
 }
