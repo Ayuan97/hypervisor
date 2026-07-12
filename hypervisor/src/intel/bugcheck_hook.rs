@@ -67,12 +67,24 @@ static HOOK_LATCHED: AtomicBool = AtomicBool::new(false);
 
 const WATCH_LEN: u64 = 128; // same conservative window diag.rs uses
 
-/// When set at compile time via `HV_NO_ENTRY_HOOK=1 cargo build ...` the
-/// entry hook installation is skipped so runs measuring overhead-free
-/// baseline behaviour aren't paying the spurious-step-through cost. We
-/// leave the code path in place because we still need CTL ids 70-76 to
-/// return the sentinel state (all zero) that cpuid_ping expects.
-const HOOK_DISABLED: bool = option_env!("HV_NO_ENTRY_HOOK").is_some();
+/// Default: hook installation is SKIPPED. Opt in at compile time with
+/// `HV_ENABLE_ENTRY_HOOK=1 cargo build ...` when you specifically want the
+/// KeBugCheckEx-entered diagnostic and are willing to pay for it.
+///
+/// Why the flip (2026-07-13): the hook cloaks the entire 4 KiB page holding
+/// KeBugCheckEx and single-steps every neighbour function that also lives on
+/// that page. Under an EAC-driven workload that scales to ~1.5M spurious
+/// step-throughs per session (measured via HOOK_SPURIOUS_COUNT), each one
+/// costing an EPT-violation exit + MTF exit + two INVEPTs. That overhead is
+/// the leading suspect for the "HV alone + EAC = freeze inside minutes"
+/// pattern we've been chasing — CPUs sink into the step-through loop and
+/// starve IPI delivery until Windows watchdog can't cope.
+///
+/// The old default matched the tooling's ergonomics — "just build, hook
+/// works" — but the ergonomics aren't worth the freezes, and the CTL id
+/// 70-76 sentinels still return their "all zero" no-hit state when disabled
+/// so cpuid_ping doesn't need to know either way.
+const HOOK_DISABLED: bool = option_env!("HV_ENABLE_ENTRY_HOOK").is_none();
 
 /// Resolve KeBugCheckEx, split the containing 2 MiB EPT entry, and cloak
 /// the 4 KiB page (READ_WRITE only — no execute). Idempotent: if the
@@ -80,7 +92,7 @@ const HOOK_DISABLED: bool = option_env!("HV_NO_ENTRY_HOOK").is_some();
 /// left disabled (HOOK_PAGE_PA stays 0). Never fatal to driver init.
 pub fn install(ept: &mut Ept) {
     if HOOK_DISABLED {
-        log::info!("bugcheck_hook: HV_NO_ENTRY_HOOK set, install skipped");
+        log::info!("bugcheck_hook: HV_ENABLE_ENTRY_HOOK not set, install skipped");
         return;
     }
     let addr = get_ntoskrnl_export("KeBugCheckEx");
