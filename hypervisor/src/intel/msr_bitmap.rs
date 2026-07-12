@@ -153,11 +153,22 @@ impl MsrBitmap {
         set_msr_bitmap_bit(&mut self.read_high_msrs, efer_low);
         set_msr_bitmap_bit(&mut self.write_high_msrs, efer_low);
 
-        // APERF (0xE8) / MPERF (0xE7). BattlEye is known to use APERF-based
-        // timing (secret.club 2020). Count reads; reads pass through so ratio
-        // stays close to bare metal (our VM-exit rate is very low anyway).
-        set_msr_bitmap_bit(&mut self.read_low_msrs, IA32_MPERF);
-        set_msr_bitmap_bit(&mut self.read_low_msrs, IA32_APERF);
+        // APERF / MPERF — NOT intercepted.
+        //
+        // The old comment claimed "reads pass through so ratio stays close
+        // to bare metal (our VM-exit rate is very low anyway)". Empirically
+        // false: Windows scheduler reads both on every tick × 24 logical
+        // processors × 250 Hz ≈ 6 000 baseline exits/sec, and under a real
+        // workload (Rust + EAC) that scaled to millions/sec with the
+        // handler adding ~200 ns each — a big chunk of the exit-rate
+        // storm that repeatedly crashed the box after the C-state clamps
+        // pushed idle exits on top. KVM ran into the same problem and
+        // fixed it by leaving these MSRs passthrough (LWN 998994). We do
+        // the same. Diagnostic APERF_READ_COUNT / MPERF_READ_COUNT stop
+        // incrementing but the freeze-relevant signal (Rust/EAC caused
+        // us to hit ratios wildly outside bare metal) can be recovered
+        // by turning the intercept back on for a single measurement run
+        // if we ever need it again.
 
         // MSR_PKG_CST_CONFIG_CONTROL (0xE2). Shadow reads so the guest OS
         // sees a package C-state limit of C1 regardless of the BIOS value —
