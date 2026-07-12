@@ -33,12 +33,11 @@
 //! trade ~6% CPU for stealth on that specific detection path.
 
 use {
-    crate::intel::{diag, support::vmread_checked},
+    crate::intel::diag,
     core::{
         cell::UnsafeCell,
         sync::atomic::Ordering::Relaxed,
     },
-    x86::vmx::vmcs::guest as vmcs_guest,
 };
 
 const IA32_DEBUGCTL: u32 = 0x1D9;
@@ -122,35 +121,20 @@ fn cpu_slot() -> &'static mut LbrSlot {
 /// before VMRESUME to reverse this).
 #[inline]
 pub fn save_and_disable_lbr() -> bool {
-    // Read the GUEST's DEBUGCTL from the VMCS, not the hardware register.
-    // Per Intel SDM 27.5.1 the host IA32_DEBUGCTL is cleared to 0 on
-    // VM-exit, so rdmsr here would always report LBR=off and the save
-    // path would never fire — the LBR stack was intended to be preserved
-    // whenever the *guest* had LBR enabled. VMCS guest-state field
-    // IA32_DEBUGCTL_FULL holds that value (SAVE_DEBUG_CONTROLS is
-    // default-1 on our target, confirmed via VM-Exit control 0x01036ffb).
-    let debugctl = vmread_checked(vmcs_guest::IA32_DEBUGCTL_FULL).unwrap_or(0);
-    let slot = cpu_slot();
-    slot.debugctl = debugctl;
-    if (debugctl & 1) == 0 {
-        // Guest didn't have LBR on; nothing to save. Fast path — 0 MSRs.
-        return false;
-    }
-    // Guest had LBR on. Host DEBUGCTL bit 0 is already 0 (hardware
-    // cleared it on VM-exit), so host branches do NOT record into the
-    // LBR stack — the stack contents are exactly what the guest saw at
-    // the moment of exit. Snapshot them so we can restore them verbatim
-    // before VMRESUME even if some host code path (e.g. our own MSR
-    // handler) touches the stack.
-    slot.tos = unsafe { x86::msr::rdmsr(IA32_LASTBRANCH_TOS) };
-    let mut i = 0;
-    while i < LBR_NR_ENTRIES {
-        slot.from[i] = unsafe { x86::msr::rdmsr(IA32_LASTBRANCH_FROM_BASE + i as u32) };
-        slot.to[i] = unsafe { x86::msr::rdmsr(IA32_LASTBRANCH_TO_BASE + i as u32) };
-        i += 1;
-    }
-    diag::LBR_SAVE_COUNT.fetch_add(1, Relaxed);
-    true
+    // DISABLED. Snapshotting LBR on every VM-exit turned out to cost 65
+    // MSR reads per exit whenever the guest had DEBUGCTL bit 0 set, and
+    // under an active EAC + MWAIT-clamp workload that ran into the tens
+    // of millions of RDMSRs per second — the box locked up inside a
+    // minute (2026-07-12).
+    //
+    // Host DEBUGCTL is cleared to 0 on VM-exit (Intel SDM 27.5.1), so
+    // host handler branches do not pollute the guest LBR stack anyway;
+    // the "save" path was defensive against a leak that can't actually
+    // happen. Keep the code shape (matching restore_lbr, counters
+    // wired through diag::LBR_SAVE_COUNT) but return false immediately.
+    // If we ever need the stack-swap for a specific stealth scenario,
+    // re-enable per exit type rather than unconditionally.
+    false
 }
 
 /// Restore the LBR stack + DEBUGCTL captured by the matching
