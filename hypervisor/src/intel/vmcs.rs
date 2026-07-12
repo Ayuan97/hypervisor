@@ -467,12 +467,11 @@ fn required_primary_controls() -> u64 {
     // the exit handler, working around Intel Raptor Lake erratum
     // RPL038/044 (C6/C8 entry/exit MCE hang). Skipped in minimal_mode /
     // HV_NO_CSTATE_CLAMP so we can A/B test whether the clamp is needed.
-    if !minimal_mode() && option_env!("HV_NO_CSTATE_CLAMP").is_none() {
-        bits |= vmcs::control::PrimaryControls::MWAIT_EXITING.bits();
-        bits |= vmcs::control::PrimaryControls::MONITOR_EXITING.bits();
-        // HLT_EXITING intentionally NOT enabled — see note in
-        // `unsupported_primary_exit_controls` above.
-    }
+    // MWAIT/MONITOR/HLT clamp is dead — kept the env-var check as a
+    // compile-time knob for future re-experiments, but the branch
+    // body is intentionally empty because every enabled combination
+    // crashed the box inside a couple of minutes today.
+    let _ = option_env!("HV_NO_CSTATE_CLAMP");
     bits as u64
 }
 
@@ -595,15 +594,22 @@ fn pinbased_interrupt_exiting_ready(effective_pinbased: u64) -> bool {
 }
 
 fn unsupported_primary_exit_controls(effective_primary: u64) -> u64 {
-    // MWAIT_EXITING and MONITOR_EXITING are enabled by default to clamp
-    // guest package C-state hints to C1 in the exit handler. HLT_EXITING
-    // was tried too (2026-07-12) but pushed the VM-exit rate to ~10M/sec
-    // and destabilised the guest inside 22 min — Windows kernel timing
-    // could not keep up. Reverted; MWAIT clamp alone was empirically
-    // stable for 45 min prior. See `vmexit::idle::{handle_mwait,
-    // handle_monitor}`.
+    // MWAIT_EXITING / MONITOR_EXITING / HLT_EXITING all disabled after
+    // repeated crash-inside-two-minutes runs today (2026-07-12). Each
+    // MWAIT trap advances RIP and lets the guest fall right back into
+    // MWAIT, so under Windows' idle loop the exit rate parked at
+    // 3-10 M/sec no matter what we did in the handler — and the box
+    // could not survive that overhead + game load. The MSR 0xE2 shadow
+    // still tells the guest kernel "package C-state limit = C1" so
+    // Windows biases toward light idle, and the BIOS-side setting
+    // remains the real hardware guarantee (imperfect on this board
+    // because bits[2:0]=0 despite the "C0/C1" UI, but the shadow
+    // covers what we can from software). See `vmexit::idle::*` for
+    // the leftover no-op handlers — they never run now.
     let unsupported = (vmcs::control::PrimaryControls::INTERRUPT_WINDOW_EXITING.bits()
         | vmcs::control::PrimaryControls::HLT_EXITING.bits()
+        | vmcs::control::PrimaryControls::MWAIT_EXITING.bits()
+        | vmcs::control::PrimaryControls::MONITOR_EXITING.bits()
         | vmcs::control::PrimaryControls::INVLPG_EXITING.bits()
         | vmcs::control::PrimaryControls::RDPMC_EXITING.bits()
         | vmcs::control::PrimaryControls::CR3_LOAD_EXITING.bits()
