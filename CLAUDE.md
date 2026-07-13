@@ -167,6 +167,85 @@ kdmapper 映射的实例**不能通过 unload.bat 卸载**，只能重启。
 - `HOST_FIRST_FAULT_VECTOR = 8` → 级联 #DF；查 `HOST_DF_COUNT` 和 `PF/GP/MC` 计数看第一个 fault 是谁。
 - watchdog `slow_count > 0` → 有 handler 跑得 ≥14ms，`last_slow_reason` 是嫌疑；正常 handler 应 <1ms。
 
+## 本项目 freeze 的具体 signature（2026-07-12 用户实测确认）
+
+**必读**：判读前先确认 freeze 特征是否匹配本项目。
+
+用户实测本项目 freeze 都符合这些特征：
+- **屏幕定格最后一帧**（GPU 还在输出，CPU 停送命令）
+- **任何键盘按键无反应**（CAPS LOCK / NumLock LED 都不亮）
+- **电源键短按无反应**（ACPI SCI 死）
+- **SSH / 网络全断**（网络中断 handler 死）
+- **无自动重启**（无 hardware watchdog 触发，无 triple fault）
+- **直接卡死无渐进**（discrete event 触发，非累积）
+- **持续无限**（除非按 RST 硬复位）
+
+**判决**：**全 CPU 卡在稳定循环**，中断服务链全死。最可能是：
+- CPU 卡在 VMX-root handler 死循环
+- 或全 CPU IPI 死锁互等
+- 或 guest kernel spinlock 死锁
+
+**排除**：BSOD（会显示蓝屏）、Triple fault（会自动重启）、GPU driver hang（键盘会响应）、渐进型资源耗尽。
+
+**Boot freeze 触发时机**：游戏全屏画面**马上要出的一瞬间**（Rust DXGI fullscreen 切换 + EAC 首次深度扫描同时发生）。
+**Runtime freeze 触发时机**：挂机状态**无明显特征**（推测是 EAC 周期性扫描触发同一 bug）。
+
+## 观测方法论铁则（Phase 0 定稿）
+
+对本项目 freeze signature，观测必须遵守：
+
+1. **数据必须"死前"就在持久层里** —— 不能靠"死时紧急写"。CPU 卡死了根本执行不了写入。**"平时高频写"** 才是唯一可靠模式。
+2. **CMOS sync 时机 = handler entry**，**不是 finish** —— 本项目 freeze 里 handler 卡在中间，finish 时机永远到不了。`cmos_sync_step4_state` 走 `watchdog_handler_finish` 是错的（Phase 1 要修）。
+3. **必须区分 "HV 卡了" vs "Guest 卡了"** —— 现有诊断无字段回答此问题。Phase 1 加。
+4. **观测代码不能自我污染** —— HV 内诊断字段可能被 handler bug 覆盖或漏写；必须有独立 out-of-band 通道（CMOS + Port 0x80 + 串口 FIFO）交叉验证。
+5. **依赖 handler 完成的诊断字段一律不可信** —— 只信 handler entry 就写完的字段。
+
+## CMOS 偏移量分配表（**改前必读，避免占用冲突**）
+
+| CMOS 类型 | 偏移 | 用途 | 状态 |
+|---|---|---|---|
+| Std CMOS (0x70/0x71) | 0x00-0x0D | RTC + BIOS 用 | ❌ 禁用 |
+| Std CMOS (0x70/0x71) | 0x0E-0x3F | BIOS 校验/config | ⚠️ BIOS 可能改 |
+| Std CMOS (0x70/0x71) | 0x40-0x55 | `freeze_write_cmos_snapshot` 预留 | ⚠️ **死代码**（写入路径未调用）|
+| Std CMOS (0x70/0x71) | 0x72-0x75 | CR8 bugcheck marker（`vmexit/cpuid.rs`）| ✅ 使用中 |
+| Ext CMOS (0x72/0x73) | 0x00-0x0B | `cmos_write_rip` 预留 | ⚠️ **死代码** |
+| Ext CMOS (0x72/0x73) | 0x10-0x19 | Step 1-4 CMOS 持久化（KEBUGCHECKEX/first-fault/total） | ✅ 使用中 |
+| Ext CMOS (0x72/0x73) | 0x1E | bugcheck entry hook marker (0xE1) | ✅ 使用中 |
+| Ext CMOS (0x72/0x73) | 0x1F | bugcheck callback marker (0xB1) | ✅ 使用中 |
+| Ext CMOS (0x72/0x73) | 0x20-0x2C | Phase 0-2 CMOS 保留实验（`cmos_retention_experiment`）| ✅ 使用中 |
+| Ext CMOS (0x72/0x73) | 0x2D-0x7F | **未分配** | 🆓 可用 |
+
+## GET_CTL 字段扩展（Phase 0，2026-07-12）
+
+在原表（0-85）基础上新增 90-98，专用于 Phase 0 CMOS 保留实验：
+
+| ID | 字段 | 说明 |
+|---|---|---|
+| 90 | CMOS_RET_PREV_MAGIC | 上次 CMOS 里的 magic byte（0xC3=有效数据）|
+| 91 | CMOS_RET_PREV_COUNTER | 上次 boot counter |
+| 92 | CMOS_RET_PREV_LAST_SESSION | 上次的 last_session_id |
+| 93 | CMOS_RET_PREV_THIS_SESSION | 上次的 this_session_id |
+| 94 | CMOS_RET_PREV_COMPLETION | 上次 completion marker (0x01=正常, 0x00=torn write) |
+| 95 | CMOS_RET_PREV_CHECKSUM_OK | 上次 checksum 校验结果 (1=通过) |
+| 96 | CMOS_RET_NEW_COUNTER | 本次 boot counter |
+| 97 | CMOS_RET_NEW_THIS_SESSION | 本次 session id |
+| 98 | CMOS_RET_EXPERIMENT_RAN | 本次是否成功运行 (1=是) |
+
+## Phase 0 CMOS 保留实验
+
+**目的**：验证 Ext CMOS 0x20-0x2C 跨 warm reset / cold boot / freeze-then-RST 是否保留。
+
+**位置**：`hypervisor/src/intel/diag.rs::cmos_retention_experiment()`，从 `driver_entry` 调用一次。
+
+**详细测试协议**：见 `docs/phase0-cmos-retention.md`（4 步测试 + 判读矩阵）。
+
+**读回**：`tools\cpuid_ping.exe` 输出 "=== CMOS Retention Experiment ===" 段。
+
+**判决**：
+- `prev magic = 0xC3` + `prev_checksum_ok = 1` + `prev_counter` 正确递增 → **CMOS 可作 Layer 3 主战场**
+- `prev magic = 0xFF/0x00` → **BIOS 清了**（下一步查扩展 CMOS 是否被清 vs 主板 CMOS 电池）
+- `prev completion = 0x00` → **上次冻死时正在 CMOS 写入中间**（有 race，Phase 1 用双缓冲或 per-CPU slot 修）
+
 ## 自检命令
 
 ```powershell

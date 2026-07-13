@@ -937,6 +937,59 @@ fn main() {
         println!("  (no Step 1-4 CMOS data, magic=0x{:02x})", step4_magic);
     }
 
+    // === CMOS Retention Experiment (Phase 0-2, 2026-07-12) ===
+    // Test whether ext CMOS 0x20-0x2C survives reboots. Shows previous boot's
+    // stored state and the state written this boot.
+    println!("\n=== CMOS Retention Experiment (Phase 0-2) ===");
+    let ran = hv_cmd(CMD_GET_CTL, 98);
+    if ran != 1 {
+        println!("  [!] Experiment did NOT run this boot (ran={})", ran);
+        println!("      Either HV load path skipped cmos_retention_experiment()");
+        println!("      or the driver has not been rebuilt with the experiment code.");
+    } else {
+        let prev_magic = hv_cmd(CMD_GET_CTL, 90) as u8;
+        let prev_counter = hv_cmd(CMD_GET_CTL, 91) as u16;
+        let prev_last_session = hv_cmd(CMD_GET_CTL, 92) as u32;
+        let prev_this_session = hv_cmd(CMD_GET_CTL, 93) as u32;
+        let prev_completion = hv_cmd(CMD_GET_CTL, 94) as u8;
+        let prev_checksum_ok = hv_cmd(CMD_GET_CTL, 95) == 1;
+        let new_counter = hv_cmd(CMD_GET_CTL, 96) as u16;
+        let new_this_session = hv_cmd(CMD_GET_CTL, 97) as u32;
+
+        println!("  --- Previous boot's state (as read from CMOS) ---");
+        println!("  magic:            {:#04x}  (0xC3 = valid, else uninit/cleared)", prev_magic);
+        println!("  boot_counter:     {}", prev_counter);
+        println!("  last_session_id:  {:#010x}", prev_last_session);
+        println!("  this_session_id:  {:#010x}", prev_this_session);
+        println!("  completion_marker: {:#04x}  (0x01 = clean, 0x00 = torn write)", prev_completion);
+        println!("  checksum_valid:   {}", prev_checksum_ok);
+        println!();
+        println!("  --- This boot's state (just written to CMOS) ---");
+        println!("  boot_counter:     {}", new_counter);
+        println!("  this_session_id:  {:#010x}", new_this_session);
+        println!();
+        println!("  --- Interpretation ---");
+        if prev_magic == 0xC3 && prev_checksum_ok {
+            println!("  [+] CMOS RETENTION WORKS — data survived from prev boot");
+            if prev_completion != 0x01 {
+                println!("  [!] Previous boot's completion marker != 0x01");
+                println!("      → Previous session died DURING CMOS write (torn write detected)");
+            }
+        } else if prev_magic == 0xC3 && !prev_checksum_ok {
+            println!("  [!] CMOS has our magic but checksum invalid");
+            println!("      → Possible: torn write, bit rot, or BIOS altered some bytes");
+        } else if prev_magic == 0xFF {
+            println!("  [!] CMOS bytes are 0xFF (default/unwritten)");
+            println!("      → First run, OR BIOS cleared our bytes to 0xFF");
+        } else if prev_magic == 0x00 {
+            println!("  [!] CMOS bytes are 0x00 (zeroed)");
+            println!("      → First run, OR BIOS cleared our bytes to 0x00");
+        } else {
+            println!("  [!] CMOS magic is {:#04x} (unexpected)", prev_magic);
+            println!("      → Someone else is writing to these offsets");
+        }
+    }
+
     if !checks_ok {
         std::process::exit(1);
     }

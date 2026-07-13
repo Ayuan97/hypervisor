@@ -195,6 +195,162 @@ pub fn set_kebugcheckex_sentinel(addr: u64, first_qword: u64) {
 }
 
 // ---------------------------------------------------------------------------
+// CMOS Retention Experiment (Phase 0, 2026-07-12).
+//
+// One-shot experiment run from DriverEntry BEFORE HV virtualization begins.
+// Answers three questions:
+//   1. Does extended CMOS 0x20-0x2C survive warm reset / cold boot / freeze?
+//   2. Does BIOS clear our bytes on boot?
+//   3. Can we reliably persist a session ID and boot counter across reboots?
+//
+// Layout (extended CMOS ports 0x72/0x73):
+//   0x20: magic (0xC3 = experiment data present)
+//   0x21-0x22: boot_counter (u16 LE) — +1 every HV load
+//   0x23-0x26: last_session_id (u32 LE) — previous load's this_session
+//   0x27-0x2A: this_session_id (u32 LE) — random per-load (TSC low 32)
+//   0x2B: completion_marker (0x00 = writing, 0x01 = complete)
+//   0x2C: XOR checksum of 0x20..0x2B (with completion=0x01)
+//
+// Torn-write protocol:
+//   1. Write completion = 0x00 (mark "writing in progress")
+//   2. Write payload bytes 0x20-0x2A
+//   3. Compute checksum assuming completion=0x01, write to 0x2C
+//   4. Write completion = 0x01 (mark "complete")
+// Reader treats completion != 0x01 or checksum mismatch as invalid.
+// ---------------------------------------------------------------------------
+const CMOS_RET_OFF_MAGIC: u8 = 0x20;
+const CMOS_RET_OFF_COUNTER_LO: u8 = 0x21;
+const CMOS_RET_OFF_COUNTER_HI: u8 = 0x22;
+const CMOS_RET_OFF_LAST_SESSION_BASE: u8 = 0x23; // 0x23-0x26
+const CMOS_RET_OFF_THIS_SESSION_BASE: u8 = 0x27; // 0x27-0x2A
+const CMOS_RET_OFF_COMPLETION: u8 = 0x2B;
+const CMOS_RET_OFF_CHECKSUM: u8 = 0x2C;
+const CMOS_RET_MAGIC: u8 = 0xC3;
+
+// Snapshot of what we READ from CMOS before overwriting — exposed via GET_CTL.
+pub static CMOS_RET_PREV_MAGIC: AtomicU64 = AtomicU64::new(u64::MAX);
+pub static CMOS_RET_PREV_COUNTER: AtomicU64 = AtomicU64::new(u64::MAX);
+pub static CMOS_RET_PREV_LAST_SESSION: AtomicU64 = AtomicU64::new(u64::MAX);
+pub static CMOS_RET_PREV_THIS_SESSION: AtomicU64 = AtomicU64::new(u64::MAX);
+pub static CMOS_RET_PREV_COMPLETION: AtomicU64 = AtomicU64::new(u64::MAX);
+pub static CMOS_RET_PREV_CHECKSUM_OK: AtomicU64 = AtomicU64::new(u64::MAX);
+
+// Snapshot of what we WROTE this boot — exposed via GET_CTL.
+pub static CMOS_RET_NEW_COUNTER: AtomicU64 = AtomicU64::new(0);
+pub static CMOS_RET_NEW_THIS_SESSION: AtomicU64 = AtomicU64::new(0);
+
+// Set to 1 after the write protocol completes successfully.
+pub static CMOS_RET_EXPERIMENT_RAN: AtomicU64 = AtomicU64::new(0);
+
+/// Run the CMOS retention experiment once, at DriverEntry.
+///
+/// Reads previous state (populating `CMOS_RET_PREV_*` statics), then writes
+/// a new state with incremented counter and fresh session id.
+///
+/// Safe to call before HV virtualization: uses only port I/O and no locks.
+pub fn cmos_retention_experiment() {
+    // ------------------------------------------------------------------
+    // Phase A: read previous state.
+    // ------------------------------------------------------------------
+    let prev_magic = ext_cmos_read(CMOS_RET_OFF_MAGIC);
+    let prev_counter_lo = ext_cmos_read(CMOS_RET_OFF_COUNTER_LO);
+    let prev_counter_hi = ext_cmos_read(CMOS_RET_OFF_COUNTER_HI);
+    let mut prev_last_bytes = [0u8; 4];
+    let mut prev_this_bytes = [0u8; 4];
+    for i in 0..4u8 {
+        prev_last_bytes[i as usize] = ext_cmos_read(CMOS_RET_OFF_LAST_SESSION_BASE + i);
+        prev_this_bytes[i as usize] = ext_cmos_read(CMOS_RET_OFF_THIS_SESSION_BASE + i);
+    }
+    let prev_completion = ext_cmos_read(CMOS_RET_OFF_COMPLETION);
+    let prev_checksum = ext_cmos_read(CMOS_RET_OFF_CHECKSUM);
+
+    let prev_counter = (prev_counter_lo as u16) | ((prev_counter_hi as u16) << 8);
+    let prev_last_session = u32::from_le_bytes(prev_last_bytes);
+    let prev_this_session = u32::from_le_bytes(prev_this_bytes);
+
+    // Verify checksum against the state as it should be after a successful
+    // write (completion byte contributes 0x01). Torn writes / stale data /
+    // BIOS-cleared bytes will mismatch.
+    let mut expected_checksum: u8 = prev_magic ^ prev_counter_lo ^ prev_counter_hi ^ 0x01; // completion (final)
+    for b in prev_last_bytes.iter().chain(prev_this_bytes.iter()) {
+        expected_checksum ^= *b;
+    }
+    let checksum_ok = expected_checksum == prev_checksum && prev_completion == 0x01;
+
+    CMOS_RET_PREV_MAGIC.store(prev_magic as u64, Relaxed);
+    CMOS_RET_PREV_COUNTER.store(prev_counter as u64, Relaxed);
+    CMOS_RET_PREV_LAST_SESSION.store(prev_last_session as u64, Relaxed);
+    CMOS_RET_PREV_THIS_SESSION.store(prev_this_session as u64, Relaxed);
+    CMOS_RET_PREV_COMPLETION.store(prev_completion as u64, Relaxed);
+    CMOS_RET_PREV_CHECKSUM_OK.store(checksum_ok as u64, Relaxed);
+
+    // ------------------------------------------------------------------
+    // Phase B: compute new state.
+    // ------------------------------------------------------------------
+    let is_valid_prev = prev_magic == CMOS_RET_MAGIC && checksum_ok;
+    let new_counter: u16 = if is_valid_prev {
+        prev_counter.wrapping_add(1)
+    } else {
+        1
+    };
+    let new_last_session: u32 = if is_valid_prev { prev_this_session } else { 0 };
+    let new_this_session: u32 = rdtsc_now() as u32;
+
+    CMOS_RET_NEW_COUNTER.store(new_counter as u64, Relaxed);
+    CMOS_RET_NEW_THIS_SESSION.store(new_this_session as u64, Relaxed);
+
+    let new_counter_lo = new_counter as u8;
+    let new_counter_hi = (new_counter >> 8) as u8;
+    let new_last_bytes = new_last_session.to_le_bytes();
+    let new_this_bytes = new_this_session.to_le_bytes();
+
+    // Pre-compute checksum assuming completion = 0x01 (final state).
+    let mut new_checksum: u8 = CMOS_RET_MAGIC ^ new_counter_lo ^ new_counter_hi ^ 0x01;
+    for b in new_last_bytes.iter().chain(new_this_bytes.iter()) {
+        new_checksum ^= *b;
+    }
+
+    // ------------------------------------------------------------------
+    // Phase C: torn-write-safe write protocol.
+    // ------------------------------------------------------------------
+    // Step 1: mark "writing in progress" so a reader after crash-during-write
+    // sees completion != 0x01 and treats data as invalid.
+    ext_cmos_write(CMOS_RET_OFF_COMPLETION, 0x00);
+    // Step 2: payload.
+    ext_cmos_write(CMOS_RET_OFF_MAGIC, CMOS_RET_MAGIC);
+    ext_cmos_write(CMOS_RET_OFF_COUNTER_LO, new_counter_lo);
+    ext_cmos_write(CMOS_RET_OFF_COUNTER_HI, new_counter_hi);
+    for i in 0..4u8 {
+        ext_cmos_write(
+            CMOS_RET_OFF_LAST_SESSION_BASE + i,
+            new_last_bytes[i as usize],
+        );
+        ext_cmos_write(
+            CMOS_RET_OFF_THIS_SESSION_BASE + i,
+            new_this_bytes[i as usize],
+        );
+    }
+    // Step 3: checksum.
+    ext_cmos_write(CMOS_RET_OFF_CHECKSUM, new_checksum);
+    // Step 4: mark complete.
+    ext_cmos_write(CMOS_RET_OFF_COMPLETION, 0x01);
+
+    CMOS_RET_EXPERIMENT_RAN.store(1, Relaxed);
+
+    log::info!(
+        "cmos_ret: prev magic={:#04x} counter={} last={:#010x} this={:#010x} mark={:#04x} chk_ok={} | new counter={} session={:#010x}",
+        prev_magic,
+        prev_counter,
+        prev_last_session,
+        prev_this_session,
+        prev_completion,
+        checksum_ok as u32,
+        new_counter,
+        new_this_session,
+    );
+}
+
+// ---------------------------------------------------------------------------
 // CMOS persistence for freeze-critical Step 1-4 fields (2026-07-09).
 //
 // The 2026-07-09 EAC scenario test proved KEBUGCHECKEX / first-fault / total
@@ -1386,6 +1542,16 @@ pub fn control(id: u64) -> u64 {
         // bits[2:0]: 000=no limit, 001=C1, 010=C2, 011=C3, 110=C6, 111=C7/C8.
         84 => unsafe { x86::msr::rdmsr(0xE2) },
         85 => super::vmexit::idle::HLT_EXITS.load(Relaxed),
+        // CMOS retention experiment (Phase 0, 2026-07-12).
+        90 => CMOS_RET_PREV_MAGIC.load(Relaxed),
+        91 => CMOS_RET_PREV_COUNTER.load(Relaxed),
+        92 => CMOS_RET_PREV_LAST_SESSION.load(Relaxed),
+        93 => CMOS_RET_PREV_THIS_SESSION.load(Relaxed),
+        94 => CMOS_RET_PREV_COMPLETION.load(Relaxed),
+        95 => CMOS_RET_PREV_CHECKSUM_OK.load(Relaxed),
+        96 => CMOS_RET_NEW_COUNTER.load(Relaxed),
+        97 => CMOS_RET_NEW_THIS_SESSION.load(Relaxed),
+        98 => CMOS_RET_EXPERIMENT_RAN.load(Relaxed),
         _ => u64::MAX,
     }
 }

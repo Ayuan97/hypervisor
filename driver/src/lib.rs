@@ -222,6 +222,10 @@ pub unsafe extern "system" fn driver_entry(
         .base(0x2f8)
         .filter(LevelFilter::Info)
         .setup();
+    // Phase 0-2 CMOS retention experiment. Runs once, before HV starts, before
+    // any boot_stage stop check — we want experiment data written even when
+    // HV_BOOT_STOP_STAGE aborts the load early.
+    diag::cmos_retention_experiment();
     if let Some(status) = boot_stage(100) {
         return status;
     }
