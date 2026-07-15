@@ -17,8 +17,6 @@ Windows x64 Intel VT-x type-2 hypervisor（crate 名 `matrix`）。为 `game_ove
 
 ## 开发工作流
 
-### 开发工作流
-
 在 Windows 本机直接用 Codex 改，全流程都在这台机器上：
 
 ```text
