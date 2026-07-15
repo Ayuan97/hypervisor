@@ -129,10 +129,19 @@ impl VmExit {
         // LBR is disabled (single RDMSR). See intel/lbr.rs.
         let lbr_saved = crate::intel::lbr::save_and_disable_lbr();
 
+        // Port 0x80 breadcrumb: mark that we entered handle_vmexit. Overwritten
+        // by the real exit reason a few lines below; this sentinel only "wins"
+        // if we freeze between LBR save and EXIT_REASON read. See diag.rs.
+        diag::port80(diag::P80_HV_ENTER);
+
         let exit_reason = vmread_checked(ro::EXIT_REASON)? as u32;
         diag::watchdog_handler_start(exit_tsc_start, exit_reason as u64);
         let vm_entry_failure = (exit_reason & 0x8000_0000) != 0;
         let basic_reason = exit_reason & 0xFFFF;
+        // Overwrite the sentinel with the actual basic exit reason so the
+        // Q-Code display / PORT80_LAST reflects the handler we are about to
+        // dispatch to. If we freeze inside that handler, this value stays.
+        diag::port80_vmexit(basic_reason);
 
         if vm_entry_failure {
             use core::sync::atomic::Ordering::Relaxed;

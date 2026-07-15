@@ -1,6 +1,6 @@
 use {
     crate::error::HypervisorError,
-    core::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed},
+    core::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering::Relaxed},
 };
 
 const ZERO_U64: AtomicU64 = AtomicU64::new(0);
@@ -348,6 +348,71 @@ pub fn cmos_retention_experiment() {
         new_counter,
         new_this_session,
     );
+}
+
+// ---------------------------------------------------------------------------
+// Port 0x80 breadcrumb — hardware-visible "what handler are we in" (2026-07-15).
+//
+// Motherboards route port 0x80 writes to the POST code / Q-Code LED display.
+// Whatever value we write last stays visible even after the CPU stops
+// executing (freeze). This gives us a single-byte, out-of-band diagnostic
+// that survives instant hangs — no handler needs to "finish writing" or
+// "post over the network". If a board has a Q-Code display, the user reads
+// the freeze state directly with their eyes.
+//
+// Encoding of the byte written:
+//   0x00-0x7F : VM-exit basic reason (top bit clear).
+//                Only reasons 0-127 fit; current SDM caps around 68 so this
+//                is safe. Value visible = HV was handling that exit reason
+//                when it froze (or guest resumed with that being the last
+//                exit handled).
+//   0x80-0x9F : host IDT fault handler entry, low 5 bits = vector (0-31).
+//                Only vectors 0-31 fit; sufficient for architectural
+//                exceptions. Value visible = HV took a fault while handling
+//                a VM-exit (or right at a fault handler).
+//   0xFC (P80_HV_ENTER)   : HV entered handle_vmexit but has not yet
+//                            read EXIT_REASON. Rare/interesting window.
+//   0xFD (P80_HV_LEAVE)   : reserved (devirtualize/teardown path).
+//   0xFE (P80_GUEST_RESUME): reserved (right before VMRESUME).
+//   0xFF                  : reserved (many boards default to 0xFF on reset).
+//
+// Overhead: 1 x outb, ~200-400 ns per write on typical hardware. Called
+// at every VM-exit → measurable but tolerable diagnostics cost. Multi-CPU
+// races produce a "last writer wins" pattern on the display, which is
+// exactly the behaviour we want for a freeze-visible byte.
+//
+// A software shadow (PORT80_LAST) is also updated so cpuid_ping can read
+// the last value via CTL id 100 (useful on boards without a Q-Code display,
+// or for post-freeze CMOS-relayed capture in future phases).
+// ---------------------------------------------------------------------------
+pub const P80_HV_ENTER: u8 = 0xFC;
+pub const P80_HV_LEAVE: u8 = 0xFD;
+pub const P80_GUEST_RESUME: u8 = 0xFE;
+
+pub static PORT80_LAST: AtomicU8 = AtomicU8::new(0);
+pub static PORT80_WRITE_COUNT: AtomicU64 = AtomicU64::new(0);
+
+/// Write a single byte to port 0x80 (POST code) and update the software
+/// shadow. Cheap enough to call at every VM-exit handler entry.
+#[inline(always)]
+pub fn port80(val: u8) {
+    PORT80_LAST.store(val, Relaxed);
+    PORT80_WRITE_COUNT.fetch_add(1, Relaxed);
+    crate::utils::instructions::outb(0x80, val);
+}
+
+/// Encode a VM-exit basic reason (0-127) into port 0x80.
+#[inline(always)]
+pub fn port80_vmexit(basic_reason: u32) {
+    port80((basic_reason & 0x7F) as u8);
+}
+
+/// Encode a host IDT fault handler entry (vector 0-31) into port 0x80.
+/// Vector 32-255 external interrupts should never reach here; the host IDT
+/// currently routes them through the soft default handler.
+#[inline(always)]
+pub fn port80_host_fault(vector: u8) {
+    port80(0x80 | (vector & 0x1F));
 }
 
 // ---------------------------------------------------------------------------
@@ -1552,6 +1617,9 @@ pub fn control(id: u64) -> u64 {
         96 => CMOS_RET_NEW_COUNTER.load(Relaxed),
         97 => CMOS_RET_NEW_THIS_SESSION.load(Relaxed),
         98 => CMOS_RET_EXPERIMENT_RAN.load(Relaxed),
+        // Port 0x80 breadcrumb (2026-07-15).
+        100 => PORT80_LAST.load(Relaxed) as u64,
+        101 => PORT80_WRITE_COUNT.load(Relaxed),
         _ => u64::MAX,
     }
 }
