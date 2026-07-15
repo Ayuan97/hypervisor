@@ -55,25 +55,13 @@
 
 ## 用户测试步骤
 
-### 步骤 0：推代码 + 构建
-
-```bash
-# Mac 侧
-cd /Users/administer/Desktop/go/hypervisor
-git add -A
-git commit -m "Phase 0-2: CMOS retention experiment"
-git push origin master
-
-# SSH 到 Windows
-sshpass -p '0223' ssh administrator@100.116.207.106
-```
+### 步骤 0：构建（Windows-first，全部本机跑）
 
 ```powershell
-# Windows 侧
-cd D:\hello\code\hypervisor
+cd D:\rust-cheat\hypervisor
 git pull origin master
 cargo build -p matrix --release
-powershell -NoProfile -ExecutionPolicy Bypass -File scripts\finalize_driver.ps1
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts\finalize_driver.ps1 -Source .\target\release\matrix.dll -Destination .\target\release\matrix.sys
 rustc tools\cpuid_ping.rs -o tools\cpuid_ping.exe
 ```
 
@@ -83,8 +71,9 @@ rustc tools\cpuid_ping.rs -o tools\cpuid_ping.exe
 
 ```powershell
 shutdown /r /t 0
-# 等重启完成，SSH 进去
+# 等重启完成，登回来本机
 
+cd D:\rust-cheat\hypervisor
 set HV_NO_SEAL=1
 scripts\start_hv.bat
 tools\cpuid_ping.exe > logs\cmos-ret-step1.txt
@@ -105,7 +94,8 @@ tools\cpuid_ping.exe > logs\cmos-ret-step1.txt
 ```
 
 ```powershell
-# 重启后：
+# 重启后（本机操作）：
+cd D:\rust-cheat\hypervisor
 set HV_NO_SEAL=1
 scripts\start_hv.bat
 tools\cpuid_ping.exe > logs\cmos-ret-step2.txt
@@ -133,7 +123,8 @@ shutdown /s /t 0
 ```
 
 ```powershell
-# 开机后：
+# 开机后（本机操作）：
+cd D:\rust-cheat\hypervisor
 set HV_NO_SEAL=1
 scripts\start_hv.bat
 tools\cpuid_ping.exe > logs\cmos-ret-step3.txt
@@ -161,7 +152,8 @@ tools\cpuid_ping.exe > logs\cmos-ret-step3.txt
 ```
 
 ```powershell
-# 重启后：
+# 重启后（本机操作）：
+cd D:\rust-cheat\hypervisor
 set HV_NO_SEAL=1
 scripts\start_hv.bat
 tools\cpuid_ping.exe > logs\cmos-ret-step4.txt
