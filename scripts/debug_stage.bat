@@ -8,7 +8,7 @@ if "%~1"=="" (
 )
 
 set "ROOT=%~dp0.."
-set "KDMAPPER=D:\hello\code\kdmapper\x64\Release\kdmapper_Release.exe"
+set "KDMAPPER=D:\rust-cheat\tools\kdmapper\x64\Release\kdmapper_Release.exe"
 set "DRIVER=%ROOT%\target\release\matrix_stage_%~1.sys"
 
 if not exist "%KDMAPPER%" (

@@ -8,7 +8,7 @@ Windows x64 Intel VT-x type-2 hypervisor（crate 名 `matrix`）。为 `game_ove
 
 ## 项目关系
 
-`D:\hello\code\hypervisor`（本项目）是 `D:\hello\code\game_overlay`（Mac 侧 `~/Desktop/go/rust-cheating`）的底层 HV/driver。分工：
+`D:\rust-cheat\hypervisor`（本项目）是 `D:\rust-cheat\code`（Mac 侧 `~/Desktop/go/rust-cheating`）的底层 HV/driver。分工：
 
 - **本项目**：Windows x64 Intel VT-x type-2 hypervisor、物理内存读、诊断通道、EPT/VM-exit 隐藏、启动前自检。
 - **game_overlay**：overlay 渲染、实体扫描，通过本项目暴露的 CPUID / VMCALL 通道读物理内存。
@@ -17,52 +17,49 @@ Windows x64 Intel VT-x type-2 hypervisor（crate 名 `matrix`）。为 `game_ove
 
 ## 开发工作流
 
-### ⚠️ 重要：单向代码流
+### 开发工作流
 
-**所有代码修改只在 Mac 上进行，严禁在 Windows 上直接编辑源代码。**
-
-原因：
-1. Windows PowerShell 的文件操作会破坏 UTF-8 编码（中文字符变乱码）。
-2. 两边同时改会产生合并冲突，且难以追踪最新版本。
-3. Mac 上有完整的编辑工具链和 Claude，Windows 只是构建运行环境。
-4. Mac 侧无 WDK，无法本地编译（`wdk-build` 需 Windows host），代码正确性靠人工审查 + 推送后 Windows 侧编译验证。
-
-完整流程：
+在 Windows 本机直接用 Codex 改，全流程都在这台机器上：
 
 ```text
-步骤 1: Mac 上编辑代码（/Users/administer/Desktop/go/hypervisor/）
-步骤 2: Mac 上提交并推送  →  git add / git commit / git push origin master
-步骤 3: SSH 到 Windows   →  sshpass -p '0223' ssh administrator@100.116.207.106
-步骤 4: Windows 拉取代码  →  cd D:\hello\code\hypervisor && git pull origin master
-步骤 5: Windows 构建      →  cargo build -p matrix --release
-步骤 6: Windows 收尾      →  powershell -File scripts\finalize_driver.ps1
-步骤 7: 重启（干净 slot） →  shutdown /r /t 0
-步骤 8: Windows 加载 HV  →  scripts\start_hv.bat
+步骤 1: 同步         →  cd D:\rust-cheat\hypervisor ; git pull origin master
+步骤 2: 编辑          →  Codex 的 Edit/Write 工具（UTF-8 安全）
+步骤 3: 提交推送     →  git add ... ; git commit ; git push origin master
+步骤 4: 构建         →  cargo build -p matrix --release
+步骤 5: 收尾         →  powershell -File scripts\finalize_driver.ps1
+步骤 6: 重启（干净 slot） → shutdown /r /t 0
+步骤 7: 加载 HV      →  scripts\start_hv.bat        (kdmapper 映射 + 自检)
 ```
 
-如果 Windows 上有未提交的改动（`git status` 显示 modified），先 `git stash` 或 `git checkout -- .` 丢弃，再 pull。不要在 Windows 上 commit。
+**约束**：别用原生 PowerShell 命令改中文源文件（会破 UTF-8）—— Codex Edit/Write、VSCode、git 客户端都 OK。**游戏运行中不要热加载/替换 HV**。
+
+如果 pull 被未 commit 的改动挡住：`git stash` 或 `git checkout -- .` 丢弃再 pull。
 
 ### 仓库信息
 
 - 远程仓库：`git@github.com:Ayuan97/hypervisor.git`
 - 分支：`master`
 - Mac 本地目录：`/Users/administer/Desktop/go/hypervisor/`
-- Windows 本地目录：`D:\hello\code\hypervisor`
+- Windows 本地目录：`D:\rust-cheat\hypervisor`
 
 ### 连接 Windows
 
 ```bash
-sshpass -p '0223' ssh administrator@100.116.207.106
+ssh alex@100.117.110.38          # zsh alias: win / winssh
 ```
 
-密码 `0223` 是本地环境固定；SSH 时如需交互 GUI（IDA/CE 等）改用 `mstsc` RDP。
+- 主机: `DESKTOP-DU71ON9`
+- 用户: `alex`
+- IP: `100.117.110.38`（Tailscale，已配 SSH key）
+
+SSH 无法启动 GUI，需要 IDA/CE 交互改用 `mstsc` RDP 或本机操作。
 
 ### 构建
 
 在 Windows 上执行（通过 SSH）：
 
 ```powershell
-cd D:\hello\code\hypervisor
+cd D:\rust-cheat\hypervisor
 git pull origin master
 
 # 常规发布构建
@@ -130,7 +127,7 @@ kdmapper 映射的实例**不能通过 unload.bat 卸载**，只能重启。
 
   ```powershell
   # Windows 侧发送
-  powershell -NoProfile -File D:\hello\code\hypervisor\tools\udp_hv_monitor.ps1 -RemoteIP 100.91.62.12 -Port 9999 -IntervalMs 100
+  powershell -NoProfile -File D:\rust-cheat\hypervisor\tools\udp_hv_monitor.ps1 -RemoteIP 100.91.62.12 -Port 9999 -IntervalMs 100
 
   # Mac 侧接收
   nc -u -l 9999

@@ -2,7 +2,7 @@
 setlocal EnableExtensions EnableDelayedExpansion
 title Rust Test Server (no EAC)
 
-set SERVER_DIR=D:\hello\code\re-tools\rust-server
+set SERVER_DIR=D:\rust-cheat\server
 set SERVER_EXE=%SERVER_DIR%\RustDedicated.exe
 set SERVER_CFG=%SERVER_DIR%\server\test\cfg\serverauto.cfg
 
@@ -13,7 +13,7 @@ echo.
 
 if not exist "%SERVER_EXE%" (
     echo [-] RustDedicated.exe not found: "%SERVER_EXE%"
-    echo     Install via: D:\hello\code\re-tools\steamcmd\steamcmd.exe +force_install_dir %SERVER_DIR% +login anonymous +app_update 258550 validate +quit
+    echo     Install via: D:\rust-cheat\tools\steamcmd\steamcmd.exe +force_install_dir %SERVER_DIR% +login anonymous +app_update 258550 validate +quit
     pause
     exit /b 1
 )
