@@ -231,6 +231,18 @@ fn cpuid_result_is_zero(result: (u32, u32, u32, u32)) -> bool {
     result.0 == 0 && result.1 == 0 && result.2 == 0 && result.3 == 0
 }
 
+fn port80_decode(v: u8) -> &'static str {
+    match v {
+        0x00 => "uninitialized (HV loaded but no VM-exit yet)",
+        0xFC => "HV_ENTER — VM-exit handler entered, EXIT_REASON not yet read",
+        0xFD => "HV_LEAVE — reserved (devirtualize teardown)",
+        0xFE => "GUEST_RESUME — reserved (pre-VMRESUME)",
+        0x80..=0x9F => "HOST_FAULT — 0x80 | (vector & 0x1F); host IDT fired inside handler",
+        0x01..=0x7F => "vmexit basic reason — HV finished vmread(EXIT_REASON) OK",
+        _ => "unknown / reserved",
+    }
+}
+
 fn cpuid_cmd(leaf: u64, cmd: u64, arg1: u64, token: u64) -> u64 {
     cpuid_cmd2(leaf, cmd, arg1, 0, token)
 }
@@ -530,6 +542,26 @@ fn main() {
     let boot_stage = hv_cmd(CMD_GET_CTL, 9);
     if boot_stage != u64::MAX && boot_stage != HV_STATUS_ACCESS_DENIED {
         println!("  BOOT_STAGE     = {}", boot_stage);
+    }
+
+    // === Port 0x80 breadcrumb (Layer 1, hardware-visible via POST card) ===
+    // Encoding (see diag.rs::port80* helpers):
+    //   0x00        uninitialized (no VM-exit yet)
+    //   0x01..=0x7F basic vmexit reason (HV completed vmread(EXIT_REASON))
+    //   0x80..=0x9F host fault marker: 0x80 | (vector & 0x1F)
+    //   0xFC/FD/FE  sentinels (HV_ENTER / HV_LEAVE / GUEST_RESUME)
+    println!("\n=== Port 0x80 breadcrumb (Layer 1) ===");
+    let p80_last = hv_cmd(CMD_GET_CTL, 100);
+    let p80_count = hv_cmd(CMD_GET_CTL, 101);
+    if p80_last == u64::MAX || p80_count == u64::MAX {
+        println!("  unsupported by loaded HV (rebuild + reboot for Layer 1)");
+    } else {
+        let last = (p80_last & 0xFF) as u8;
+        println!("  last  = 0x{:02x}  ({})", last, port80_decode(last));
+        println!("  count = {}", p80_count);
+        if p80_count == 0 {
+            println!("  [!] count=0 — no VM-exit has reached diag::port80() yet");
+        }
     }
 
     println!("\n=== Host IDT Patch ===");
