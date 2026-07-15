@@ -416,6 +416,64 @@ pub fn port80_host_fault(vector: u8) {
 }
 
 // ---------------------------------------------------------------------------
+// Layer 4: HV vs Guest classifier (2026-07-15).
+//
+// Per-CPU "am I currently inside handle_vmexit?" flag. Set at handler entry
+// via RAII guard; cleared on Drop, so every Ok/Err return path (including `?`
+// propagation) resets it. `fatal_vmx_failure_loop_pub()` is `-> !` and never
+// drops — the flag stays 1, which correctly records "this CPU died in HV".
+//
+// Answers observation rule #3 in hypervisor/CLAUDE.md: distinguish
+// "HV stuck" from "guest stuck" without needing a working IDT or COM logger.
+//
+// Read via CTL id 102 (bitmap for CPU 0-63) and 103 (popcount).
+// ---------------------------------------------------------------------------
+pub static HANDLER_ACTIVE: [AtomicU8; MAX_TRACKED_CPUS] =
+    [const { AtomicU8::new(0) }; MAX_TRACKED_CPUS];
+
+pub struct HandlerGuard(usize);
+
+impl Drop for HandlerGuard {
+    #[inline(always)]
+    fn drop(&mut self) {
+        if self.0 < MAX_TRACKED_CPUS {
+            HANDLER_ACTIVE[self.0].store(0, Relaxed);
+        }
+    }
+}
+
+/// Mark the current CPU as inside handle_vmexit. Drop clears the flag.
+#[inline(always)]
+pub fn handler_enter() -> HandlerGuard {
+    let cpu = super::host_idt::current_cpu_index();
+    if cpu < MAX_TRACKED_CPUS {
+        HANDLER_ACTIVE[cpu].store(1, Relaxed);
+    }
+    HandlerGuard(cpu)
+}
+
+pub fn handler_active_bitmap_lo() -> u64 {
+    let mut bits = 0u64;
+    let n = if MAX_TRACKED_CPUS < 64 { MAX_TRACKED_CPUS } else { 64 };
+    for cpu in 0..n {
+        if HANDLER_ACTIVE[cpu].load(Relaxed) != 0 {
+            bits |= 1u64 << cpu;
+        }
+    }
+    bits
+}
+
+pub fn handler_active_count() -> u64 {
+    let mut n = 0u64;
+    for cpu in 0..MAX_TRACKED_CPUS {
+        if HANDLER_ACTIVE[cpu].load(Relaxed) != 0 {
+            n += 1;
+        }
+    }
+    n
+}
+
+// ---------------------------------------------------------------------------
 // CMOS persistence for freeze-critical Step 1-4 fields (2026-07-09).
 //
 // The 2026-07-09 EAC scenario test proved KEBUGCHECKEX / first-fault / total
@@ -1620,6 +1678,9 @@ pub fn control(id: u64) -> u64 {
         // Port 0x80 breadcrumb (2026-07-15).
         100 => PORT80_LAST.load(Relaxed) as u64,
         101 => PORT80_WRITE_COUNT.load(Relaxed),
+        // Layer 4 HV vs Guest classifier (2026-07-15).
+        102 => handler_active_bitmap_lo(),
+        103 => handler_active_count(),
         _ => u64::MAX,
     }
 }

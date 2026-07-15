@@ -124,6 +124,11 @@ impl VmExit {
     ) -> Result<ExitType, HypervisorError> {
         let exit_tsc_start = unsafe { x86::time::rdtsc() };
 
+        // Layer 4: mark this CPU as inside handle_vmexit. Drop clears the flag
+        // on every Ok/Err return; fatal_vmx_failure_loop_pub() is `-> !` and
+        // never drops, so the flag stays 1 to record "died in HV". See diag.rs.
+        let _handler_guard = diag::handler_enter();
+
         // Snapshot + freeze the LBR stack ASAP so host handler branches do
         // not pollute what the guest reads back later. Cheap fast-path if
         // LBR is disabled (single RDMSR). See intel/lbr.rs.

@@ -564,6 +564,29 @@ fn main() {
         }
     }
 
+    // === HV vs Guest classifier (Layer 4) ===
+    // Non-zero bits = CPUs currently executing inside handle_vmexit. A live
+    // snapshot always shows ~0 (we are calling from user-mode, guest side),
+    // but after a freeze the retained bitmap tells us which CPUs died in HV.
+    println!("\n=== HV vs Guest classifier (Layer 4) ===");
+    let active_bitmap = hv_cmd(CMD_GET_CTL, 102);
+    let active_count = hv_cmd(CMD_GET_CTL, 103);
+    if active_bitmap == u64::MAX || active_count == u64::MAX {
+        println!("  unsupported by loaded HV (rebuild + reboot for Layer 4)");
+    } else {
+        println!("  active bitmap  = {:#018x}", active_bitmap);
+        println!("  active count   = {}  (CPUs currently in handle_vmexit)", active_count);
+        if active_count > 0 {
+            let mut cpus = Vec::new();
+            for cpu in 0..64u64 {
+                if (active_bitmap >> cpu) & 1 == 1 {
+                    cpus.push(cpu);
+                }
+            }
+            println!("  in HV now      = CPU {:?}", cpus);
+        }
+    }
+
     println!("\n=== Host IDT Patch ===");
     let patch_calls = hv_cmd(CMD_GET_CTL, 10);
     let patch_ok_calls = hv_cmd(CMD_GET_CTL, 11);
