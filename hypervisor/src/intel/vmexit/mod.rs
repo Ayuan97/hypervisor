@@ -166,6 +166,13 @@ impl VmExit {
                 "VM-entry failure: reason={:#x} qual={:#x} rip={:#x} — halting CPU",
                 exit_reason, exit_qual, guest_rip
             );
+            // Layer 3: force-flush CMOS right before entering fatal loop so
+            // the post-freeze reboot reads back the *moment-before-crash*
+            // snapshot rather than up to 63 exits stale. port80_last will
+            // be the basic reason (0x01..=0x7F), handler_active bitmap
+            // will include this CPU, and the CMOS slot will pin this state
+            // permanently since fatal_vmx_failure_loop_pub() never returns.
+            diag::layer3_force_flush();
             crate::intel::vmlaunch::fatal_vmx_failure_loop_pub();
         }
 

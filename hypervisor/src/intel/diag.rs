@@ -536,6 +536,24 @@ pub fn layer3_maybe_flush() {
     LAYER3_FLUSH_LOCK.store(false, core::sync::atomic::Ordering::Release);
 }
 
+/// Force a Layer 3 flush right now, bypassing the 64-exit interval.
+/// Use at Rust-reachable fatal paths (VM entry failure, pre-fatal-loop) so
+/// the CMOS snapshot reflects the moment-before-crash rather than up to
+/// 63 exits ago. Uses try-acquire — if another CPU is already flushing,
+/// their in-progress write is fresh enough; we skip to avoid deadlock if
+/// that CPU is itself frozen.
+#[inline(always)]
+pub fn layer3_force_flush() {
+    if LAYER3_FLUSH_LOCK
+        .compare_exchange(false, true, core::sync::atomic::Ordering::Acquire, Relaxed)
+        .is_err()
+    {
+        return;
+    }
+    layer3_flush();
+    LAYER3_FLUSH_LOCK.store(false, core::sync::atomic::Ordering::Release);
+}
+
 fn layer3_flush() {
     let seq = LAYER3_SEQUENCE.fetch_add(1, Relaxed).wrapping_add(1) as u16;
     let base = if seq & 1 == 1 { CMOS_L3_SLOT_A_BASE } else { CMOS_L3_SLOT_B_BASE };
@@ -1869,11 +1887,8 @@ pub fn control(id: u64) -> u64 {
         114 => LAYER3_CACHE_LAST_EXIT.load(Relaxed) as u64,
         115 => LAYER3_CACHE_COUNT.load(Relaxed) as u64,
         116 => LAYER3_CACHE_VALID.load(Relaxed) as u64,
-        117 => LAYER3_FLUSH_COUNT.load(Relaxed),   // total flush attempts (RAM)
-        // Raw CMOS magic byte reads for slot A/B (debug — remove after Layer 3 verified).
-        118 => ext_cmos_read(CMOS_L3_SLOT_A_BASE) as u64,
-        119 => ext_cmos_read(CMOS_L3_SLOT_B_BASE) as u64,
-        120 => LAYER3_SEQUENCE.load(Relaxed),      // actual flushes done (not vmexits)
+        117 => LAYER3_FLUSH_COUNT.load(Relaxed),   // total vmexits (not flushes)
+        120 => LAYER3_SEQUENCE.load(Relaxed),      // actual flushes done — used by cpuid_ping origin judgment
         _ => u64::MAX,
     }
 }

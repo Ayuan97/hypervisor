@@ -600,11 +600,7 @@ fn main() {
     } else {
         println!("  vmexit count (RAM)= {}  (this-boot vmexits observed)", l3_flush_count);
         let l3_actual_flush = hv_cmd(CMD_GET_CTL, 120);
-        let l3_raw_a = hv_cmd(CMD_GET_CTL, 118);
-        let l3_raw_b = hv_cmd(CMD_GET_CTL, 119);
-        println!("  actual flushes    = {}  (LAYER3_SEQUENCE)", l3_actual_flush);
-        println!("  raw slot A magic  = 0x{:02x}  (expect 0x4c if flush wrote A)", l3_raw_a);
-        println!("  raw slot B magic  = 0x{:02x}  (expect 0x4c if flush wrote B)", l3_raw_b);
+        println!("  actual flushes    = {}  (this-boot flushes; force-flush counts too)", l3_actual_flush);
         let l3_valid = hv_cmd(CMD_GET_CTL, 116);
         let slot_name = match l3_slot_id { 1 => "A", 2 => "B", _ => "none" };
         if l3_valid != 1 {
