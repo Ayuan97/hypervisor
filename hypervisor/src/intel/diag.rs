@@ -474,6 +474,184 @@ pub fn handler_active_count() -> u64 {
 }
 
 // ---------------------------------------------------------------------------
+// Layer 3: CMOS mirror of Layer 1 (Port 0x80) + Layer 4 (HV/Guest classifier).
+//
+// Phase 0 (2026-07-15) confirmed Ext CMOS 0x20-0x2C survives both warm reset
+// and cold boot. Layer 3 mirrors the freeze-critical Layer 1 + 4 state to
+// Ext CMOS 0x30-0x4E so a hard-reset after freeze can read back
+// "who died in HV" + "last VM-exit reason on that CPU".
+//
+// Layout (double-buffered, 2 slots × 15 bytes, 0x30-0x4E):
+//   Slot A: 0x30-0x3E    (written when sequence is odd)
+//   Slot B: 0x40-0x4E    (written when sequence is even)
+//
+//   Per-slot:
+//     +0:      magic 0x4C ('L')
+//     +1..+2:  sequence u16 LE
+//     +3:      PORT80_LAST snapshot
+//     +4..+11: HANDLER_ACTIVE bitmap (u64 LE)
+//     +12:     LAST_EXIT_REASON low 8 bits
+//     +13:     popcount(bitmap)
+//     +14:     XOR checksum of +0..+13
+//
+// Torn-write protection: writes always target only one slot per flush;
+// the other slot stays intact. Reader validates each slot's checksum and
+// picks the newer valid one. Freeze mid-write only invalidates that slot.
+//
+// Flush cadence: every LAYER3_FLUSH_INTERVAL VM-exits (64 by default). At
+// ~100k exits/s the CMOS overhead is ~5% (2 outs × 15 bytes × ~1us / 64 exits).
+// ---------------------------------------------------------------------------
+const CMOS_L3_MAGIC: u8 = 0x4C;
+const CMOS_L3_SLOT_A_BASE: u8 = 0x30;
+const CMOS_L3_SLOT_B_BASE: u8 = 0x40;
+const LAYER3_FLUSH_INTERVAL: u64 = 64;
+
+static LAYER3_FLUSH_COUNT: AtomicU64 = AtomicU64::new(0);
+static LAYER3_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+// Serialize concurrent flushers. Two CPUs both hitting the 64-exit boundary
+// would otherwise interleave `ext_cmos_write` calls to the same slot,
+// producing torn bytes even though the double-buffer scheme protects
+// against freeze-in-write. If we can't acquire, we skip this cycle —
+// another CPU is already writing, and the next 64-exit boundary catches up.
+static LAYER3_FLUSH_LOCK: AtomicBool = AtomicBool::new(false);
+
+fn layer3_bitmap_byte(bitmap: u64, i: usize) -> u8 {
+    (bitmap >> (i * 8)) as u8
+}
+
+#[inline(always)]
+pub fn layer3_maybe_flush() {
+    let n = LAYER3_FLUSH_COUNT.fetch_add(1, Relaxed).wrapping_add(1);
+    if n % LAYER3_FLUSH_INTERVAL != 0 {
+        return;
+    }
+    // Try-acquire; skip if another CPU is already mid-flush.
+    if LAYER3_FLUSH_LOCK
+        .compare_exchange(false, true, core::sync::atomic::Ordering::Acquire, Relaxed)
+        .is_err()
+    {
+        return;
+    }
+    layer3_flush();
+    LAYER3_FLUSH_LOCK.store(false, core::sync::atomic::Ordering::Release);
+}
+
+fn layer3_flush() {
+    let seq = LAYER3_SEQUENCE.fetch_add(1, Relaxed).wrapping_add(1) as u16;
+    let base = if seq & 1 == 1 { CMOS_L3_SLOT_A_BASE } else { CMOS_L3_SLOT_B_BASE };
+
+    let port80 = PORT80_LAST.load(Relaxed);
+    let bitmap = handler_active_bitmap_lo();
+    let last_exit = (LAST_EXIT_REASON.load(Relaxed) & 0xFF) as u8;
+    let count = handler_active_count() as u8;
+
+    let seq_lo = seq as u8;
+    let seq_hi = (seq >> 8) as u8;
+
+    let mut cksum = CMOS_L3_MAGIC;
+    cksum ^= seq_lo;
+    cksum ^= seq_hi;
+    cksum ^= port80;
+    for i in 0..8 {
+        cksum ^= layer3_bitmap_byte(bitmap, i);
+    }
+    cksum ^= last_exit;
+    cksum ^= count;
+
+    // Magic first is safe under torn-write since the *other* slot stays valid.
+    ext_cmos_write(base, CMOS_L3_MAGIC);
+    ext_cmos_write(base + 1, seq_lo);
+    ext_cmos_write(base + 2, seq_hi);
+    ext_cmos_write(base + 3, port80);
+    for i in 0..8 {
+        ext_cmos_write(base + 4 + i as u8, layer3_bitmap_byte(bitmap, i));
+    }
+    ext_cmos_write(base + 12, last_exit);
+    ext_cmos_write(base + 13, count);
+    ext_cmos_write(base + 14, cksum);
+}
+
+struct Layer3Slot {
+    seq: u16,
+    port80: u8,
+    bitmap: u64,
+    last_exit: u8,
+    count: u8,
+    valid: bool,
+}
+
+fn layer3_read_slot(base: u8) -> Layer3Slot {
+    let magic = ext_cmos_read(base);
+    let seq_lo = ext_cmos_read(base + 1);
+    let seq_hi = ext_cmos_read(base + 2);
+    let port80 = ext_cmos_read(base + 3);
+    let mut bitmap = 0u64;
+    for i in 0..8 {
+        bitmap |= (ext_cmos_read(base + 4 + i as u8) as u64) << (i * 8);
+    }
+    let last_exit = ext_cmos_read(base + 12);
+    let count = ext_cmos_read(base + 13);
+    let stored_cksum = ext_cmos_read(base + 14);
+
+    let mut expected = magic;
+    expected ^= seq_lo;
+    expected ^= seq_hi;
+    expected ^= port80;
+    for i in 0..8 {
+        expected ^= layer3_bitmap_byte(bitmap, i);
+    }
+    expected ^= last_exit;
+    expected ^= count;
+
+    Layer3Slot {
+        seq: (seq_lo as u16) | ((seq_hi as u16) << 8),
+        port80,
+        bitmap,
+        last_exit,
+        count,
+        valid: magic == CMOS_L3_MAGIC && stored_cksum == expected,
+    }
+}
+
+// Cache for the last layer3_refresh_cache() call so cpuid_ping can query
+// multiple fields without re-reading CMOS 30 bytes each time (and without
+// tearing across a mid-read HV flush).
+static LAYER3_CACHE_SLOT_ID: AtomicU8 = AtomicU8::new(0);
+static LAYER3_CACHE_SEQ: AtomicU64 = AtomicU64::new(0);
+static LAYER3_CACHE_PORT80: AtomicU8 = AtomicU8::new(0);
+static LAYER3_CACHE_BITMAP: AtomicU64 = AtomicU64::new(0);
+static LAYER3_CACHE_LAST_EXIT: AtomicU8 = AtomicU8::new(0);
+static LAYER3_CACHE_COUNT: AtomicU8 = AtomicU8::new(0);
+static LAYER3_CACHE_VALID: AtomicU8 = AtomicU8::new(0);
+
+/// Read both slots from CMOS, pick the newer valid one, snapshot to cache,
+/// return the slot id (0=none, 1=A, 2=B). Subsequent CTL 111-116 read cache.
+fn layer3_refresh_cache() -> u8 {
+    let a = layer3_read_slot(CMOS_L3_SLOT_A_BASE);
+    let b = layer3_read_slot(CMOS_L3_SLOT_B_BASE);
+    let (slot_id, seq, port80, bitmap, last_exit, count, valid) = match (a.valid, b.valid) {
+        (true, true) => {
+            if (a.seq.wrapping_sub(b.seq) as i16) >= 0 {
+                (1u8, a.seq, a.port80, a.bitmap, a.last_exit, a.count, true)
+            } else {
+                (2u8, b.seq, b.port80, b.bitmap, b.last_exit, b.count, true)
+            }
+        }
+        (true, false) => (1u8, a.seq, a.port80, a.bitmap, a.last_exit, a.count, true),
+        (false, true) => (2u8, b.seq, b.port80, b.bitmap, b.last_exit, b.count, true),
+        (false, false) => (0u8, 0, 0, 0, 0, 0, false),
+    };
+    LAYER3_CACHE_SLOT_ID.store(slot_id, Relaxed);
+    LAYER3_CACHE_SEQ.store(seq as u64, Relaxed);
+    LAYER3_CACHE_PORT80.store(port80, Relaxed);
+    LAYER3_CACHE_BITMAP.store(bitmap, Relaxed);
+    LAYER3_CACHE_LAST_EXIT.store(last_exit, Relaxed);
+    LAYER3_CACHE_COUNT.store(count, Relaxed);
+    LAYER3_CACHE_VALID.store(if valid { 1 } else { 0 }, Relaxed);
+    slot_id
+}
+
+// ---------------------------------------------------------------------------
 // CMOS persistence for freeze-critical Step 1-4 fields (2026-07-09).
 //
 // The 2026-07-09 EAC scenario test proved KEBUGCHECKEX / first-fault / total
@@ -1681,6 +1859,21 @@ pub fn control(id: u64) -> u64 {
         // Layer 4 HV vs Guest classifier (2026-07-15).
         102 => handler_active_bitmap_lo(),
         103 => handler_active_count(),
+        // Layer 3 CMOS mirror readout (2026-07-15). CTL 110 refreshes the
+        // cache from CMOS (~30 reads), CTL 111-116 read that cache.
+        // cpuid_ping must call CTL 110 first, then the others.
+        110 => layer3_refresh_cache() as u64,      // slot_id (0=none, 1=A, 2=B) + refresh
+        111 => LAYER3_CACHE_SEQ.load(Relaxed),
+        112 => LAYER3_CACHE_PORT80.load(Relaxed) as u64,
+        113 => LAYER3_CACHE_BITMAP.load(Relaxed),
+        114 => LAYER3_CACHE_LAST_EXIT.load(Relaxed) as u64,
+        115 => LAYER3_CACHE_COUNT.load(Relaxed) as u64,
+        116 => LAYER3_CACHE_VALID.load(Relaxed) as u64,
+        117 => LAYER3_FLUSH_COUNT.load(Relaxed),   // total flush attempts (RAM)
+        // Raw CMOS magic byte reads for slot A/B (debug — remove after Layer 3 verified).
+        118 => ext_cmos_read(CMOS_L3_SLOT_A_BASE) as u64,
+        119 => ext_cmos_read(CMOS_L3_SLOT_B_BASE) as u64,
+        120 => LAYER3_SEQUENCE.load(Relaxed),      // actual flushes done (not vmexits)
         _ => u64::MAX,
     }
 }

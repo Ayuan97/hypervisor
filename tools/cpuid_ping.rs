@@ -587,6 +587,58 @@ fn main() {
         }
     }
 
+    // === Layer 3: CMOS mirror of Layer 1 + Layer 4 ===
+    // CTL 110 first (refreshes cache from CMOS), then 111-117 read the cache.
+    // After a freeze + hard reset, this is the ONLY layer whose state
+    // survives (Layer 1 + 4 live in RAM). Two slots (A/B) are alternately
+    // written every 64 VM-exits; reader picks newer valid via checksum.
+    println!("\n=== Layer 3: CMOS mirror (freeze-survivable) ===");
+    let l3_slot_id = hv_cmd(CMD_GET_CTL, 110);
+    let l3_flush_count = hv_cmd(CMD_GET_CTL, 117);
+    if l3_slot_id == u64::MAX || l3_flush_count == u64::MAX {
+        println!("  unsupported by loaded HV (rebuild + reboot for Layer 3)");
+    } else {
+        println!("  vmexit count (RAM)= {}  (this-boot vmexits observed)", l3_flush_count);
+        let l3_actual_flush = hv_cmd(CMD_GET_CTL, 120);
+        let l3_raw_a = hv_cmd(CMD_GET_CTL, 118);
+        let l3_raw_b = hv_cmd(CMD_GET_CTL, 119);
+        println!("  actual flushes    = {}  (LAYER3_SEQUENCE)", l3_actual_flush);
+        println!("  raw slot A magic  = 0x{:02x}  (expect 0x4c if flush wrote A)", l3_raw_a);
+        println!("  raw slot B magic  = 0x{:02x}  (expect 0x4c if flush wrote B)", l3_raw_b);
+        let l3_valid = hv_cmd(CMD_GET_CTL, 116);
+        let slot_name = match l3_slot_id { 1 => "A", 2 => "B", _ => "none" };
+        if l3_valid != 1 {
+            println!("  selected slot     = {}  (no valid CMOS data — first boot or both torn)", slot_name);
+        } else {
+            let l3_seq = hv_cmd(CMD_GET_CTL, 111);
+            let l3_port80 = hv_cmd(CMD_GET_CTL, 112) as u8;
+            let l3_bitmap = hv_cmd(CMD_GET_CTL, 113);
+            let l3_last_exit = hv_cmd(CMD_GET_CTL, 114) as u8;
+            let l3_count = hv_cmd(CMD_GET_CTL, 115);
+            // Distinguish prev-boot data (seq > this-boot flush count) from
+            // this-boot live data (seq within [1, this-boot flushes]).
+            let origin = if l3_seq > 0 && l3_seq <= l3_actual_flush {
+                "THIS BOOT (live)"
+            } else {
+                "PREV BOOT (survived reboot) ← freeze diagnostic data"
+            };
+            println!("  selected slot     = {}  sequence = {}  → {}", slot_name, l3_seq, origin);
+            println!("  port80_last       = 0x{:02x}  ({})", l3_port80, port80_decode(l3_port80));
+            println!("  last_exit_reason  = 0x{:02x}  ({})", l3_last_exit,
+                if l3_last_exit == 0 { "none captured" } else { "basic vmexit reason" });
+            println!("  handler_active    = {:#018x}  count={}", l3_bitmap, l3_count);
+            if l3_count > 0 {
+                let mut cpus = Vec::new();
+                for cpu in 0..64u64 {
+                    if (l3_bitmap >> cpu) & 1 == 1 {
+                        cpus.push(cpu);
+                    }
+                }
+                println!("  in HV (last flush)= CPU {:?}  ← if from PREV BOOT: candidates for \"died in HV\"", cpus);
+            }
+        }
+    }
+
     println!("\n=== Host IDT Patch ===");
     let patch_calls = hv_cmd(CMD_GET_CTL, 10);
     let patch_ok_calls = hv_cmd(CMD_GET_CTL, 11);

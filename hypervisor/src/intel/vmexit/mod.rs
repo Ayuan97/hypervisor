@@ -129,6 +129,12 @@ impl VmExit {
         // never drops, so the flag stays 1 to record "died in HV". See diag.rs.
         let _handler_guard = diag::handler_enter();
 
+        // Layer 3: every LAYER3_FLUSH_INTERVAL exits (64), mirror
+        // PORT80_LAST + HANDLER_ACTIVE bitmap to CMOS 0x30-0x4E (double-buffered).
+        // After a freeze + hard reset, cpuid_ping reads back the last snapshot
+        // that made it to persistent storage. See diag.rs::layer3_maybe_flush.
+        diag::layer3_maybe_flush();
+
         // Snapshot + freeze the LBR stack ASAP so host handler branches do
         // not pollute what the guest reads back later. Cheap fast-path if
         // LBR is disabled (single RDMSR). See intel/lbr.rs.
