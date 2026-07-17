@@ -154,6 +154,14 @@ impl VmExit {
         // dispatch to. If we freeze inside that handler, this value stays.
         diag::port80_vmexit(basic_reason);
 
+        // Layer 6 persistent per-CPU snapshot — CLAUDE.md observation rule #1
+        // says data must be in persistent storage BEFORE death, not written
+        // AT death. snap_flush writes this CPU's sequence + last exit reason
+        // to CMOS every SNAP_FLUSH_INTERVAL vmexits. On post-freeze reboot,
+        // reader compares each CPU's last-flushed sequence to global to see
+        // which CPU stopped exiting first (= died first). See diag.rs.
+        diag::snap_flush(basic_reason as u64);
+
         if vm_entry_failure {
             use core::sync::atomic::Ordering::Relaxed;
             diag::EXIT_OTHER.fetch_add(1, Relaxed);
@@ -338,10 +346,8 @@ impl VmExit {
 
             VmxBasicExitReason::Vmcall => {
                 diag::LAST_HANDLER_ID.store(4, Relaxed);
-                match handle_vmcall(guest_registers, vmx) {
-                    Some(exit) => exit,
-                    None => handle_undefined_opcode_exception(),
-                }
+                handle_vmcall(guest_registers, vmx)
+                    .unwrap_or_else(handle_undefined_opcode_exception)
             }
 
             VmxBasicExitReason::ControlRegisterAccesses => {
@@ -429,6 +435,52 @@ impl VmExit {
                 diag::LAST_HANDLER_ID.store(18, Relaxed);
                 handle_xsetbv(guest_registers)
             }
+            // Basic reason 3. Intel SDM 25.2: "INIT signals are blocked in
+            // VMX non-root operation and cause VM-exit reason 3 instead of
+            // resetting the logical processor." The correct HV response is
+            // to DISCARD the INIT — guest continues unaffected. Previously
+            // this fell through to `handle_undefined_opcode_exception()`
+            // which injected #UD into guest, which is architecturally wrong
+            // (INIT is not an instruction) and observed 2026-07-16 as the
+            // root cause of an EAC-triggered freeze (Layer 6 caught CPU 11
+            // last exit reason = 3 at freeze moment).
+            //
+            // Guest missing an INIT signal is exactly what we want: whoever
+            // sent it (EAC probing, per known secret.club anti-VM technique)
+            // expected the CPU to reset. Silently swallowing the INIT means
+            // guest keeps running normally and the sender can't distinguish
+            // "INIT swallowed" from "target was busy". This is the standard
+            // stealth response.
+            VmxBasicExitReason::InitSignal => {
+                diag::EXIT_OTHER.fetch_add(1, Relaxed);
+                diag::LAST_HANDLER_ID.store(21, Relaxed);
+                log::info!("INIT signal discarded (VMX non-root)");
+                ExitType::Continue
+            }
+
+            // Basic reason 4. SIPI is the second half of INIT-SIPI-SIPI
+            // multiprocessor startup. In VMX non-root on a running CPU,
+            // SIPI is only meaningful right after INIT (which we swallow).
+            // Discarding preserves the "no reset happened" story to any
+            // observer.
+            VmxBasicExitReason::StartupIpi => {
+                diag::EXIT_OTHER.fetch_add(1, Relaxed);
+                diag::LAST_HANDLER_ID.store(22, Relaxed);
+                log::info!("SIPI discarded (VMX non-root)");
+                ExitType::Continue
+            }
+
+            // Basic reason 2. Guest triple-faulted → guest is unrecoverable.
+            // Don't inject #UD; that just adds a fourth fault to the pile.
+            // Log so we notice + Continue so at least the HV keeps other
+            // CPUs alive (this CPU's guest state is already broken).
+            VmxBasicExitReason::TripleFault => {
+                diag::EXIT_OTHER.fetch_add(1, Relaxed);
+                diag::LAST_HANDLER_ID.store(23, Relaxed);
+                log::error!("Guest TRIPLE FAULT — guest state unrecoverable");
+                ExitType::Continue
+            }
+
             VmxBasicExitReason::VmxPreemptionTimerExpired => {
                 diag::EXIT_PREEMPT.fetch_add(1, Relaxed);
                 diag::LAST_HANDLER_ID.store(19, Relaxed);
@@ -436,16 +488,13 @@ impl VmExit {
                     x86::vmx::vmcs::guest::VMX_PREEMPTION_TIMER_VALUE,
                     0x0060_0000u64,
                 );
-                let inject_nmi = diag::cpu_record_timer_rip(guest_registers.rip);
-                if inject_nmi {
-                    // Inject NMI into guest to force BSOD + crash dump
-                    // VM-entry interruption info: valid=1, type=NMI(2), vector=2
-                    let nmi_info: u64 = (1u64 << 31) | (2u64 << 8) | 2u64;
-                    let _ = vmwrite_checked(
-                        x86::vmx::vmcs::control::VMENTRY_INTERRUPTION_INFO_FIELD,
-                        nmi_info,
-                    );
-                }
+                // Legacy per-CPU stuck-RIP tracker kept for existing GET_CTL
+                // diagnostics — always returns false. The old auto-NMI and
+                // new smart-detector NMI paths were both disabled 2026-07-16
+                // because they violated CLAUDE.md observation rule #1 ("data
+                // must be in persistent storage BEFORE death"). Layer 6
+                // (snap_flush in the shared prologue) replaces both.
+                let _ = diag::cpu_record_timer_rip(guest_registers.rip);
                 ExitType::Continue
             }
             _ => {
@@ -469,6 +518,12 @@ impl VmExit {
         reinject_idt_vectoring_event();
         diag::cpu_enter_phase(diag::PHASE_CHECK_NMI);
         super::host_idt::check_pending_nmi();
+
+        // NMI-inject-BSOD path disabled 2026-07-16 (violated observation
+        // rule #1). The consume path is kept but always no-ops because
+        // nothing calls `preempt_timer_check_freeze` anymore. Data now
+        // flows through the Layer 6 persistent snapshot instead.
+
         diag::cpu_enter_phase(diag::PHASE_PRE_VMRESUME);
         diag::watchdog_handler_finish(guest_registers.rip);
         if lbr_saved {

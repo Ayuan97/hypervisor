@@ -138,8 +138,18 @@ impl MsrBitmap {
             set_msr_bitmap_bit(&mut self.write_low_msrs, msr);
         }
 
-        // Intercept writes to IA32_TSC_AUX — host IDT handlers use rdtscp
-        // for per-CPU indexing; a guest WRMSR would corrupt that index.
+        // IA32_TSC_AUX — intercept BOTH directions.
+        //
+        // Writes: host IDT handlers use rdtscp for per-CPU indexing, so a
+        // guest WRMSR to physical MSR would corrupt host's index. Absorb
+        // into per-CPU shadow (`msr.rs`).
+        //
+        // Reads: previously pass-through, which leaked host's per-CPU index
+        // to guest — a wrmsr-then-rdmsr probe from EAC sees "we wrote X but
+        // MSR contains host's index Y ≠ X", a clean HV fingerprint. Read
+        // now returns the shadow so wrmsr-then-rdmsr is consistent with
+        // bare metal.
+        set_msr_bitmap_bit(&mut self.read_high_msrs, IA32_TSC_AUX);
         set_msr_bitmap_bit(&mut self.write_high_msrs, IA32_TSC_AUX);
 
         // ---- P2 stealth interception (secret.club EAC detection vectors) ----

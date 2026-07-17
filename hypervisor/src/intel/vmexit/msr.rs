@@ -6,7 +6,18 @@ use crate::{
     intel::{events::EventInjection, support, vmexit::ExitType},
     utils::capture::GuestRegisters,
 };
+use core::sync::atomic::AtomicU64;
 use x86::{msr, vmx::vmcs};
+
+/// Per-CPU shadow of IA32_TSC_AUX. Must be >= diag::MAX_TRACKED_CPUS since
+/// current_cpu_index() ranges over that. Kept as a plain const here to
+/// avoid a cross-module dependency on diag.
+pub(super) const MAX_TSC_AUX_SHADOW_CPUS: usize = 64;
+
+#[allow(clippy::declare_interior_mutable_const)]
+const ZERO_U64: AtomicU64 = AtomicU64::new(0);
+pub(super) static TSC_AUX_SHADOW: [AtomicU64; MAX_TSC_AUX_SHADOW_CPUS] =
+    [ZERO_U64; MAX_TSC_AUX_SHADOW_CPUS];
 
 const IA32_FEATURE_CONTROL_MSR: u32 = 0x3a;
 const IA32_TSC_AUX: u32 = 0xC000_0103;
@@ -107,7 +118,40 @@ where
         return ExitType::IncrementRIP;
     }
 
-    if matches!(access_type, MsrAccessType::Write) && msr == IA32_TSC_AUX {
+    // IA32_TSC_AUX — per-CPU shadow. Host's physical TSC_AUX carries the
+    // logical-CPU index used by rdtscp-based dispatch (see host_idt.rs).
+    // If guest writes reach the physical MSR, that per-CPU index gets
+    // corrupted and host handlers dispatch to the wrong CPU slot. If guest
+    // reads reach the physical MSR, guest sees the host's per-CPU index
+    // instead of what it last wrote — a wrmsr-then-rdmsr probe reveals us.
+    // Shadow the guest's value per-CPU; physical MSR is untouched.
+    if msr == IA32_TSC_AUX {
+        let cpu = crate::intel::host_idt::current_cpu_index();
+        if cpu >= MAX_TSC_AUX_SHADOW_CPUS {
+            // Out-of-range CPU (shouldn't happen given MAX_TRACKED_CPUS=64,
+            // but guard anyway). Absorb writes, return 0 for reads to keep
+            // wrmsr-then-rdmsr consistent within this CPU's session.
+            match access_type {
+                MsrAccessType::Read => {
+                    guest_registers.rax = 0;
+                    guest_registers.rdx = 0;
+                }
+                MsrAccessType::Write => {}
+            }
+            return ExitType::IncrementRIP;
+        }
+        match access_type {
+            MsrAccessType::Read => {
+                let value = TSC_AUX_SHADOW[cpu].load(core::sync::atomic::Ordering::Relaxed);
+                guest_registers.rax = value & 0xFFFF_FFFF;
+                guest_registers.rdx = value >> 32;
+            }
+            MsrAccessType::Write => {
+                let value = ((guest_registers.rdx as u64) << 32)
+                    | (guest_registers.rax as u64 & 0xFFFF_FFFF);
+                TSC_AUX_SHADOW[cpu].store(value, core::sync::atomic::Ordering::Relaxed);
+            }
+        }
         return ExitType::IncrementRIP;
     }
 
@@ -422,6 +466,37 @@ mod tests {
 
         assert_eq!(exit, ExitType::IncrementRIP);
         assert_eq!(injected_error, None);
+    }
+
+    #[test]
+    fn tsc_aux_wrmsr_then_rdmsr_returns_shadow_value() {
+        // Whatever guest wrote, subsequent guest read must return the same
+        // value — otherwise EAC's `wrmsr TSC_AUX, X; rdmsr TSC_AUX` probe
+        // sees inconsistency and fingerprints us.
+        let mut regs = GuestRegisters::default();
+        regs.rcx = IA32_TSC_AUX as u64;
+        regs.rax = 0xDEAD_BEEF;
+        regs.rdx = 0x1234_5678;
+
+        let exit = handle_msr_access_test(
+            &mut regs,
+            MsrAccessType::Write,
+            |_| panic!("TSC_AUX write must not reach hardware"),
+            |code| panic!("TSC_AUX write must not #GP (code={})", code),
+        );
+        assert_eq!(exit, ExitType::IncrementRIP);
+
+        regs.rax = 0;
+        regs.rdx = 0;
+        let exit = handle_msr_access_test(
+            &mut regs,
+            MsrAccessType::Read,
+            |_| panic!("TSC_AUX read must not reach hardware (must hit shadow)"),
+            |code| panic!("TSC_AUX read must not #GP (code={})", code),
+        );
+        assert_eq!(exit, ExitType::IncrementRIP);
+        assert_eq!(regs.rax, 0xDEAD_BEEF);
+        assert_eq!(regs.rdx, 0x1234_5678);
     }
 
     #[test]

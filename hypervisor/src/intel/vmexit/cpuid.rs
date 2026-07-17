@@ -140,12 +140,34 @@ pub fn handle_cpuid(guest_registers: &mut GuestRegisters, vmx: &mut Vmx, exit_ts
         }
     }
 
-    if !minimal_cpuid() {
+    // Ophion CPUID→RDTSC spoofing (2026-07-16 EXPERIMENT: disabled).
+    //
+    // Ophion spoofs the NEXT RDTSC after a CPUID to make (rdtsc_after -
+    // rdtsc_before) look like bare-metal CPUID cost (~120 cycles). Problem:
+    // APERF/MPERF are NOT spoofed and cannot be cheaply intercepted (~1M
+    // reads/s per CPU crashes the box). Anti-cheat measuring APERF/TSC ratio
+    // over a CPUID sees: TSC-delta ≈ 120 (spoofed), APERF-delta ≈ 700 (raw
+    // includes ~600-cycle VM-exit overhead) → ratio ~6x, way above normal
+    // turbo (~1.5x). This inconsistency IS a detection vector.
+    //
+    // Trade-off: with Ophion OFF, CPUID looks "slow" (bare-metal ~120 →
+    // observed ~2000). But TSC/APERF/MPERF all agree (all include the
+    // stolen cycles equally). A single, honest leak beats two mutually-
+    // inconsistent leaks. Also VMEXIT_ENTRY_OVERHEAD=600 and
+    // CPUID_BARE_METAL_COST=120 are Skylake constants; unmeasured on
+    // Raptor Lake (i7-13700KF) — spoofed values were probably wrong anyway.
+    //
+    // Set HV_ENABLE_OPHION=1 at build time to re-arm the trap for A/B tests.
+    if !minimal_cpuid() && ophion_enabled() {
         vmx.cpuid_entry_tsc = exit_tsc_start;
         enable_rdtsc_exiting();
     }
 
     ExitType::IncrementRIP
+}
+
+fn ophion_enabled() -> bool {
+    option_env!("HV_ENABLE_OPHION").map_or(false, |v| v == "1")
 }
 
 fn enable_rdtsc_exiting() {

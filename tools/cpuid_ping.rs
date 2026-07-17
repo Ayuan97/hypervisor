@@ -635,6 +635,177 @@ fn main() {
         }
     }
 
+    // === Smart freeze detector + NMI inject (2026-07-16) ===
+    // Reads CTL 130 (fired counter) and 131 (currently-stuck CPU count).
+    // Also reads Ext CMOS 0x2D via a new CMD_READ_CMOS_FREEZE field=11.
+    // Ext CMOS 0x2D = 0xFD after a boot where the detector actually injected
+    // NMI — persists across the RST/BSOD-triggered reboot.
+    // === Layer 6 persistent per-CPU snapshot (2026-07-16) ===
+    // The PRIMARY source of freeze evidence going forward. Reads PREV BOOT
+    // snapshot that was captured to CMOS during last session's normal
+    // operation (every 4 vmexits per CPU). Post-freeze, comparing each
+    // CPU's last-flushed sequence to global tells us which CPU stopped
+    // exiting first — that's the CPU whose handler / spin loop hung.
+    println!("\n=== Layer 6: PREV BOOT per-CPU snapshot ===");
+    let snap_valid = hv_cmd(CMD_GET_CTL, 140);
+    if snap_valid == u64::MAX {
+        println!("  unsupported by loaded HV (rebuild + reboot)");
+    } else if snap_valid == 0 {
+        println!("  no valid snapshot in CMOS (first boot with Layer 6, or CMOS cleared)");
+    } else {
+        let prev_global_seq = hv_cmd(CMD_GET_CTL, 141);
+        let prev_global_lo = prev_global_seq & 0xFF;
+        println!("  PREV BOOT global sequence at freeze: {} (low byte: 0x{:02x})",
+            prev_global_seq, prev_global_lo);
+        println!("  Per-CPU status: gap = (global_lo - cpu_seq) mod 256");
+        println!("  gap 0-4 = CPU was current at flush time");
+        println!("  gap large = CPU stopped flushing early (candidate: died first)");
+        println!();
+        println!("  CPU  seq  gap  exit_reason  interpretation");
+        println!("  ---  ---  ---  -----------  --------------");
+        let mut max_gap = 0i64;
+        let mut max_gap_cpu = 0u64;
+        for cpu in 0..24u64 {
+            let cpu_seq = hv_cmd(CMD_GET_CTL, 142 + cpu);
+            let cpu_reason = hv_cmd(CMD_GET_CTL, 166 + cpu);
+            if cpu_seq == 0 && cpu_reason == 0 {
+                continue; // never active
+            }
+            let gap = ((prev_global_lo as i64) - (cpu_seq as i64)).rem_euclid(256);
+            if gap > max_gap {
+                max_gap = gap;
+                max_gap_cpu = cpu;
+            }
+            let interp = if gap <= 4 {
+                "up-to-date"
+            } else if gap < 32 {
+                "slightly behind"
+            } else if gap < 100 {
+                "well behind (stuck?)"
+            } else {
+                "*** STUCK EARLY ***"
+            };
+            println!("  {:3}  {:3}  {:3}  0x{:02x}         {}",
+                cpu, cpu_seq, gap, cpu_reason, interp);
+        }
+        if max_gap > 100 {
+            println!();
+            println!("  [!!] CPU {} had largest gap ({}) — died first candidate", max_gap_cpu, max_gap);
+        }
+    }
+
+    // === Layer 6: this-boot snapshot state (live) ===
+    println!("\n=== Layer 6: THIS BOOT per-CPU snapshot (live) ===");
+    let this_global = hv_cmd(CMD_GET_CTL, 190);
+    println!("  global sequence   = {} (this-boot flushes)", this_global);
+    println!("  (each CPU's SNAP_CPU_LAST_FLUSH_SEQ readable via CTL 191+cpu)");
+
+    // === Layer 6+ rare-exit RING (the freeze-hunter, 4 slots) ===
+    // Only updates for exit reasons OUTSIDE the common set (CPUID/RDTSC/
+    // RDMSR/WRMSR/preempt timer/HLT/MWAIT/MONITOR). Ring at CMOS 0x30-0x4F
+    // preserves the LAST 4 rare exits across freeze+RST, so we see the full
+    // EAC probe sequence, not just the final probe.
+    println!("\n=== Layer 6+ PREV BOOT rare-exit ring (2 slots @ Ext CMOS 0x00-0x0F) ===");
+    let ring_valid = hv_cmd(CMD_GET_CTL, 240);
+    let this_total = hv_cmd(CMD_GET_CTL, 259);
+    println!("  THIS BOOT rare-exit count: {}", this_total);
+    // Live Ext CMOS dump for verifying writes land at 0x00-0x0F
+    print!("  live Ext CMOS 0x00-0x0F:");
+    for i in 0..16u64 {
+        let b = hv_cmd(CMD_GET_CTL, 260 + i);
+        print!(" {:02x}", b & 0xFF);
+    }
+    println!();
+    if ring_valid == u64::MAX {
+        println!("  unsupported by loaded HV (rebuild + reboot)");
+    } else if ring_valid == 0 {
+        println!("  no ring data in prev boot CMOS (magic != 0xD6)");
+        println!("  → NO rare exit fired in prev session before freeze");
+        println!("  → freeze root cause is not a captured rare exit");
+    } else {
+        let head = hv_cmd(CMD_GET_CTL, 241) as usize;
+        let count = hv_cmd(CMD_GET_CTL, 242);
+        const N: usize = 2;
+        let filled = if count as usize >= N { N } else { count as usize };
+        println!("  prev boot: head={} count={} (saturating u8; this boot rare total={})",
+                 head, count, this_total);
+        println!("  Slots ordered oldest → newest (last row = freeze trigger candidate):");
+        println!("  #  slot  CPU  reason           RIP(low32)");
+        println!("  -- ----  ---  ---------------  ------------");
+        // Walk backward from (head-1) to reconstruct newest-first, then
+        // reverse to print oldest→newest.
+        let mut ordered: Vec<usize> = Vec::new();
+        for i in 0..filled {
+            let s = (head + N - 1 - i) % N;
+            ordered.push(s);
+        }
+        ordered.reverse();
+        for (idx, slot) in ordered.iter().enumerate() {
+            let base = 243 + (*slot as u64) * 4;
+            let cpu = hv_cmd(CMD_GET_CTL, base);
+            let reason = hv_cmd(CMD_GET_CTL, base + 1);
+            let rip = hv_cmd(CMD_GET_CTL, base + 2);
+            let _seq_lo = hv_cmd(CMD_GET_CTL, base + 3);
+            let reason_name = match reason {
+                0 => "Exception/NMI", 2 => "TripleFault", 3 => "INIT signal",
+                4 => "SIPI", 5 => "I/O SMI", 6 => "Other SMI",
+                7 => "Interrupt window", 8 => "NMI window", 9 => "Task switch",
+                11 => "GETSEC", 13 => "INVD", 14 => "INVLPG", 15 => "RDPMC",
+                17 => "RSM", 18 => "VMCALL", 19 => "VMCLEAR", 20 => "VMLAUNCH",
+                21 => "VMPTRLD", 22 => "VMPTRST", 23 => "VMREAD", 24 => "VMRESUME",
+                25 => "VMWRITE", 26 => "VMXOFF", 27 => "VMXON",
+                28 => "CR access", 29 => "MOV DR", 30 => "I/O instruction",
+                33 => "VM-entry inv guest",
+                34 => "VM-entry MSR fail",
+                37 => "Monitor Trap Flag",
+                41 => "APIC access", 42 => "Virtualized EOI",
+                43 => "GDTR/IDTR access", 44 => "LDTR/TR access",
+                45 => "EPT violation", 46 => "EPT misconfig",
+                47 => "INVEPT", 49 => "INVVPID", 53 => "INVVPID",
+                54 => "WBINVD", 55 => "XSETBV",
+                56 => "APIC write", 57 => "RDRAND", 58 => "INVPCID",
+                59 => "VMFUNC", 60 => "ENCLS", 61 => "RDSEED",
+                62 => "PML full", 63 => "XSAVES", 64 => "XRSTORS",
+                _ => "unknown",
+            };
+            let marker = if idx + 1 == ordered.len() { "*" } else { " " };
+            println!("  {} {:>3}   {:>3}  {:>2}={:<12}  0x{:08x}",
+                     marker, slot, cpu, reason, reason_name, rip);
+        }
+        if filled == 0 {
+            println!("  (ring magic present but count = 0 — malformed?)");
+        }
+        println!("  '*' = newest slot (freeze trigger candidate)");
+    }
+
+    println!("\n=== Smart freeze detector (NMI-to-BSOD, DISABLED 2026-07-16) ===");
+    let freeze_fired_ram = hv_cmd(CMD_GET_CTL, 130);
+    let freeze_stuck_now = hv_cmd(CMD_GET_CTL, 131);
+    let freeze_fired_cmos = hv_cmd(CMD_GET_CTL, 132);
+    let freeze_peak_ram = hv_cmd(CMD_GET_CTL, 133);
+    let freeze_peak_cmos = hv_cmd(CMD_GET_CTL, 134);
+    let freeze_ticks = hv_cmd(CMD_GET_CTL, 135);
+    if freeze_fired_ram == u64::MAX {
+        println!("  unsupported by loaded HV (rebuild + reboot)");
+    } else {
+        // This-boot RAM state
+        println!("  --- this boot (RAM) ---");
+        println!("  ticks             = {}  (arm at >= 40)", freeze_ticks);
+        println!("  fired flag        = {}", freeze_fired_ram);
+        println!("  stuck CPUs now    = {}  (live: at CR8>=2 with IF=0)", freeze_stuck_now);
+        println!("  peak stuck seen   = {}  (this-boot high water)", freeze_peak_ram);
+        // Persistent (survives freeze+RST) state
+        println!("  --- prev boot (CMOS) ---");
+        if freeze_fired_cmos == 0xFD {
+            println!("  fired CMOS mark   = 0xFD  [!!] Detector fired last boot — NMI injected.");
+            println!("                     Check C:\\Windows\\MEMORY.DMP for kernel dump.");
+        } else {
+            println!("  fired CMOS mark   = 0x{:02x}  (0xFD would mean fired last boot)", freeze_fired_cmos);
+        }
+        println!("  peak stuck (CMOS) = {}  (last-boot high water — threshold is {})",
+            freeze_peak_cmos, 4);
+    }
+
     println!("\n=== Host IDT Patch ===");
     let patch_calls = hv_cmd(CMD_GET_CTL, 10);
     let patch_ok_calls = hv_cmd(CMD_GET_CTL, 11);

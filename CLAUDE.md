@@ -201,14 +201,18 @@ kdmapper 映射的实例**不能通过 unload.bat 卸载**，只能重启。
 |---|---|---|---|
 | Std CMOS (0x70/0x71) | 0x00-0x0D | RTC + BIOS 用 | ❌ 禁用 |
 | Std CMOS (0x70/0x71) | 0x0E-0x3F | BIOS 校验/config | ⚠️ BIOS 可能改 |
-| Std CMOS (0x70/0x71) | 0x40-0x55 | `freeze_write_cmos_snapshot` 预留 | ⚠️ **死代码**（写入路径未调用）|
+| Std CMOS (0x70/0x71) | 0x40-0x55 | `freeze_write_cmos_snapshot` 预留 | ⚠️ **死代码 + BIOS 会清**（试过存 ring 挂了）|
 | Std CMOS (0x70/0x71) | 0x72-0x75 | CR8 bugcheck marker（`vmexit/cpuid.rs`）| ✅ 使用中 |
-| Ext CMOS (0x72/0x73) | 0x00-0x0B | `cmos_write_rip` 预留 | ⚠️ **死代码** |
+| Ext CMOS (0x72/0x73) | 0x00-0x0F | Layer 6+ rare-exit RING (2 槽 × 6 字节 + 4 字节头) | ✅ 使用中 |
 | Ext CMOS (0x72/0x73) | 0x10-0x19 | Step 1-4 CMOS 持久化（KEBUGCHECKEX/first-fault/total） | ✅ 使用中 |
 | Ext CMOS (0x72/0x73) | 0x1E | bugcheck entry hook marker (0xE1) | ✅ 使用中 |
 | Ext CMOS (0x72/0x73) | 0x1F | bugcheck callback marker (0xB1) | ✅ 使用中 |
 | Ext CMOS (0x72/0x73) | 0x20-0x2C | Phase 0-2 CMOS 保留实验（`cmos_retention_experiment`）| ✅ 使用中 |
-| Ext CMOS (0x72/0x73) | 0x2D-0x7F | **未分配** | 🆓 可用 |
+| Ext CMOS (0x72/0x73) | 0x2D-0x2F | Layer 6 snap magic + global seq (⚠️ 0x2D/2E 与 FREEZE_DETECTED/PEAK 冲突) | ✅ 使用中 |
+| Ext CMOS (0x72/0x73) | 0x30-0x3E | Layer 3 CMOS mirror slot A (magic 0x4C) | ✅ 使用中 |
+| Ext CMOS (0x72/0x73) | 0x40-0x4E | Layer 3 CMOS mirror slot B | ✅ 使用中 |
+| Ext CMOS (0x72/0x73) | 0x50-0x67 | Layer 6 per-CPU last flush seq (24 CPUs) | ✅ 使用中 |
+| Ext CMOS (0x72/0x73) | 0x68-0x7F | Layer 6 per-CPU last exit reason (24 CPUs) | ✅ 使用中 |
 
 ## GET_CTL 字段扩展（Phase 0，2026-07-12）
 

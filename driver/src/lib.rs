@@ -222,6 +222,12 @@ pub unsafe extern "system" fn driver_entry(
         .base(0x2f8)
         .filter(LevelFilter::Info)
         .setup();
+    // Layer 6: capture prev-boot per-CPU snapshot from CMOS into RAM BEFORE
+    // anything else can write to CMOS. This is what preserves freeze-boot
+    // data across the RST/reboot cycle even after this-boot flushes start
+    // overwriting CMOS. Cheap: ~50 CMOS reads.
+    diag::snap_capture_prev_boot();
+
     // Phase 0-2 CMOS retention experiment. Runs once, before HV starts, before
     // any boot_stage stop check — we want experiment data written even when
     // HV_BOOT_STOP_STAGE aborts the load early.
