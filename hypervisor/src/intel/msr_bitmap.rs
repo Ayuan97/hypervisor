@@ -138,19 +138,21 @@ impl MsrBitmap {
             set_msr_bitmap_bit(&mut self.write_low_msrs, msr);
         }
 
-        // IA32_TSC_AUX — intercept BOTH directions.
+        // IA32_TSC_AUX — write always intercepted; read only when the shadow
+        // is enabled at build time (HV_ENABLE_TSC_AUX_SHADOW=1).
         //
-        // Writes: host IDT handlers use rdtscp for per-CPU indexing, so a
-        // guest WRMSR to physical MSR would corrupt host's index. Absorb
-        // into per-CPU shadow (`msr.rs`).
+        // Writes must always be intercepted: host IDT handlers use rdtscp for
+        // per-CPU indexing, so a guest WRMSR to physical MSR would corrupt
+        // host's index. Absorbed by `msr.rs`.
         //
-        // Reads: previously pass-through, which leaked host's per-CPU index
-        // to guest — a wrmsr-then-rdmsr probe from EAC sees "we wrote X but
-        // MSR contains host's index Y ≠ X", a clean HV fingerprint. Read
-        // now returns the shadow so wrmsr-then-rdmsr is consistent with
-        // bare metal.
-        set_msr_bitmap_bit(&mut self.read_high_msrs, IA32_TSC_AUX);
+        // Reads: with the shadow enabled, we return the shadow so a
+        // wrmsr-then-rdmsr probe (an EAC fingerprint) is consistent with bare
+        // metal. Disabled by default 2026-07-17 after a BSOD 0x1E during
+        // isolation testing — see `msr.rs::tsc_aux_shadow_enabled`.
         set_msr_bitmap_bit(&mut self.write_high_msrs, IA32_TSC_AUX);
+        if option_env!("HV_ENABLE_TSC_AUX_SHADOW").map_or(false, |v| v == "1") {
+            set_msr_bitmap_bit(&mut self.read_high_msrs, IA32_TSC_AUX);
+        }
 
         // ---- P2 stealth interception (secret.club EAC detection vectors) ----
 

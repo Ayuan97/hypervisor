@@ -19,6 +19,13 @@ const ZERO_U64: AtomicU64 = AtomicU64::new(0);
 pub(super) static TSC_AUX_SHADOW: [AtomicU64; MAX_TSC_AUX_SHADOW_CPUS] =
     [ZERO_U64; MAX_TSC_AUX_SHADOW_CPUS];
 
+/// TSC_AUX shadow is a NEW code path added 2026-07-17 alongside a BSOD 0x1E
+/// during isolation testing. Gated OFF by default until root-cause isolated.
+/// Set HV_ENABLE_TSC_AUX_SHADOW=1 at build time to re-arm.
+pub(super) fn tsc_aux_shadow_enabled() -> bool {
+    option_env!("HV_ENABLE_TSC_AUX_SHADOW").map_or(false, |v| v == "1")
+}
+
 const IA32_FEATURE_CONTROL_MSR: u32 = 0x3a;
 const IA32_TSC_AUX: u32 = 0xC000_0103;
 const IA32_VMX_MSR_START: u32 = 0x480;
@@ -118,39 +125,63 @@ where
         return ExitType::IncrementRIP;
     }
 
-    // IA32_TSC_AUX — per-CPU shadow. Host's physical TSC_AUX carries the
-    // logical-CPU index used by rdtscp-based dispatch (see host_idt.rs).
-    // If guest writes reach the physical MSR, that per-CPU index gets
-    // corrupted and host handlers dispatch to the wrong CPU slot. If guest
-    // reads reach the physical MSR, guest sees the host's per-CPU index
-    // instead of what it last wrote — a wrmsr-then-rdmsr probe reveals us.
-    // Shadow the guest's value per-CPU; physical MSR is untouched.
+    // IA32_TSC_AUX handling. Two modes selected at build time:
+    //
+    // Shadow ON (env HV_ENABLE_TSC_AUX_SHADOW=1): per-CPU shadow, R+W
+    // intercepted. Host's physical TSC_AUX carries the logical-CPU index
+    // used by rdtscp-based dispatch (see host_idt.rs); guest writes reach
+    // only the shadow, physical stays intact; guest reads return the
+    // shadow so wrmsr-then-rdmsr is consistent with bare metal.
+    //
+    // Shadow OFF (default, 2026-07-17): only writes are intercepted (and
+    // absorbed) — reads pass through to physical. This is the pre-shadow
+    // behaviour, preserved after a BSOD 0x1E was observed with the shadow
+    // active (STATUS_PRIVILEGED_INSTRUCTION at a kernel-dynamic MOV CR0,
+    // preceded by a WHEA fatal). Root cause not yet isolated; keeping the
+    // shadow gated lets us A/B-test cleanly. Read intercept must be
+    // disabled in msr_bitmap.rs when the shadow is off, otherwise a guest
+    // TSC_AUX read would exit into no-op territory and fall through the
+    // default #GP path below.
     if msr == IA32_TSC_AUX {
-        let cpu = crate::intel::host_idt::current_cpu_index();
-        if cpu >= MAX_TSC_AUX_SHADOW_CPUS {
-            // Out-of-range CPU (shouldn't happen given MAX_TRACKED_CPUS=64,
-            // but guard anyway). Absorb writes, return 0 for reads to keep
-            // wrmsr-then-rdmsr consistent within this CPU's session.
+        if tsc_aux_shadow_enabled() {
+            let cpu = crate::intel::host_idt::current_cpu_index();
+            if cpu >= MAX_TSC_AUX_SHADOW_CPUS {
+                // Out-of-range CPU (shouldn't happen given MAX_TRACKED_CPUS=64,
+                // but guard anyway). Absorb writes, return 0 for reads.
+                match access_type {
+                    MsrAccessType::Read => {
+                        guest_registers.rax = 0;
+                        guest_registers.rdx = 0;
+                    }
+                    MsrAccessType::Write => {}
+                }
+                return ExitType::IncrementRIP;
+            }
             match access_type {
                 MsrAccessType::Read => {
-                    guest_registers.rax = 0;
-                    guest_registers.rdx = 0;
+                    let value = TSC_AUX_SHADOW[cpu].load(core::sync::atomic::Ordering::Relaxed);
+                    guest_registers.rax = value & 0xFFFF_FFFF;
+                    guest_registers.rdx = value >> 32;
                 }
-                MsrAccessType::Write => {}
+                MsrAccessType::Write => {
+                    let value = ((guest_registers.rdx as u64) << 32)
+                        | (guest_registers.rax as u64 & 0xFFFF_FFFF);
+                    TSC_AUX_SHADOW[cpu].store(value, core::sync::atomic::Ordering::Relaxed);
+                }
             }
             return ExitType::IncrementRIP;
         }
+        // Shadow OFF: absorb write, hand read to hardware. Reads should
+        // not normally VM-exit in this mode (bitmap read bit clear), but
+        // if one does — e.g. bitmap misconfig — return the raw MSR value
+        // rather than falling into the #GP path below.
         match access_type {
             MsrAccessType::Read => {
-                let value = TSC_AUX_SHADOW[cpu].load(core::sync::atomic::Ordering::Relaxed);
+                let value = read_msr(msr);
                 guest_registers.rax = value & 0xFFFF_FFFF;
                 guest_registers.rdx = value >> 32;
             }
-            MsrAccessType::Write => {
-                let value = ((guest_registers.rdx as u64) << 32)
-                    | (guest_registers.rax as u64 & 0xFFFF_FFFF);
-                TSC_AUX_SHADOW[cpu].store(value, core::sync::atomic::Ordering::Relaxed);
-            }
+            MsrAccessType::Write => {}
         }
         return ExitType::IncrementRIP;
     }
@@ -468,11 +499,15 @@ mod tests {
         assert_eq!(injected_error, None);
     }
 
+    /// TSC_AUX behaviour depends on the build-time HV_ENABLE_TSC_AUX_SHADOW
+    /// gate, so this test only runs when the gate is ON (matching what
+    /// production sees in that mode). With the gate OFF the code path reads
+    /// hardware, which the test harness can't simulate cleanly.
     #[test]
     fn tsc_aux_wrmsr_then_rdmsr_returns_shadow_value() {
-        // Whatever guest wrote, subsequent guest read must return the same
-        // value — otherwise EAC's `wrmsr TSC_AUX, X; rdmsr TSC_AUX` probe
-        // sees inconsistency and fingerprints us.
+        if !tsc_aux_shadow_enabled() {
+            return;
+        }
         let mut regs = GuestRegisters::default();
         regs.rcx = IA32_TSC_AUX as u64;
         regs.rax = 0xDEAD_BEEF;
