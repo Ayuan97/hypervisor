@@ -716,6 +716,13 @@ fn main() {
         print!(" {:02x}", b & 0xFF);
     }
     println!();
+    // Live vector array at Ext CMOS 0x1A-0x1B (per-slot exception vector).
+    let v0 = hv_cmd(CMD_GET_CTL, 278);
+    let v1 = hv_cmd(CMD_GET_CTL, 279);
+    if v0 != u64::MAX || v1 != u64::MAX {
+        println!("  live Ext CMOS 0x1A-0x1B (vec[slot0], vec[slot1]): {:02x} {:02x}",
+                 v0 & 0xFF, v1 & 0xFF);
+    }
     if ring_valid == u64::MAX {
         println!("  unsupported by loaded HV (rebuild + reboot)");
     } else if ring_valid == 0 {
@@ -730,8 +737,8 @@ fn main() {
         println!("  prev boot: head={} count={} (saturating u8; this boot rare total={})",
                  head, count, this_total);
         println!("  Slots ordered oldest → newest (last row = freeze trigger candidate):");
-        println!("  #  slot  CPU  reason           RIP(low32)");
-        println!("  -- ----  ---  ---------------  ------------");
+        println!("  #  slot  CPU  reason           RIP(low32)   vec");
+        println!("  -- ----  ---  ---------------  ------------ ----");
         // Walk backward from (head-1) to reconstruct newest-first, then
         // reverse to print oldest→newest.
         let mut ordered: Vec<usize> = Vec::new();
@@ -768,9 +775,40 @@ fn main() {
                 62 => "PML full", 63 => "XSAVES", 64 => "XRSTORS",
                 _ => "unknown",
             };
+            let vec = hv_cmd(CMD_GET_CTL, 276 + (*slot as u64));
+            let vec_str = if reason == 0 {
+                match vec {
+                    0 => "0=#DE".to_string(),
+                    1 => "1=#DB".to_string(),
+                    2 => "2=NMI".to_string(),
+                    3 => "3=#BP".to_string(),
+                    4 => "4=#OF".to_string(),
+                    5 => "5=#BR".to_string(),
+                    6 => "6=#UD".to_string(),
+                    7 => "7=#NM".to_string(),
+                    8 => "8=#DF".to_string(),
+                    10 => "A=#TS".to_string(),
+                    11 => "B=#NP".to_string(),
+                    12 => "C=#SS".to_string(),
+                    13 => "D=#GP".to_string(),
+                    14 => "E=#PF".to_string(),
+                    16 => "10=#MF".to_string(),
+                    17 => "11=#AC".to_string(),
+                    18 => "12=#MC".to_string(),
+                    19 => "13=#XM".to_string(),
+                    20 => "14=#VE".to_string(),
+                    0xFE => "R!".to_string(),
+                    u64::MAX => "?".to_string(),
+                    _ => format!("0x{:02x}", vec),
+                }
+            } else if vec == u64::MAX {
+                "?".to_string()
+            } else {
+                "-".to_string() // non-Exception rare exit → vector n/a
+            };
             let marker = if idx + 1 == ordered.len() { "*" } else { " " };
-            println!("  {} {:>3}   {:>3}  {:>2}={:<12}  0x{:08x}",
-                     marker, slot, cpu, reason, reason_name, rip);
+            println!("  {} {:>3}   {:>3}  {:>2}={:<12}  0x{:08x}  {}",
+                     marker, slot, cpu, reason, reason_name, rip, vec_str);
         }
         if filled == 0 {
             println!("  (ring magic present but count = 0 — malformed?)");

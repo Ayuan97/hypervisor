@@ -1134,6 +1134,23 @@ const RARE_RING_SLOT_BASE: u8 = 0x04;
 const RARE_RING_SLOT_SIZE: u8 = 6;
 pub const RARE_RING_SLOTS: usize = 2;
 
+// Per-slot exception vector (Ext CMOS 0x1A-0x1B).
+//
+// When a rare exit is Exception/NMI (basic reason 0), the exit reason alone
+// doesn't tell us WHICH exception fired — could be NMI (vector 2), #GP (13),
+// #PF (14), #MC (18) or something else. VMEXIT_INTERRUPTION_INFO carries the
+// vector in bits 7:0 and is valid for basic-reason-0 exits. Persisting it to
+// CMOS lets a post-freeze read distinguish "EAC cascaded an NMI at us" from
+// "guest took a page fault" — critical for characterising the INIT-then-NMI
+// attack pattern observed 2026-07-17.
+//
+// Values:
+//   0xFE = vmread failed (should never appear on a well-formed exit)
+//   0x00 = slot holds a non-Exception rare exit (INIT, VMCALL, etc.)
+//   otherwise = the exception/interrupt vector
+const RARE_RING_VEC_BASE: u8 = 0x1A;
+const RARE_RING_VEC_VMREAD_FAIL: u8 = 0xFE;
+
 /// Count of rare exits this boot — sanity check "did any rare exit happen at
 /// all". Zero = no rare event was observed → freeze isn't triggered by any
 /// exit reason outside the common set. Non-zero = ring has data.
@@ -1153,6 +1170,8 @@ static RARE_RING_PREV_REASON: [AtomicU64; RARE_RING_SLOTS] =
 static RARE_RING_PREV_RIP: [AtomicU64; RARE_RING_SLOTS] =
     [ZERO_U64; RARE_RING_SLOTS];
 static RARE_RING_PREV_SEQ_LO: [AtomicU64; RARE_RING_SLOTS] =
+    [ZERO_U64; RARE_RING_SLOTS];
+static RARE_RING_PREV_VEC: [AtomicU64; RARE_RING_SLOTS] =
     [ZERO_U64; RARE_RING_SLOTS];
 
 /// Called from snap_flush after common-exit early return. Decides whether
@@ -1196,6 +1215,20 @@ fn snap_flush_rare(exit_reason: u64, cpu: usize, _seq: u64) {
         ext_cmos_write(base + 2 + b, ((rip >> (b * 8)) & 0xFF) as u8);
     }
 
+    // Per-slot vector byte at Ext CMOS 0x1A + head. Only Exception/NMI (basic
+    // reason 0) carries a meaningful vector — for other rare exits (INIT,
+    // VMCALL, VMX-instruction, etc.) we write 0 so the reader can distinguish
+    // "no vector applicable" from a real 0 vector (which is #DE).
+    let vec_byte: u8 = if exit_reason == 0 {
+        match super::support::vmread_checked(x86::vmx::vmcs::ro::VMEXIT_INTERRUPTION_INFO) {
+            Ok(info) => (info & 0xFF) as u8,
+            Err(_) => RARE_RING_VEC_VMREAD_FAIL,
+        }
+    } else {
+        0
+    };
+    ext_cmos_write(RARE_RING_VEC_BASE + head as u8, vec_byte);
+
     // Update header: head advances, count saturates at 0xFF, magic (re)set.
     ext_cmos_write(RARE_RING_HEAD_OFF, next as u8);
     let total = RARE_TOTAL_COUNT.load(Relaxed);
@@ -1227,6 +1260,8 @@ fn snap_capture_prev_rare() {
         RARE_RING_PREV_RIP[slot].store(rip, Relaxed);
         // Slot has no per-slot seq_lo (space tight); ordering comes from head.
         RARE_RING_PREV_SEQ_LO[slot].store(0, Relaxed);
+        RARE_RING_PREV_VEC[slot]
+            .store(ext_cmos_read(RARE_RING_VEC_BASE + slot as u8) as u64, Relaxed);
     }
 }
 
@@ -2401,6 +2436,17 @@ pub fn control(id: u64) -> u64 {
         // 260..=275 = read Ext CMOS 0x00 + (id-260), one byte each (16 bytes,
         // full ring region 0x00-0x0F).
         260..=275 => ext_cmos_read(RARE_RING_MAGIC_OFF + (id - 260) as u8) as u64,
+        // 276-277 — PREV BOOT per-slot exception vector.
+        //   276 = slot 0, 277 = slot 1.
+        //   0x00 = non-Exception rare exit (INIT/VMCALL/etc.), vector n/a.
+        //   0xFE = vmread(VMEXIT_INTERRUPTION_INFO) failed at record time.
+        //   else = 8-bit vector (2 = NMI, 13 = #GP, 14 = #PF, 18 = #MC, ...).
+        276..=277 => {
+            let slot = (id - 276) as usize;
+            RARE_RING_PREV_VEC[slot].load(Relaxed)
+        }
+        // 278-279 — live Ext CMOS 0x1A-0x1B (vector array debug readback).
+        278..=279 => ext_cmos_read(RARE_RING_VEC_BASE + (id - 278) as u8) as u64,
         _ => u64::MAX,
     }
 }
