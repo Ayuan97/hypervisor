@@ -8,13 +8,31 @@ $root = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
 $logsDir = Join-Path $root 'logs'
 $statePath = Join-Path $logsDir 'hv_resume.json'
 $artifact = Join-Path $root 'target\release\matrix.sys'
+$workspaceRoot = Split-Path -Parent $root
+$ping = Join-Path $root 'tools\cpuid_ping.exe'
+$probe = Join-Path $root 'tools\probe_test.exe'
+$mapper = Join-Path $workspaceRoot 'tools\kdmapper\x64\Release\kdmapper_Release.exe'
 
 New-Item -ItemType Directory -Force -Path $logsDir | Out-Null
+
+foreach ($required in @($artifact, $ping, $probe, $mapper)) {
+    if (-not (Test-Path -LiteralPath $required)) {
+        throw "Required recovery artifact is missing: $required"
+    }
+}
+
+if (Test-Path -LiteralPath $statePath) {
+    $existing = Get-Content -LiteralPath $statePath -Raw | ConvertFrom-Json
+    if ([bool]$existing.pending) {
+        throw "A reboot recovery is already pending: $statePath"
+    }
+}
 
 $commit = (& git -C $root rev-parse HEAD 2>$null)
 if (-not $commit) {
     $commit = 'unknown'
 }
+$artifactSha256 = (Get-FileHash -Algorithm SHA256 -LiteralPath $artifact).Hash
 
 $state = [ordered]@{
     version = 1
@@ -24,6 +42,8 @@ $state = [ordered]@{
     created_at = (Get-Date).ToUniversalTime().ToString('o')
     commit = ([string]$commit).Trim()
     artifact = $artifact
+    artifact_sha256 = $artifactSha256
+    mapper = $mapper
     auto_load = $true
     auto_seal = $true
     last_log = $null

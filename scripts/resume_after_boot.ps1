@@ -5,6 +5,7 @@ param(
 
 $ErrorActionPreference = 'Stop'
 $root = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
+$workspaceRoot = Split-Path -Parent $root
 if ([string]::IsNullOrWhiteSpace($StatePath)) {
     $StatePath = Join-Path $root 'logs\hv_resume.json'
 }
@@ -39,7 +40,22 @@ Start-Transcript -LiteralPath $logPath -Force | Out-Null
 try {
     $ping = Join-Path $root 'tools\cpuid_ping.exe'
     $probe = Join-Path $root 'tools\probe_test.exe'
-    $mapper = Join-Path $root 'tools\kdmapper\x64\Release\kdmapper_Release.exe'
+    $mapper = [string]$state.mapper
+    if ([string]::IsNullOrWhiteSpace($mapper)) {
+        $mapper = Join-Path $workspaceRoot 'tools\kdmapper\x64\Release\kdmapper_Release.exe'
+    }
+
+    if (-not (Test-Path -LiteralPath $state.artifact)) {
+        throw "driver artifact not found: $($state.artifact)"
+    }
+    if (-not [string]::IsNullOrWhiteSpace([string]$state.artifact_sha256)) {
+        $actualSha256 = (Get-FileHash -Algorithm SHA256 -LiteralPath $state.artifact).Hash
+        if ($actualSha256 -ne [string]$state.artifact_sha256) {
+            throw "driver artifact hash mismatch: expected $($state.artifact_sha256), got $actualSha256"
+        }
+    }
+
+    Start-Sleep -Seconds 30
 
     $deadline = (Get-Date).AddSeconds($WaitSeconds)
     while ((Get-Date) -lt $deadline -and -not (Test-Path -LiteralPath $ping)) {
@@ -54,11 +70,15 @@ try {
         return $LASTEXITCODE
     }
 
-    $statusCode = Invoke-PingStatus
-    if ($statusCode -ne 0 -and [bool]$state.auto_load) {
-        if (-not (Test-Path -LiteralPath $state.artifact)) {
-            throw "driver artifact not found: $($state.artifact)"
+    $statusCode = 2
+    for ($attempt = 0; $attempt -lt 3; $attempt++) {
+        $statusCode = Invoke-PingStatus
+        if ($statusCode -eq 0) {
+            break
         }
+        Start-Sleep -Seconds 5
+    }
+    if ($statusCode -ne 0 -and [bool]$state.auto_load) {
         if (-not (Test-Path -LiteralPath $mapper)) {
             throw "kdmapper not found: $mapper"
         }
@@ -72,7 +92,14 @@ try {
             throw "kdmapper failed with exit code $LASTEXITCODE"
         }
         Start-Sleep -Seconds 2
-        $statusCode = Invoke-PingStatus
+        $statusCode = 2
+        for ($attempt = 0; $attempt -lt 5; $attempt++) {
+            $statusCode = Invoke-PingStatus
+            if ($statusCode -eq 0) {
+                break
+            }
+            Start-Sleep -Seconds 2
+        }
     }
 
     if ($statusCode -ne 0) {
