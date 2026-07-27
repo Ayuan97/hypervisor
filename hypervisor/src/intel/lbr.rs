@@ -32,7 +32,7 @@
 //! LBR bit is enabled. Windows normally leaves LBR off.
 
 use {
-    crate::intel::{diag, support::vmread_checked},
+    crate::intel::{diag, host_idt, support::vmread_checked},
     core::{
         cell::UnsafeCell,
         sync::atomic::{AtomicU8, Ordering::Relaxed},
@@ -97,23 +97,9 @@ const EMPTY_SLOT: UnsafeCell<LbrSlot> = UnsafeCell::new(LbrSlot::zero());
 static SLOTS: SlotArray = SlotArray([EMPTY_SLOT; MAX_LBR_CPUS]);
 
 #[inline]
-fn cpu_index() -> usize {
-    let aux: u32;
-    unsafe {
-        core::arch::asm!(
-            "rdtscp",
-            out("ecx") aux,
-            out("eax") _,
-            out("edx") _,
-            options(nomem, nostack),
-        );
-    }
-    (aux as usize) & (MAX_LBR_CPUS - 1)
-}
-
-#[inline]
-fn cpu_slot() -> &'static mut LbrSlot {
-    unsafe { &mut *SLOTS.0[cpu_index()].get() }
+fn cpu_slot() -> Option<&'static mut LbrSlot> {
+    let cpu = host_idt::current_cpu_index();
+    (cpu < MAX_LBR_CPUS).then(|| unsafe { &mut *SLOTS.0[cpu].get() })
 }
 
 fn depth_mask_supports_32(mask: u32) -> bool {
@@ -156,7 +142,9 @@ pub fn save_and_disable_lbr() -> bool {
     // VM-exit clears host IA32_DEBUGCTL. Read the guest value from the VMCS
     // so we only snapshot when guest LBR recording was actually enabled.
     let debugctl = vmread_checked(vmcs_guest::IA32_DEBUGCTL_FULL).unwrap_or(0);
-    let slot = cpu_slot();
+    let Some(slot) = cpu_slot() else {
+        return false;
+    };
     slot.debugctl = debugctl;
     if (debugctl & 1) == 0 {
         return false;
@@ -190,7 +178,9 @@ pub fn save_and_disable_lbr() -> bool {
 /// and does not touch the stack MSRs.
 #[inline]
 pub fn restore_lbr() {
-    let slot = cpu_slot();
+    let Some(slot) = cpu_slot() else {
+        return;
+    };
     if (slot.debugctl & 1) == 0 {
         // Guest didn't have LBR on at exit — nothing to restore. DEBUGCTL
         // is auto-restored by VM-entry via LOAD_DEBUG_CONTROLS = 1 from
