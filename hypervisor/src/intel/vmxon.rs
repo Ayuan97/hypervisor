@@ -56,6 +56,31 @@ impl ControlRegisterSnapshot {
 }
 
 impl Vmxon {
+    /// Validate per-CPU VMX enablement before the virtualization loop mutates
+    /// any processor. This mirrors `set_lock_bit` without writing MSRs or CRs.
+    pub fn preflight() -> Result<(), HypervisorError> {
+        let feature_control = unsafe { x86::msr::rdmsr(x86::msr::IA32_FEATURE_CONTROL) };
+        feature_control_update_for_vmxon(feature_control)?;
+
+        let cr0 = unsafe { x86::controlregs::cr0().bits() as u64 };
+        let cr0_fixed0 = unsafe { x86::msr::rdmsr(x86::msr::IA32_VMX_CR0_FIXED0) };
+        let cr0_fixed1 = unsafe { x86::msr::rdmsr(x86::msr::IA32_VMX_CR0_FIXED1) };
+        let adjusted_cr0 = cr0_with_vmx_fixed_bits(cr0, cr0_fixed0, cr0_fixed1);
+        if adjusted_cr0 & cr0_fixed0 != cr0_fixed0 || adjusted_cr0 & !cr0_fixed1 != 0 {
+            return Err(HypervisorError::VMXUnsupported);
+        }
+
+        let cr4 = Cr4::read_raw();
+        let cr4_fixed0 = unsafe { x86::msr::rdmsr(x86::msr::IA32_VMX_CR4_FIXED0) };
+        let cr4_fixed1 = unsafe { x86::msr::rdmsr(x86::msr::IA32_VMX_CR4_FIXED1) };
+        let adjusted_cr4 = cr4_with_vmx_fixed_bits(cr4, cr4_fixed0, cr4_fixed1);
+        if adjusted_cr4 & cr4_fixed0 != cr4_fixed0 || adjusted_cr4 & !cr4_fixed1 != 0 {
+            return Err(HypervisorError::VMXUnsupported);
+        }
+
+        Ok(())
+    }
+
     /// Sets up the VMXON region and enables VMX operations.
     ///
     /// # Arguments

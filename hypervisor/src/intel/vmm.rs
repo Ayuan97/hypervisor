@@ -9,6 +9,7 @@ use {
             shared_data::SharedData,
             vcpu::Vcpu,
             vmcs::Vmcs,
+            vmxon::Vmxon,
         },
         utils::{
             alloc::PhysicalAllocator,
@@ -133,7 +134,7 @@ impl Hypervisor {
             let Some(executor) = ProcessorExecutor::switch_to_processor(processor.id()) else {
                 return Err(HypervisorError::ProcessorSwitchFailed);
             };
-            let result = Vmcs::preflight_vmcs_control_fields();
+            let result = Vmxon::preflight().and_then(|()| Vmcs::preflight_vmcs_control_fields());
             drop(executor);
             result?;
         }
