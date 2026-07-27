@@ -10,15 +10,14 @@
 //! session eventually froze even though the P1 CPUID/MSR consistency was
 //! clean.
 //!
-//! Strategy on every VM-exit:
-//! 1. Read guest `IA32_DEBUGCTL`. If LBR bit (0) is clear, guest is not
-//!    using LBR — skip everything. Zero-cost fast path.
-//! 2. Otherwise snapshot all 32 pairs of LBR stack MSRs plus TOS to a
-//!    per-CPU buffer, then clear the LBR bit in DEBUGCTL so host code that
-//!    runs between here and VMRESUME does NOT pollute the stack.
-//! 3. Before VMRESUME, write the saved values back and restore DEBUGCTL.
-//!    Guest wakes up seeing the LBR state it had at the moment of VM-exit,
-//!    with zero host branches leaked.
+//! The shadow is explicitly build-gated because a full snapshot costs 64
+//! MSR reads and writes per VM-exit. When enabled:
+//! 1. Read guest `IA32_DEBUGCTL` from the VMCS. If LBR bit (0) is clear, skip.
+//! 2. Snapshot all 32 pairs of LBR stack MSRs plus TOS to a per-CPU buffer.
+//!    VM-exit already clears host `IA32_DEBUGCTL`, so host handler branches do
+//!    not need an additional hardware write here.
+//! 3. Before VMRESUME, write the saved values back. Guest sees the LBR state
+//!    it had at the moment of VM-exit, with no handler branches in the stack.
 //!
 //! There is still a *small* leak window between VMX-root entry (top of the
 //! asm VM-exit stub) and the point where `save_and_disable_lbr()` runs. A
@@ -27,20 +26,15 @@
 //! from "every host branch in the exit handler" to "the ~20-30 branches of
 //! the asm stub", which is enough to break the detection pattern EAC used.
 //!
-//! Cost: 66 RDMSR + 66 WRMSR per VM-exit (~6600 cycles). Only paid when
-//! the guest actually has LBR enabled — Windows kernel does not turn it on
-//! by default, so normal ops see no overhead. When EAC enables it, we
-//! trade ~6% CPU for stealth on that specific detection path.
+//! Cost: 65 RDMSR + 65 WRMSR per VM-exit (~6600 cycles), only when both the
+//! build gate and guest LBR bit are enabled. Windows normally leaves LBR off.
 
 use {
-    crate::intel::diag,
-    core::{
-        cell::UnsafeCell,
-        sync::atomic::Ordering::Relaxed,
-    },
+    crate::intel::{diag, support::vmread_checked},
+    core::{cell::UnsafeCell, sync::atomic::Ordering::Relaxed},
+    x86::vmx::vmcs::guest as vmcs_guest,
 };
 
-const IA32_DEBUGCTL: u32 = 0x1D9;
 const IA32_LASTBRANCH_TOS: u32 = 0x1C9;
 const IA32_LASTBRANCH_FROM_BASE: u32 = 0x680;
 /// LASTBRANCH_TO_i lives at `0x6C0 + i` on Nehalem-and-later (Intel SDM Vol 4).
@@ -113,28 +107,40 @@ fn cpu_slot() -> &'static mut LbrSlot {
     unsafe { &mut *SLOTS.0[cpu_index()].get() }
 }
 
-/// If the guest currently has LBR recording enabled, snapshot the entire
-/// LBR stack + DEBUGCTL to a per-CPU buffer and disable recording so host
-/// handler branches do not leak into it. Called from the VM-exit prologue.
+pub(super) fn lbr_shadow_enabled() -> bool {
+    option_env!("HV_ENABLE_LBR_SHADOW").map_or(false, |v| v == "1")
+}
+
+/// If the guest currently has LBR recording enabled and the build gate is on,
+/// snapshot the entire LBR stack to a per-CPU buffer. VM-exit has already
+/// cleared host DEBUGCTL, so handler branches do not leak into it.
 ///
 /// Returns true iff the state was saved (i.e. `restore_lbr()` must run
 /// before VMRESUME to reverse this).
 #[inline]
 pub fn save_and_disable_lbr() -> bool {
-    // DISABLED. Snapshotting LBR on every VM-exit turned out to cost 65
-    // MSR reads per exit whenever the guest had DEBUGCTL bit 0 set, and
-    // under an active EAC + MWAIT-clamp workload that ran into the tens
-    // of millions of RDMSRs per second — the box locked up inside a
-    // minute (2026-07-12).
-    //
-    // Host DEBUGCTL is cleared to 0 on VM-exit (Intel SDM 27.5.1), so
-    // host handler branches do not pollute the guest LBR stack anyway;
-    // the "save" path was defensive against a leak that can't actually
-    // happen. Keep the code shape (matching restore_lbr, counters
-    // wired through diag::LBR_SAVE_COUNT) but return false immediately.
-    // If we ever need the stack-swap for a specific stealth scenario,
-    // re-enable per exit type rather than unconditionally.
-    false
+    if !lbr_shadow_enabled() {
+        return false;
+    }
+
+    // VM-exit clears host IA32_DEBUGCTL. Read the guest value from the VMCS
+    // so we only snapshot when guest LBR recording was actually enabled.
+    let debugctl = vmread_checked(vmcs_guest::IA32_DEBUGCTL_FULL).unwrap_or(0);
+    let slot = cpu_slot();
+    slot.debugctl = debugctl;
+    if (debugctl & 1) == 0 {
+        return false;
+    }
+
+    slot.tos = unsafe { x86::msr::rdmsr(IA32_LASTBRANCH_TOS) };
+    let mut i = 0;
+    while i < LBR_NR_ENTRIES {
+        slot.from[i] = unsafe { x86::msr::rdmsr(IA32_LASTBRANCH_FROM_BASE + i as u32) };
+        slot.to[i] = unsafe { x86::msr::rdmsr(IA32_LASTBRANCH_TO_BASE + i as u32) };
+        i += 1;
+    }
+    diag::LBR_SAVE_COUNT.fetch_add(1, Relaxed);
+    true
 }
 
 /// Restore the LBR stack + DEBUGCTL captured by the matching

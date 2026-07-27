@@ -13,6 +13,7 @@ use {
     core::sync::atomic::{AtomicBool, AtomicU64, Ordering},
     x86::{
         cpuid::{cpuid, CpuIdResult},
+        time::rdtsc,
         vmx::vmcs,
     },
 };
@@ -21,14 +22,16 @@ fn minimal_cpuid() -> bool {
     option_env!("HV_MINIMAL").map_or(false, |v| v == "1")
 }
 
-pub const CPUID_BARE_METAL_COST: u64 = 120;
+pub const CPUID_BARE_METAL_COST_DEFAULT: u64 = 120;
 // VM-exit transition: guest CPUID → CPU saves state → loads host → our handler rdtsc().
 // Subtract this from cpuid_entry_tsc to approximate the guest-side TSC at CPUID time.
+// Kept conservative and only used by the explicitly gated timing path.
 pub const VMEXIT_ENTRY_OVERHEAD: u64 = 600;
 
 static LEAF7_SUBLEAF0_LOW: AtomicU64 = AtomicU64::new(0);
 static LEAF7_SUBLEAF0_HIGH: AtomicU64 = AtomicU64::new(0);
 static LEAF7_SUBLEAF0_READY: AtomicBool = AtomicBool::new(false);
+static CPUID_BARE_METAL_COST: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 /// Enum representing the various CPUID leaves for feature and interface discovery.
@@ -153,17 +156,44 @@ pub fn handle_cpuid(guest_registers: &mut GuestRegisters, vmx: &mut Vmx, exit_ts
     // Trade-off: with Ophion OFF, CPUID looks "slow" (bare-metal ~120 →
     // observed ~2000). But TSC/APERF/MPERF all agree (all include the
     // stolen cycles equally). A single, honest leak beats two mutually-
-    // inconsistent leaks. Also VMEXIT_ENTRY_OVERHEAD=600 and
-    // CPUID_BARE_METAL_COST=120 are Skylake constants; unmeasured on
-    // Raptor Lake (i7-13700KF) — spoofed values were probably wrong anyway.
+    // inconsistent leaks. VMEXIT_ENTRY_OVERHEAD remains conservative; the
+    // bare-metal CPUID cost is calibrated once on the current host instead of
+    // using the old fixed 120-cycle value.
     //
     // Set HV_ENABLE_OPHION=1 at build time to re-arm the trap for A/B tests.
     if !minimal_cpuid() && ophion_enabled() {
+        let _ = cpuid_bare_metal_cost();
         vmx.cpuid_entry_tsc = exit_tsc_start;
         enable_rdtsc_exiting();
     }
 
     ExitType::IncrementRIP
+}
+
+pub fn cpuid_bare_metal_cost() -> u64 {
+    let cached = CPUID_BARE_METAL_COST.load(Ordering::Acquire);
+    if cached != 0 {
+        return cached;
+    }
+
+    let mut best = u64::MAX;
+    let mut i = 0;
+    while i < 16 {
+        let start = unsafe { rdtsc() };
+        let _ = cpuid!(0, 0);
+        let elapsed = unsafe { rdtsc() }.wrapping_sub(start);
+        if elapsed < best {
+            best = elapsed;
+        }
+        i += 1;
+    }
+    let measured = if best == u64::MAX {
+        CPUID_BARE_METAL_COST_DEFAULT
+    } else {
+        best.clamp(50, 300)
+    };
+    let _ = CPUID_BARE_METAL_COST.compare_exchange(0, measured, Ordering::Release, Ordering::Relaxed);
+    CPUID_BARE_METAL_COST.load(Ordering::Acquire)
 }
 
 fn ophion_enabled() -> bool {
@@ -466,7 +496,7 @@ mod tests {
 
     #[test]
     fn cpuid_bare_metal_cost_is_reasonable() {
-        assert!(CPUID_BARE_METAL_COST >= 50 && CPUID_BARE_METAL_COST <= 300);
+        assert!(cpuid_bare_metal_cost() >= 50 && cpuid_bare_metal_cost() <= 300);
     }
 
     #[test]

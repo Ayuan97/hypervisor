@@ -6,8 +6,8 @@ use crate::{
     intel::{events::EventInjection, support, vmexit::ExitType},
     utils::capture::GuestRegisters,
 };
-use core::sync::atomic::AtomicU64;
-use x86::{msr, vmx::vmcs};
+use core::sync::atomic::{AtomicBool, AtomicU64};
+use x86::{msr, time::rdtsc, vmx::vmcs};
 
 /// Per-CPU shadow of IA32_TSC_AUX. Must be >= diag::MAX_TRACKED_CPUS since
 /// current_cpu_index() ranges over that. Kept as a plain const here to
@@ -19,11 +19,85 @@ const ZERO_U64: AtomicU64 = AtomicU64::new(0);
 pub(super) static TSC_AUX_SHADOW: [AtomicU64; MAX_TSC_AUX_SHADOW_CPUS] =
     [ZERO_U64; MAX_TSC_AUX_SHADOW_CPUS];
 
+#[allow(clippy::declare_interior_mutable_const)]
+const ZERO_BOOL: AtomicBool = AtomicBool::new(false);
+pub(super) static TSC_AUX_SHADOW_VALID: [AtomicBool; MAX_TSC_AUX_SHADOW_CPUS] =
+    [ZERO_BOOL; MAX_TSC_AUX_SHADOW_CPUS];
+
+pub(super) const MAX_APERF_SHADOW_CPUS: usize = 64;
+pub(super) static APERF_SHADOW_VALID: [AtomicBool; MAX_APERF_SHADOW_CPUS] =
+    [ZERO_BOOL; MAX_APERF_SHADOW_CPUS];
+pub(super) static APERF_LAST_RAW: [AtomicU64; MAX_APERF_SHADOW_CPUS] =
+    [ZERO_U64; MAX_APERF_SHADOW_CPUS];
+pub(super) static MPERF_LAST_RAW: [AtomicU64; MAX_APERF_SHADOW_CPUS] =
+    [ZERO_U64; MAX_APERF_SHADOW_CPUS];
+pub(super) static APERF_LAST_TSC: [AtomicU64; MAX_APERF_SHADOW_CPUS] =
+    [ZERO_U64; MAX_APERF_SHADOW_CPUS];
+pub(super) static APERF_LAST_HOST_TSC: [AtomicU64; MAX_APERF_SHADOW_CPUS] =
+    [ZERO_U64; MAX_APERF_SHADOW_CPUS];
+pub(super) static APERF_CORRECTION: [AtomicU64; MAX_APERF_SHADOW_CPUS] =
+    [ZERO_U64; MAX_APERF_SHADOW_CPUS];
+pub(super) static MPERF_CORRECTION: [AtomicU64; MAX_APERF_SHADOW_CPUS] =
+    [ZERO_U64; MAX_APERF_SHADOW_CPUS];
+pub(super) static APERF_OFFSET: [AtomicU64; MAX_APERF_SHADOW_CPUS] =
+    [ZERO_U64; MAX_APERF_SHADOW_CPUS];
+pub(super) static MPERF_OFFSET: [AtomicU64; MAX_APERF_SHADOW_CPUS] =
+    [ZERO_U64; MAX_APERF_SHADOW_CPUS];
+
 /// TSC_AUX shadow is a NEW code path added 2026-07-17 alongside a BSOD 0x1E
 /// during isolation testing. Gated OFF by default until root-cause isolated.
 /// Set HV_ENABLE_TSC_AUX_SHADOW=1 at build time to re-arm.
 pub(super) fn tsc_aux_shadow_enabled() -> bool {
     option_env!("HV_ENABLE_TSC_AUX_SHADOW").map_or(false, |v| v == "1")
+}
+
+pub(super) fn aperf_mperf_shadow_enabled() -> bool {
+    option_env!("HV_ENABLE_APERF_SHADOW").map_or(false, |v| v == "1")
+}
+
+/// Return the TSC_AUX value that should be visible to the guest's RDTSCP.
+///
+/// The host keeps its physical TSC_AUX as the CPU index used by the VM-exit
+/// and host-IDT paths. When the shadow is enabled, RDMSR and RDTSCP must see
+/// the same guest-owned value; otherwise a guest can write TSC_AUX and detect
+/// the host index through the next RDTSCP.
+pub(super) fn guest_tsc_aux(raw_aux: u32) -> u32 {
+    if !tsc_aux_shadow_enabled() {
+        return raw_aux;
+    }
+    let cpu = crate::intel::host_idt::current_cpu_index();
+    let shadow_valid = if cpu < MAX_TSC_AUX_SHADOW_CPUS {
+        TSC_AUX_SHADOW_VALID[cpu].load(core::sync::atomic::Ordering::Acquire)
+    } else {
+        false
+    };
+    guest_tsc_aux_for_cpu(
+        raw_aux,
+        true,
+        cpu,
+        if shadow_valid {
+            TSC_AUX_SHADOW[cpu].load(core::sync::atomic::Ordering::Relaxed)
+        } else {
+            0
+        },
+        shadow_valid,
+    )
+}
+
+fn guest_tsc_aux_for_cpu(
+    raw_aux: u32,
+    shadow_enabled: bool,
+    cpu: usize,
+    shadow: u64,
+    shadow_valid: bool,
+) -> u32 {
+    if !shadow_enabled {
+        return raw_aux;
+    }
+    if cpu >= MAX_TSC_AUX_SHADOW_CPUS || !shadow_valid {
+        return raw_aux;
+    }
+    shadow as u32
 }
 
 const IA32_FEATURE_CONTROL_MSR: u32 = 0x3a;
@@ -106,14 +180,14 @@ pub fn handle_msr_access(
 fn handle_msr_access_with<R, W, G>(
     guest_registers: &mut GuestRegisters,
     access_type: MsrAccessType,
-    read_msr: R,
-    write_msr: W,
-    inject_gp: G,
+    mut read_msr: R,
+    mut write_msr: W,
+    mut inject_gp: G,
 ) -> ExitType
 where
-    R: FnOnce(u32) -> u64,
-    W: FnOnce(u32, u64),
-    G: FnOnce(u32),
+    R: FnMut(u32) -> u64,
+    W: FnMut(u32, u64),
+    G: FnMut(u32),
 {
     let msr = guest_registers.rcx as u32;
 
@@ -159,7 +233,12 @@ where
             }
             match access_type {
                 MsrAccessType::Read => {
-                    let value = TSC_AUX_SHADOW[cpu].load(core::sync::atomic::Ordering::Relaxed);
+                    let value =
+                        if TSC_AUX_SHADOW_VALID[cpu].load(core::sync::atomic::Ordering::Acquire) {
+                            TSC_AUX_SHADOW[cpu].load(core::sync::atomic::Ordering::Relaxed)
+                        } else {
+                            read_msr(msr)
+                        };
                     guest_registers.rax = value & 0xFFFF_FFFF;
                     guest_registers.rdx = value >> 32;
                 }
@@ -167,6 +246,7 @@ where
                     let value = ((guest_registers.rdx as u64) << 32)
                         | (guest_registers.rax as u64 & 0xFFFF_FFFF);
                     TSC_AUX_SHADOW[cpu].store(value, core::sync::atomic::Ordering::Relaxed);
+                    TSC_AUX_SHADOW_VALID[cpu].store(true, core::sync::atomic::Ordering::Release);
                 }
             }
             return ExitType::IncrementRIP;
@@ -184,6 +264,42 @@ where
             MsrAccessType::Write => {}
         }
         return ExitType::IncrementRIP;
+    }
+
+    if aperf_mperf_shadow_enabled() && (msr == IA32_APERF || msr == IA32_MPERF) {
+        match access_type {
+            MsrAccessType::Read => {
+                let raw_aperf = read_msr(IA32_APERF);
+                let raw_mperf = read_msr(IA32_MPERF);
+                let cpu = crate::intel::host_idt::current_cpu_index();
+                let value = aperf_mperf_shadow_read(cpu, raw_aperf, raw_mperf, msr);
+                guest_registers.rax = value & 0xFFFF_FFFF;
+                guest_registers.rdx = value >> 32;
+                if msr == IA32_APERF {
+                    super::super::diag::APERF_READ_COUNT
+                        .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                } else {
+                    super::super::diag::MPERF_READ_COUNT
+                        .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                }
+                return ExitType::IncrementRIP;
+            }
+            MsrAccessType::Write => {
+                let value = ((guest_registers.rdx as u64) << 32)
+                    | (guest_registers.rax as u64 & 0xFFFF_FFFF);
+                let cpu = crate::intel::host_idt::current_cpu_index();
+                let raw_aperf = read_msr(IA32_APERF);
+                let raw_mperf = read_msr(IA32_MPERF);
+                if cpu < MAX_APERF_SHADOW_CPUS {
+                    aperf_mperf_shadow_write(cpu, raw_aperf, raw_mperf, msr, value);
+                } else {
+                    // Keep the architectural operation working if the CPU
+                    // index is outside the tracked range.
+                    write_msr(msr, value);
+                }
+                return ExitType::IncrementRIP;
+            }
+        }
     }
 
     if matches!(access_type, MsrAccessType::Read) && msr == IA32_FEATURE_CONTROL_MSR {
@@ -261,9 +377,10 @@ where
         }
     }
 
-    // APERF / MPERF: pass through reads (very low VM-exit rate means ratio
-    // stays close to bare metal). Just count so we can tell if EAC polls
-    // them — writes are not intercepted at all.
+    // APERF / MPERF: pass through when the optional shadow is disabled (very
+    // low VM-exit rate means the ratio stays close to bare metal). Just count
+    // so we can tell if EAC polls them; writes are not intercepted in this
+    // mode.
     if msr == IA32_APERF || msr == IA32_MPERF {
         if matches!(access_type, MsrAccessType::Read) {
             let value = read_msr(msr);
@@ -348,6 +465,98 @@ where
     ExitType::Continue
 }
 
+fn aperf_mperf_shadow_read(cpu: usize, raw_aperf: u64, raw_mperf: u64, msr: u32) -> u64 {
+    if cpu >= MAX_APERF_SHADOW_CPUS {
+        return if msr == IA32_APERF { raw_aperf } else { raw_mperf };
+    }
+
+    let now_tsc = unsafe { rdtsc() };
+    let host_tsc = super::super::diag::host_tsc_accum(cpu);
+    if APERF_SHADOW_VALID[cpu].load(core::sync::atomic::Ordering::Acquire) {
+        let total_tsc = now_tsc
+            .wrapping_sub(APERF_LAST_TSC[cpu].load(core::sync::atomic::Ordering::Relaxed));
+        let host_delta = host_tsc
+            .wrapping_sub(APERF_LAST_HOST_TSC[cpu].load(core::sync::atomic::Ordering::Relaxed))
+            .min(total_tsc);
+        if total_tsc != 0 && host_delta != 0 {
+            let aperf_delta = raw_aperf
+                .wrapping_sub(APERF_LAST_RAW[cpu].load(core::sync::atomic::Ordering::Relaxed));
+            let mperf_delta = raw_mperf
+                .wrapping_sub(MPERF_LAST_RAW[cpu].load(core::sync::atomic::Ordering::Relaxed));
+            APERF_CORRECTION[cpu].fetch_add(
+                proportional_counter_delta(aperf_delta, host_delta, total_tsc),
+                core::sync::atomic::Ordering::Relaxed,
+            );
+            MPERF_CORRECTION[cpu].fetch_add(
+                proportional_counter_delta(mperf_delta, host_delta, total_tsc),
+                core::sync::atomic::Ordering::Relaxed,
+            );
+        }
+    }
+
+    APERF_LAST_RAW[cpu].store(raw_aperf, core::sync::atomic::Ordering::Relaxed);
+    MPERF_LAST_RAW[cpu].store(raw_mperf, core::sync::atomic::Ordering::Relaxed);
+    APERF_LAST_TSC[cpu].store(now_tsc, core::sync::atomic::Ordering::Relaxed);
+    APERF_LAST_HOST_TSC[cpu].store(host_tsc, core::sync::atomic::Ordering::Relaxed);
+    APERF_SHADOW_VALID[cpu].store(true, core::sync::atomic::Ordering::Release);
+
+    if msr == IA32_APERF {
+        shadow_visible_value(
+            raw_aperf,
+            APERF_CORRECTION[cpu].load(core::sync::atomic::Ordering::Relaxed),
+            APERF_OFFSET[cpu].load(core::sync::atomic::Ordering::Relaxed),
+        )
+    } else {
+        shadow_visible_value(
+            raw_mperf,
+            MPERF_CORRECTION[cpu].load(core::sync::atomic::Ordering::Relaxed),
+            MPERF_OFFSET[cpu].load(core::sync::atomic::Ordering::Relaxed),
+        )
+    }
+}
+
+fn aperf_mperf_shadow_write(
+    cpu: usize,
+    raw_aperf: u64,
+    raw_mperf: u64,
+    msr: u32,
+    value: u64,
+) {
+    let now_tsc = unsafe { rdtsc() };
+    let host_tsc = super::super::diag::host_tsc_accum(cpu);
+    let correction = if msr == IA32_APERF {
+        APERF_CORRECTION[cpu].load(core::sync::atomic::Ordering::Relaxed)
+    } else {
+        MPERF_CORRECTION[cpu].load(core::sync::atomic::Ordering::Relaxed)
+    };
+    let raw = if msr == IA32_APERF { raw_aperf } else { raw_mperf };
+    let offset = shadow_offset_for_write(value, raw, correction);
+    if msr == IA32_APERF {
+        APERF_OFFSET[cpu].store(offset, core::sync::atomic::Ordering::Relaxed);
+    } else {
+        MPERF_OFFSET[cpu].store(offset, core::sync::atomic::Ordering::Relaxed);
+    }
+    APERF_LAST_RAW[cpu].store(raw_aperf, core::sync::atomic::Ordering::Relaxed);
+    MPERF_LAST_RAW[cpu].store(raw_mperf, core::sync::atomic::Ordering::Relaxed);
+    APERF_LAST_TSC[cpu].store(now_tsc, core::sync::atomic::Ordering::Relaxed);
+    APERF_LAST_HOST_TSC[cpu].store(host_tsc, core::sync::atomic::Ordering::Relaxed);
+    APERF_SHADOW_VALID[cpu].store(true, core::sync::atomic::Ordering::Release);
+}
+
+#[inline]
+fn shadow_visible_value(raw: u64, correction: u64, offset: u64) -> u64 {
+    raw.wrapping_sub(correction).wrapping_add(offset)
+}
+
+#[inline]
+fn shadow_offset_for_write(value: u64, raw: u64, correction: u64) -> u64 {
+    value.wrapping_sub(raw.wrapping_sub(correction))
+}
+
+fn proportional_counter_delta(counter_delta: u64, part: u64, whole: u64) -> u64 {
+    ((counter_delta as u128 * part as u128) / whole as u128) as u64
+}
+
 fn vmx_capability_msr(msr: u32) -> bool {
     (IA32_VMX_MSR_START..=IA32_VMX_MSR_END).contains(&msr)
 }
@@ -380,8 +589,8 @@ mod tests {
         inject_gp: G,
     ) -> ExitType
     where
-        R: FnOnce(u32) -> u64,
-        G: FnOnce(u32),
+        R: FnMut(u32) -> u64,
+        G: FnMut(u32),
     {
         handle_msr_access_with(guest_registers, access_type, read_msr, |_, _| (), inject_gp)
     }
@@ -532,6 +741,50 @@ mod tests {
         assert_eq!(exit, ExitType::IncrementRIP);
         assert_eq!(regs.rax, 0xDEAD_BEEF);
         assert_eq!(regs.rdx, 0x1234_5678);
+    }
+
+    #[test]
+    fn rdtscp_aux_uses_guest_shadow_when_enabled() {
+        assert_eq!(
+            guest_tsc_aux_for_cpu(7, true, 3, 0x1122_3344_5566_7788, true),
+            0x5566_7788
+        );
+    }
+
+    #[test]
+    fn rdtscp_aux_preserves_hardware_value_when_shadow_disabled() {
+        assert_eq!(
+            guest_tsc_aux_for_cpu(7, false, 3, 0x1122_3344_5566_7788, false),
+            7
+        );
+    }
+
+    #[test]
+    fn rdtscp_aux_preserves_hardware_value_for_untracked_cpu() {
+        assert_eq!(
+            guest_tsc_aux_for_cpu(7, true, MAX_TSC_AUX_SHADOW_CPUS, 0x99, true),
+            7
+        );
+    }
+
+    #[test]
+    fn rdtscp_aux_preserves_hardware_value_before_guest_writes_shadow() {
+        assert_eq!(
+            guest_tsc_aux_for_cpu(7, true, 3, 0x1122_3344_5566_7788, false),
+            7
+        );
+    }
+
+    #[test]
+    fn aperf_correction_scales_with_host_time() {
+        assert_eq!(proportional_counter_delta(1_000, 25, 100), 250);
+    }
+
+    #[test]
+    fn aperf_shadow_write_round_trips_after_correction() {
+        let desired = 77;
+        let offset = shadow_offset_for_write(desired, 1_000, 250);
+        assert_eq!(shadow_visible_value(1_000, 250, offset), desired);
     }
 
     #[test]

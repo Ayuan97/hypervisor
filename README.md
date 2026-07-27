@@ -87,6 +87,8 @@ scripts\build_stage.bat 600   # 产物 target\release\matrix_stage_600.sys
 - `HV_BOOT_STOP_STAGE=N`：**构建时**变量，driver 在 boot stage N 停下（配合 `scripts\build_stage.bat`）。
 - `HV_TRANSPARENT=1`：**构建时**，CPUID 完全透传，无 masking，只用于隔离测试。
 - `HV_USER_CLIENT_READS=1`：允许用户态 client-read 通道；生产环境保持 0。
+- `HV_ENABLE_APERF_SHADOW=1`：拦截并按 host handler TSC 时间补偿 APERF/MPERF；默认 0。
+- `HV_ENABLE_LBR_SHADOW=1`：保存/恢复 guest LBR 栈并隐藏 VM-exit 期间的 host 分支；默认 0。
 - `HV_DRIVER=<path>`：覆盖 `start_hv.bat` 默认的 driver 路径。
 
 ## 自检要求
@@ -148,16 +150,16 @@ CMOS freeze snapshot（`CMD_READ_CMOS_FREEZE`，扩展 CMOS 0x00-0x0B + 传统 C
 | VMX 指令探针 | 用户态注入 `#UD`；CPL0 shadow VMXE=0 时 `#UD`；shadow VMXE=1 时 VMfailInvalid |
 | SGX ENCLS/ENCLV | 可用时退出并注入 `#UD`；无法安全隐藏 SGX host 时拒绝加载 |
 | Intel PT VMX 痕迹 | 支持时启用 VMX concealment；不完整则拒绝 Intel PT host |
-| RDTSC/RDTSCP | trap-next-RDTSC 补偿 CPUID exit 开销（TSC_OFFSET 保持 0） |
+| RDTSC/RDTSCP | `HV_ENABLE_OPHION=1` 时 trap-next-RDTSC 补偿 CPUID exit 开销（TSC_OFFSET 保持 0）；`HV_ENABLE_TSC_AUX_SHADOW=1` 时 RDTSCP 的 TSC_AUX 与 guest MSR shadow 一致 |
 | XSETBV/INVD/WBINVD | 按 CPL 注入原生一致异常 |
 | EPT/VPID invalidation | VMXON 后、VMXOFF 前执行 |
 | 首次 VMLAUNCH 失败 | 恢复调用栈与非易失寄存器后返回错误 |
 | host IDT patch | 全表覆盖为 default handler，vector 2/8/13/14/18 单独 patch，first-fault breadcrumb 记录第一位 fault 现场 |
 | 游戏前诊断通道 | 默认 seal；用户态 PING 不返回 magic，拒绝 counters/controls，只允许重复 seal 与 CPL0 DEVIRTUALIZE |
-| **LBR 一致性** | **未防**（`docs/eac-hv-research-2026-07.md` 检测清单第 12 项） |
-| **APERF/MPERF 补偿** | **未防**（清单第 10 项，BattlEye 已知使用） |
+| **LBR 一致性** | `HV_ENABLE_LBR_SHADOW=1` 时保存/恢复 guest LBR 栈；默认关闭高开销路径 |
+| **APERF/MPERF 补偿** | `HV_ENABLE_APERF_SHADOW=1` 时按 host handler TSC 时间比例扣除；默认关闭高频拦截 |
 | **IA32_EFER SCE 虚拟化** | **未防**（清单第 13 项，延迟检测） |
-| **devirtualize 路径** | 完整 teardown（invept+invvpid+vmxoff+恢复 FS/GS/GDT/IDT/CR3）；**无 KeRegisterBugCheckCallback** |
+| **devirtualize 路径** | 完整 teardown（invept+invvpid+vmxoff+恢复 FS/GS/GDT/IDT/CR3）；已注册 `KeRegisterBugCheckCallback`，仅用于记录 bugcheck 证据，不在 callback 内执行 VMX teardown |
 
 ## 仍需实机重启验证
 
