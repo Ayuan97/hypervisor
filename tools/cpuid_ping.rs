@@ -171,10 +171,6 @@ fn hv_cmd(cmd: u64, arg1: u64) -> u64 {
     cpuid_cmd(CPUID_LEAF, cmd, arg1, EXPECTED_MAGIC)
 }
 
-fn hv_cmd_unauth(cmd: u64, arg1: u64) -> u64 {
-    cpuid_cmd(CPUID_LEAF, cmd, arg1, 0)
-}
-
 fn legacy_hv_cmd(cmd: u64, arg1: u64) -> u64 {
     cpuid_cmd(LEGACY_CPUID_LEAF, cmd, arg1, EXPECTED_MAGIC)
 }
@@ -348,11 +344,14 @@ fn main() {
 
     let mut checks_ok = true;
 
-    let unauth = hv_cmd_unauth(0x01, 0);
-    if unauth == 0 {
-        println!("[+] unauth CPUID leaf hidden");
+    let unauth = guest_cpuid(CPUID_LEAF as u32, 0);
+    if cpuid_result_is_zero(unauth) {
+        println!("[+] unauth CPUID leaf hidden (all registers zero)");
     } else {
-        println!("[!] unauth CPUID leaf leaked 0x{:X}", unauth);
+        println!(
+            "[!] unauth CPUID leaf leaked eax={:#X} ebx={:#X} ecx={:#X} edx={:#X}",
+            unauth.0, unauth.1, unauth.2, unauth.3
+        );
         checks_ok = false;
     }
 
@@ -365,15 +364,17 @@ fn main() {
         (feature_ecx >> 5) & 1,
         (feature_ecx >> 6) & 1
     );
-    let (_, leaf7_ebx, leaf7_ecx, _) = guest_cpuid(7, 0);
+    let (_, leaf7_ebx, leaf7_ecx, leaf7_edx) = guest_cpuid(7, 0);
     println!(
-        "  Leaf 7          = ebx={:#010x} ecx={:#010x} sgx={} intel_pt={} waitpkg={} sgx_lc={}",
+        "  Leaf 7          = ebx={:#010x} ecx={:#010x} edx={:#010x} sgx={} intel_pt={} waitpkg={} sgx_lc={} arch_lbr={}",
         leaf7_ebx,
         leaf7_ecx,
+        leaf7_edx,
         (leaf7_ebx >> 2) & 1,
         (leaf7_ebx >> 25) & 1,
         (leaf7_ecx >> 5) & 1,
-        (leaf7_ecx >> 30) & 1
+        (leaf7_ecx >> 30) & 1,
+        (leaf7_edx >> 19) & 1
     );
     let (hv_max, hv_ebx, hv_ecx, hv_edx) = guest_cpuid(0x4000_0000, 0);
     println!(
@@ -385,10 +386,40 @@ fn main() {
         "  Leaf 40000100   = eax={:#010x} ebx={:#010x} ecx={:#010x} edx={:#010x}",
         hidden_hv_ext.0, hidden_hv_ext.1, hidden_hv_ext.2, hidden_hv_ext.3
     );
+    let hidden_hv_leaves = [
+        0x4000_0001u32,
+        0x4000_0002,
+        0x4000_0003,
+        0x4000_0004,
+        0x4000_0005,
+        0x4000_0006,
+        0x4000_0009,
+        0x4000_000A,
+    ];
+    let hidden_hv_ok = hidden_hv_leaves
+        .iter()
+        .copied()
+        .map(|leaf| (leaf, guest_cpuid(leaf, 0)))
+        .all(|(_, result)| cpuid_result_is_zero(result));
+    if hidden_hv_ok {
+        println!("  HV leaves 40000001..4000000A = all zero");
+    } else {
+        println!("  HV leaves 40000001..4000000A = CHECK (non-zero result)");
+    }
     let (sgx_eax, sgx_ebx, sgx_ecx, sgx_edx) = guest_cpuid(0x12, 0);
     println!(
         "  Leaf 12         = eax={:#010x} ebx={:#010x} ecx={:#010x} edx={:#010x}",
         sgx_eax, sgx_ebx, sgx_ecx, sgx_edx
+    );
+    let processor_trace = guest_cpuid(0x14, 0);
+    println!(
+        "  Leaf 14         = eax={:#010x} ebx={:#010x} ecx={:#010x} edx={:#010x}",
+        processor_trace.0, processor_trace.1, processor_trace.2, processor_trace.3
+    );
+    let architectural_lbr = guest_cpuid(0x1C, 0);
+    println!(
+        "  Leaf 1C         = eax={:#010x} ebx={:#010x} ecx={:#010x} edx={:#010x}",
+        architectural_lbr.0, architectural_lbr.1, architectural_lbr.2, architectural_lbr.3
     );
     if ((feature_ecx >> 31) & 1) == 0
         && ((feature_ecx >> 5) & 1) == 0
@@ -397,15 +428,19 @@ fn main() {
         && ((leaf7_ebx >> 25) & 1) == 0
         && ((leaf7_ecx >> 5) & 1) == 0
         && ((leaf7_ecx >> 30) & 1) == 0
+        && ((leaf7_edx >> 19) & 1) == 0
         && hv_max == 0
         && hv_ebx == 0
         && hv_ecx == 0
         && hv_edx == 0
         && cpuid_result_is_zero(hidden_hv_ext)
+        && hidden_hv_ok
         && sgx_eax == 0
         && sgx_ebx == 0
         && sgx_ecx == 0
         && sgx_edx == 0
+        && cpuid_result_is_zero(processor_trace)
+        && cpuid_result_is_zero(architectural_lbr)
     {
         println!("  Masking         = OK");
     } else {
@@ -467,9 +502,26 @@ fn main() {
         } else if i == 2 {
             println!("    bit19 ConcealVmxFromPt={}", (v >> 19) & 1);
         } else if i == 3 {
-            println!("    bit24 ConcealVmxFromPt={}", (v >> 24) & 1);
+            println!(
+                "    bit2 SaveDebug={} bit24 ConcealVmxFromPt={}",
+                (v >> 2) & 1,
+                (v >> 24) & 1
+            );
         } else if i == 4 {
-            println!("    bit17 ConcealVmxFromPt={}", (v >> 17) & 1);
+            println!(
+                "    bit2 LoadDebug={} bit17 ConcealVmxFromPt={}",
+                (v >> 2) & 1,
+                (v >> 17) & 1
+            );
+        }
+    }
+
+    if !diagnostics_sealed {
+        if (exit & (1 << 2)) == 0 || (entry & (1 << 2)) == 0 {
+            println!("  Debug controls  = CHECK (save/load pair incomplete)");
+            checks_ok = false;
+        } else {
+            println!("  Debug controls  = OK");
         }
     }
 
@@ -1132,7 +1184,7 @@ fn main() {
         println!("      from halting a CPU. Compare against HOST_DEFAULT_COUNT (id 25).");
     }
 
-    // === P2 stealth MSR counters (2026-07-09) ===
+    // === MSR diagnostics ===
     let efer_r = hv_cmd(CMD_GET_CTL, 57);
     let efer_w = hv_cmd(CMD_GET_CTL, 58);
     let aperf_r = hv_cmd(CMD_GET_CTL, 59);
@@ -1141,15 +1193,14 @@ fn main() {
     let debugctl_w = hv_cmd(CMD_GET_CTL, 62);
     let lbr_r = hv_cmd(CMD_GET_CTL, 63);
     let dbg_shadow = hv_cmd(CMD_GET_CTL, 64);
-    println!("\n=== P2 stealth MSR polls ===");
-    println!("  IA32_EFER          reads={} writes={}", efer_r, efer_w);
+    println!("\n=== MSR diagnostics ===");
+    println!("  IA32_EFER          native; intercepted_reads={} intercepted_writes={}", efer_r, efer_w);
     println!("  IA32_APERF/MPERF   aperf_reads={} mperf_reads={}", aperf_r, mperf_r);
-    println!("  IA32_DEBUGCTL      reads={} writes={} shadow={:#018x}", debugctl_r, debugctl_w, dbg_shadow);
-    println!("  IA32_LBR stack     reads={}", lbr_r);
+    println!("  IA32_DEBUGCTL      native; intercepted_reads={} intercepted_writes={} diag_value={:#018x}", debugctl_r, debugctl_w, dbg_shadow);
+    println!("  IA32_LBR stack     native; intercepted_reads={}", lbr_r);
     if efer_r > 0 || aperf_r > 0 || mperf_r > 0 || debugctl_r > 0 || lbr_r > 0 {
         println!("  [i] Non-zero polls = something is querying these MSRs.");
-        println!("      Windows kernel does hit EFER/APERF at boot, so a small baseline is normal.");
-        println!("      A sudden jump after game launch = anti-cheat probe.");
+        println!("      Native EFER/DEBUGCTL/LBR accesses do not increment these counters.");
     }
 
     // === KeBugCheckEx Sentinel Address ===

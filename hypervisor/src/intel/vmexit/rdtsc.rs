@@ -44,11 +44,18 @@ pub fn handle_rdtscp(
     vmx: &mut crate::intel::vmx::Vmx,
 ) -> ExitType {
     if vmx.cpuid_entry_tsc != 0 {
-        let (_, aux) = unsafe { rdtscp() };
-        guest_registers.rcx = aux as u64;
+        guest_registers.rcx = vmx.guest_tsc_aux() as u64;
         handle_rdtsc_spoofed(guest_registers, vmx)
     } else {
-        handle_rdtscp_with_offset(guest_registers, || unsafe { rdtscp() }, vmx.tsc_offset)
+        let guest_aux = vmx.guest_tsc_aux();
+        handle_rdtscp_with_offset(
+            guest_registers,
+            || {
+                let (tsc, _) = unsafe { rdtscp() };
+                (tsc, guest_aux)
+            },
+            vmx.tsc_offset,
+        )
     }
 }
 
@@ -58,7 +65,7 @@ fn handle_rdtsc_spoofed(
     guest_registers: &mut GuestRegisters,
     vmx: &mut crate::intel::vmx::Vmx,
 ) -> ExitType {
-    use super::cpuid::{CPUID_BARE_METAL_COST, VMEXIT_ENTRY_OVERHEAD};
+    use super::cpuid::{cpuid_bare_metal_cost, VMEXIT_ENTRY_OVERHEAD};
     let now = unsafe { x86::time::rdtsc() };
     let elapsed = now.wrapping_sub(vmx.cpuid_entry_tsc);
     vmx.cpuid_entry_tsc = 0;
@@ -76,7 +83,7 @@ fn handle_rdtsc_spoofed(
     let spoofed = now
         .wrapping_sub(elapsed)
         .wrapping_sub(VMEXIT_ENTRY_OVERHEAD)
-        .wrapping_add(CPUID_BARE_METAL_COST)
+        .wrapping_add(cpuid_bare_metal_cost())
         .wrapping_add(vmcs_tsc_offset);
     write_tsc(guest_registers, spoofed);
     ExitType::IncrementRIP

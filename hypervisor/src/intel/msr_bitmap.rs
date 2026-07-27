@@ -24,19 +24,11 @@ const IA32_RTIT_STATUS_MSR: u32 = 0x571;
 const IA32_RTIT_CR3_MATCH_MSR: u32 = 0x572;
 const IA32_RTIT_ADDR_MSR_START: u32 = 0x580;
 const IA32_RTIT_ADDR_MSR_END: u32 = 0x58f;
-const IA32_TSC_AUX: u32 = 0x103;
-const IA32_EFER: u32 = 0xC000_0080;
 const IA32_MPERF: u32 = 0xE7;
 const IA32_APERF: u32 = 0xE8;
-const IA32_DEBUGCTL: u32 = 0x1D9;
-const IA32_LASTBRANCH_TOS: u32 = 0x1C9;
 // Intel SDM Vol 4: LASTBRANCH_FROM_i = 0x680 + i (32 entries), LASTBRANCH_TO_i = 0x6C0 + i (32 entries).
 // The gap 0x6A0-0x6BF holds LASTBRANCH_INFO_i / reserved — NOT the TO stack. Older code assumed
 // the two ranges were contiguous; correct intercept is two disjoint blocks.
-const IA32_LBR_FROM_START: u32 = 0x680;
-const IA32_LBR_FROM_END: u32 = 0x69F;
-const IA32_LBR_TO_START: u32 = 0x6C0;
-const IA32_LBR_TO_END: u32 = 0x6DF;
 
 /// Represents the MSR Bitmap structure used in VMX.
 ///
@@ -138,33 +130,23 @@ impl MsrBitmap {
             set_msr_bitmap_bit(&mut self.write_low_msrs, msr);
         }
 
-        // IA32_TSC_AUX — write always intercepted; read only when the shadow
-        // is enabled at build time (HV_ENABLE_TSC_AUX_SHADOW=1).
-        //
-        // Writes must always be intercepted: host IDT handlers use rdtscp for
-        // per-CPU indexing, so a guest WRMSR to physical MSR would corrupt
-        // host's index. Absorbed by `msr.rs`.
-        //
-        // Reads: with the shadow enabled, we return the shadow so a
-        // wrmsr-then-rdmsr probe (an EAC fingerprint) is consistent with bare
-        // metal. Disabled by default 2026-07-17 after a BSOD 0x1E during
-        // isolation testing — see `msr.rs::tsc_aux_shadow_enabled`.
-        set_msr_bitmap_bit(&mut self.write_high_msrs, IA32_TSC_AUX);
-        if option_env!("HV_ENABLE_TSC_AUX_SHADOW").map_or(false, |v| v == "1") {
-            set_msr_bitmap_bit(&mut self.read_high_msrs, IA32_TSC_AUX);
+        // IA32_TSC_AUX — both directions are intercepted. The guest gets a
+        // per-CPU shadow while the host keeps its physical CPU-index value.
+        // TSC_AUX is swapped by VM-entry/VM-exit MSR lists, so it remains
+        // native in the guest without exposing the host's CPU-index value.
+        // EFER, DEBUGCTL, and LBR MSRs likewise remain native.
+
+        // APERF / MPERF — optional shadow with proportional host-time
+        // compensation. Disabled by default because Windows polls both MSRs
+        // frequently; enabling it adds one extra RDMSR per read.
+        if option_env!("HV_ENABLE_APERF_SHADOW").map_or(false, |v| v == "1") {
+            set_msr_bitmap_bit(&mut self.read_low_msrs, IA32_MPERF);
+            set_msr_bitmap_bit(&mut self.read_low_msrs, IA32_APERF);
+            set_msr_bitmap_bit(&mut self.write_low_msrs, IA32_MPERF);
+            set_msr_bitmap_bit(&mut self.write_low_msrs, IA32_APERF);
         }
 
-        // ---- P2 stealth interception (secret.club EAC detection vectors) ----
-
-        // IA32_EFER (0xC000_0080). Falls in the high range (0xC0000000-0xC0001FFF).
-        // Read intercept lets us hand back a consistent EFER value and count how
-        // often EAC queries it; write intercept ensures guest cannot toggle SCE
-        // without our knowledge.
-        let efer_low = IA32_EFER - 0xC000_0000;
-        set_msr_bitmap_bit(&mut self.read_high_msrs, efer_low);
-        set_msr_bitmap_bit(&mut self.write_high_msrs, efer_low);
-
-        // APERF / MPERF — NOT intercepted.
+        // APERF / MPERF default behavior remains pass-through.
         //
         // The old comment claimed "reads pass through so ratio stays close
         // to bare metal (our VM-exit rate is very low anyway)". Empirically
@@ -194,21 +176,6 @@ impl MsrBitmap {
         // actually sees on bare metal, without giving up any real
         // stealth (0xE2's value on this box is 0-limit either way).
         //
-        // IA32_DEBUGCTL (0x1D9) + LBR TOS + LBR stack (0x680-0x6BF). Intercept
-        // both directions so guest cannot observe host branches leaking into
-        // LBR after a VM-exit.
-        set_msr_bitmap_bit(&mut self.read_low_msrs, IA32_DEBUGCTL);
-        set_msr_bitmap_bit(&mut self.write_low_msrs, IA32_DEBUGCTL);
-        set_msr_bitmap_bit(&mut self.read_low_msrs, IA32_LASTBRANCH_TOS);
-        set_msr_bitmap_bit(&mut self.write_low_msrs, IA32_LASTBRANCH_TOS);
-        for msr in IA32_LBR_FROM_START..=IA32_LBR_FROM_END {
-            set_msr_bitmap_bit(&mut self.read_low_msrs, msr);
-            set_msr_bitmap_bit(&mut self.write_low_msrs, msr);
-        }
-        for msr in IA32_LBR_TO_START..=IA32_LBR_TO_END {
-            set_msr_bitmap_bit(&mut self.read_low_msrs, msr);
-            set_msr_bitmap_bit(&mut self.write_low_msrs, msr);
-        }
     }
 }
 
@@ -264,13 +231,13 @@ mod tests {
     }
 
     #[test]
-    fn tsc_aux_write_is_intercepted_but_read_passes_through() {
+    fn tsc_aux_is_native_and_swapped_by_transition_lists() {
         let mut bitmap = empty_bitmap();
 
         bitmap.intercept_vmx_msrs();
 
-        assert!(msr_bitmap_bit_is_set(&bitmap.write_high_msrs, IA32_TSC_AUX));
-        assert!(!msr_bitmap_bit_is_set(&bitmap.read_high_msrs, IA32_TSC_AUX));
+        assert!(!msr_bitmap_bit_is_set(&bitmap.write_high_msrs, 0x103));
+        assert!(!msr_bitmap_bit_is_set(&bitmap.read_high_msrs, 0x103));
     }
 
     #[test]
@@ -294,27 +261,38 @@ mod tests {
     }
 
     #[test]
-    fn efer_is_intercepted_in_high_range() {
+    fn efer_is_native_in_high_range() {
         let mut bitmap = empty_bitmap();
         bitmap.intercept_vmx_msrs();
 
-        let efer_low = IA32_EFER - 0xC000_0000;
-        assert!(msr_bitmap_bit_is_set(&bitmap.read_high_msrs, efer_low));
-        assert!(msr_bitmap_bit_is_set(&bitmap.write_high_msrs, efer_low));
+        assert!(!msr_bitmap_bit_is_set(&bitmap.read_high_msrs, 0x80));
+        assert!(!msr_bitmap_bit_is_set(&bitmap.write_high_msrs, 0x80));
     }
 
     #[test]
-    fn aperf_and_mperf_are_never_intercepted() {
+    fn aperf_and_mperf_follow_shadow_build_gate() {
         // Windows scheduler polls both MSRs on every tick per logical CPU;
-        // intercepting them scaled to millions of exits/sec under EAC load.
-        // Both directions must stay pass-through — see msr_bitmap.rs comment.
+        // the shadow is therefore opt-in and must be absent in the default build.
         let mut bitmap = empty_bitmap();
         bitmap.intercept_vmx_msrs();
+        let enabled = option_env!("HV_ENABLE_APERF_SHADOW").map_or(false, |v| v == "1");
 
-        assert!(!msr_bitmap_bit_is_set(&bitmap.read_low_msrs, IA32_MPERF));
-        assert!(!msr_bitmap_bit_is_set(&bitmap.read_low_msrs, IA32_APERF));
-        assert!(!msr_bitmap_bit_is_set(&bitmap.write_low_msrs, IA32_MPERF));
-        assert!(!msr_bitmap_bit_is_set(&bitmap.write_low_msrs, IA32_APERF));
+        assert_eq!(
+            msr_bitmap_bit_is_set(&bitmap.read_low_msrs, IA32_MPERF),
+            enabled
+        );
+        assert_eq!(
+            msr_bitmap_bit_is_set(&bitmap.read_low_msrs, IA32_APERF),
+            enabled
+        );
+        assert_eq!(
+            msr_bitmap_bit_is_set(&bitmap.write_low_msrs, IA32_MPERF),
+            enabled
+        );
+        assert_eq!(
+            msr_bitmap_bit_is_set(&bitmap.write_low_msrs, IA32_APERF),
+            enabled
+        );
     }
 
     #[test]
@@ -329,25 +307,23 @@ mod tests {
     }
 
     #[test]
-    fn debugctl_and_lbr_stack_are_intercepted_both_ways() {
+    fn debugctl_is_native() {
         let mut bitmap = empty_bitmap();
         bitmap.intercept_vmx_msrs();
+        assert!(!msr_bitmap_bit_is_set(&bitmap.read_low_msrs, 0x1D9));
+        assert!(!msr_bitmap_bit_is_set(&bitmap.write_low_msrs, 0x1D9));
+    }
 
-        for msr in [
-            IA32_DEBUGCTL,
-            IA32_LASTBRANCH_TOS,
-            IA32_LBR_FROM_START,
-            IA32_LBR_FROM_END,
-            IA32_LBR_TO_START,
-            IA32_LBR_TO_END,
-        ] {
-            assert!(msr_bitmap_bit_is_set(&bitmap.read_low_msrs, msr), "read {:#x}", msr);
-            assert!(msr_bitmap_bit_is_set(&bitmap.write_low_msrs, msr), "write {:#x}", msr);
+    #[test]
+    fn lbr_stack_is_native() {
+        let mut bitmap = empty_bitmap();
+        bitmap.intercept_vmx_msrs();
+        for msr in [0x1C9, 0x680, 0x69F, 0x6C0, 0x6DF] {
+            assert!(!msr_bitmap_bit_is_set(&bitmap.read_low_msrs, msr));
+            assert!(!msr_bitmap_bit_is_set(&bitmap.write_low_msrs, msr));
         }
-        // The gap 0x6A0-0x6BF (LASTBRANCH_INFO / reserved) is deliberately NOT intercepted.
         assert!(!msr_bitmap_bit_is_set(&bitmap.read_low_msrs, 0x6A0));
         assert!(!msr_bitmap_bit_is_set(&bitmap.read_low_msrs, 0x6BF));
-        // Immediately past the TO block also must not leak.
-        assert!(!msr_bitmap_bit_is_set(&bitmap.read_low_msrs, IA32_LBR_TO_END + 1));
+        assert!(!msr_bitmap_bit_is_set(&bitmap.read_low_msrs, 0x6E0));
     }
 }

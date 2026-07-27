@@ -868,6 +868,7 @@ static HANDLER_SLOW_COUNT: [AtomicU64; MAX_TRACKED_CPUS] = [ZERO_U64; MAX_TRACKE
 static HANDLER_LAST_SLOW_REASON: [AtomicU64; MAX_TRACKED_CPUS] = [ZERO_U64; MAX_TRACKED_CPUS];
 static HANDLER_LAST_SLOW_RIP: [AtomicU64; MAX_TRACKED_CPUS] = [ZERO_U64; MAX_TRACKED_CPUS];
 static HANDLER_LAST_SLOW_DELTA: [AtomicU64; MAX_TRACKED_CPUS] = [ZERO_U64; MAX_TRACKED_CPUS];
+static HOST_TSC_ACCUM: [AtomicU64; MAX_TRACKED_CPUS] = [ZERO_U64; MAX_TRACKED_CPUS];
 
 /// Record VM-exit handler start. Called from `handle_vmexit` prologue with
 /// the TSC snapshot and current exit reason (from VMCS). Same CPU can call
@@ -891,6 +892,9 @@ pub fn watchdog_handler_finish(guest_rip: u64) {
     }
     let now = rdtsc_now();
     let delta = now.wrapping_sub(start);
+    if option_env!("HV_ENABLE_APERF_SHADOW").map_or(false, |v| v == "1") {
+        HOST_TSC_ACCUM[cpu].fetch_add(delta, Relaxed);
+    }
     let reason = HANDLER_LAST_EXIT_REASON[cpu].load(Relaxed);
     // Update per-CPU max (best-effort; racy across nested exits).
     if delta > HANDLER_MAX_DELTA[cpu].load(Relaxed) {
@@ -909,6 +913,16 @@ pub fn watchdog_handler_finish(guest_rip: u64) {
     // Persist freeze-critical Step 1-4 state to CMOS so a hard reboot can
     // still recover the "who died first" answer we lost on 2026-07-09.
     cmos_sync_step4_state();
+}
+
+/// TSC cycles spent in the VM-exit handler on a logical CPU. Used by the
+/// optional APERF/MPERF shadow to remove host handler time from guest reads.
+#[inline]
+pub(super) fn host_tsc_accum(cpu: usize) -> u64 {
+    if cpu >= MAX_TRACKED_CPUS {
+        return 0;
+    }
+    HOST_TSC_ACCUM[cpu].load(Relaxed)
 }
 
 /// Read one field of watchdog state for a given CPU.

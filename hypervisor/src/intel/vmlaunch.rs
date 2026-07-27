@@ -467,6 +467,7 @@ pub extern "C" fn vmresume_failed(vmx: *mut u64) {
     let vmx = unsafe { &*(vmx as *mut Vmx) };
     unsafe {
         guest_state.restore_after_vmxoff(vmx);
+        vmx.restore_guest_transition_msrs();
     }
     clear_virtualized();
 }

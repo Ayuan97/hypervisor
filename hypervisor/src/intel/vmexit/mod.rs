@@ -135,9 +135,8 @@ impl VmExit {
         // that made it to persistent storage. See diag.rs::layer3_maybe_flush.
         diag::layer3_maybe_flush();
 
-        // Snapshot + freeze the LBR stack ASAP so host handler branches do
-        // not pollute what the guest reads back later. Cheap fast-path if
-        // LBR is disabled (single RDMSR). See intel/lbr.rs.
+        // Snapshot the LBR stack only when the explicit shadow build gate and
+        // guest DEBUGCTL.LBR are both enabled. See intel/lbr.rs.
         let lbr_saved = crate::intel::lbr::save_and_disable_lbr();
 
         // Port 0x80 breadcrumb: mark that we entered handle_vmexit. Overwritten
@@ -589,6 +588,7 @@ impl VmExit {
         support::vmxoff()?;
         unsafe {
             guest_state.restore_after_vmxoff(vmx);
+            vmx.restore_guest_transition_msrs();
             core::arch::asm!(
                 "ldmxcsr [{}]",
                 in(reg) &saved_mxcsr,

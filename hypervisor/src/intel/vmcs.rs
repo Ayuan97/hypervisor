@@ -539,7 +539,8 @@ fn requested_secondary_controls() -> u64 {
 }
 
 fn required_entry_controls() -> u64 {
-    vmcs::control::EntryControls::IA32E_MODE_GUEST.bits() as u64
+    (vmcs::control::EntryControls::IA32E_MODE_GUEST.bits()
+        | vmcs::control::EntryControls::LOAD_DEBUG_CONTROLS.bits()) as u64
 }
 
 fn optional_entry_controls() -> u64 {
@@ -559,7 +560,8 @@ fn requested_entry_controls() -> u64 {
 }
 
 fn required_exit_controls() -> u64 {
-    vmcs::control::ExitControls::HOST_ADDRESS_SPACE_SIZE.bits() as u64
+    (vmcs::control::ExitControls::HOST_ADDRESS_SPACE_SIZE.bits()
+        | vmcs::control::ExitControls::SAVE_DEBUG_CONTROLS.bits()) as u64
 }
 
 fn optional_exit_controls() -> u64 {
@@ -888,6 +890,17 @@ mod tests {
         let tsc_offsetting = vmcs::control::PrimaryControls::USE_TSC_OFFSETTING.bits() as u64;
 
         assert_ne!(required & tsc_offsetting, 0);
+    }
+
+    #[test]
+    fn debug_controls_are_saved_and_loaded() {
+        let load_debug = vmcs::control::EntryControls::LOAD_DEBUG_CONTROLS.bits() as u64;
+        let save_debug = vmcs::control::ExitControls::SAVE_DEBUG_CONTROLS.bits() as u64;
+
+        assert_eq!(required_entry_controls() & load_debug, load_debug);
+        assert_eq!(required_exit_controls() & save_debug, save_debug);
+        assert_eq!(unsupported_entry_controls(required_entry_controls()), 0);
+        assert_eq!(unsupported_exit_controls(required_exit_controls()), 0);
     }
 
     #[test]

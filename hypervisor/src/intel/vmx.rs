@@ -19,14 +19,86 @@ use {
         },
         utils::capture::GuestRegisters,
         utils::{
+            addresses::PhysicalAddress,
             alloc::{KernelAlloc, PhysicalAllocator},
             capture::CONTEXT,
             nt::{IDENTITY_CR3, NTOSKRNL_CR3},
         },
     },
     alloc::boxed::Box,
-    core::ptr::NonNull,
+    core::{cell::UnsafeCell, ptr::NonNull},
+    x86::{cpuid::cpuid, msr, vmx::vmcs},
 };
+
+const IA32_TSC_AUX: u32 = 0xC000_0103;
+const IA32_PERF_GLOBAL_CTRL: u32 = 0x38F;
+const MAX_TRANSITION_MSRS: usize = 2;
+
+/// One entry in a VM-entry/VM-exit MSR load/store area (Intel SDM 25.7/25.8).
+#[repr(C, align(16))]
+struct VmxMsrEntry {
+    index: u32,
+    reserved: u32,
+    value: UnsafeCell<u64>,
+}
+
+impl VmxMsrEntry {
+    const fn new(index: u32, value: u64) -> Self {
+        Self {
+            index,
+            reserved: 0,
+            value: UnsafeCell::new(value),
+        }
+    }
+
+    fn value(&self) -> u64 {
+        unsafe { core::ptr::read_volatile(self.value.get()) }
+    }
+}
+
+/// Per-vCPU architectural MSRs swapped by hardware at every VM transition.
+///
+/// IA32_TSC_AUX must be swapped instead of software-shadowed: with RDTSC
+/// exiting disabled, RDTSCP executes natively in the guest and therefore must
+/// see a real guest IA32_TSC_AUX value. IA32_PERF_GLOBAL_CTRL is also swapped
+/// when architectural PMU support is present so guest counters stop while the
+/// VM-exit handler runs.
+#[repr(C, align(16))]
+struct VmxMsrList {
+    entries: [VmxMsrEntry; MAX_TRANSITION_MSRS],
+}
+
+impl VmxMsrList {
+    fn guest(tsc_aux: u64, perf_global_ctrl: Option<u64>) -> Self {
+        Self {
+            entries: [
+                VmxMsrEntry::new(IA32_TSC_AUX, tsc_aux),
+                VmxMsrEntry::new(
+                    perf_global_ctrl.map_or(0, |_| IA32_PERF_GLOBAL_CTRL),
+                    perf_global_ctrl.unwrap_or(0),
+                ),
+            ],
+        }
+    }
+
+    fn host(tsc_aux: u64, perf_global_ctrl_present: bool) -> Self {
+        Self {
+            entries: [
+                VmxMsrEntry::new(IA32_TSC_AUX, tsc_aux),
+                // Root mode does not own the guest PMU. Loading zero stops
+                // programmable/fixed counters until the matching VM-entry.
+                VmxMsrEntry::new(
+                    if perf_global_ctrl_present {
+                        IA32_PERF_GLOBAL_CTRL
+                    } else {
+                        0
+                    },
+                    0,
+                ),
+            ],
+        }
+    }
+}
 
 /// Represents the VMX structure with essential components for VMX virtualization.
 ///
@@ -48,6 +120,15 @@ pub struct Vmx {
     /// Virtual address of the VMCS region, aligned to a 4-KByte boundary.
     /// Allocated using `MmAllocateContiguousMemorySpecifyCacheNode`.
     pub vmcs_region: Box<Vmcs, PhysicalAllocator>,
+
+    /// Guest values stored on VM-exit and loaded on VM-entry.
+    guest_msr_state: Box<VmxMsrList, PhysicalAllocator>,
+
+    /// Root values loaded by hardware before the VM-exit handler runs.
+    host_msr_state: Box<VmxMsrList, PhysicalAllocator>,
+
+    /// Active entries in each transition list.
+    transition_msr_count: u32,
 
     /// Virtual address of the guest's descriptor tables, including GDT and IDT.
     /// Allocated using `ExAllocatePool` or `ExAllocatePoolWithTag`.
@@ -105,6 +186,18 @@ impl Vmx {
         // Allocate memory for the hypervisor's needs
         let vmxon_region = unsafe { Box::try_new_zeroed_in(PhysicalAllocator)?.assume_init() };
         let vmcs_region = unsafe { Box::try_new_zeroed_in(PhysicalAllocator)?.assume_init() };
+        let initial_tsc_aux = unsafe { msr::rdmsr(IA32_TSC_AUX) };
+        let pmu_present = (cpuid!(0xA).eax & 0xff) != 0;
+        let initial_perf_global_ctrl =
+            pmu_present.then(|| unsafe { msr::rdmsr(IA32_PERF_GLOBAL_CTRL) });
+        let guest_msr_state = Box::try_new_in(
+            VmxMsrList::guest(initial_tsc_aux, initial_perf_global_ctrl),
+            PhysicalAllocator,
+        )?;
+        let host_msr_state = Box::try_new_in(
+            VmxMsrList::host(initial_tsc_aux, pmu_present),
+            PhysicalAllocator,
+        )?;
         let mut guest_descriptor_table = Box::try_new_in(DescriptorTables::new(), KernelAlloc)?;
         let mut host_descriptor_table = Box::try_new_in(DescriptorTables::new(), KernelAlloc)?;
         let vmstack = unsafe { Box::try_new_zeroed_in(KernelAlloc)?.assume_init() };
@@ -140,6 +233,9 @@ impl Vmx {
         let instance = Self {
             vmxon_region,
             vmcs_region,
+            guest_msr_state,
+            host_msr_state,
+            transition_msr_count: if pmu_present { 2 } else { 1 },
             guest_descriptor_table,
             host_descriptor_table,
             vmstack,
@@ -247,6 +343,7 @@ impl Vmx {
              * - 25.8 VM-ENTRY CONTROL FIELDS
              */
             Vmcs::setup_vmcs_control_fields(shared_data)?;
+            self.setup_transition_msr_lists()?;
 
             Ok(())
         })();
@@ -327,6 +424,11 @@ impl Vmx {
         unsafe { launch_vm(&mut self.guest_registers, vmcs_host_rsp as *mut u64) };
         crate::intel::diag_trace::trace("vmlaunch: returned (FAILED)");
 
+        // `vmlaunch_failed` executes VMXOFF before returning to this frame.
+        // Restore the guest-owned transition MSRs on that path as well; the
+        // normal devirtualization path performs the same operation in
+        // `leave_vmx_root`, so this is idempotent when it returns normally.
+        unsafe { self.restore_guest_transition_msrs() };
         self.restore_control_registers();
         let _ = diag::boot_stage(790 + cpu_index as u64);
         Err(HypervisorError::VMLAUNCHFailed)
@@ -334,6 +436,64 @@ impl Vmx {
 
     pub fn restore_control_registers(&self) {
         self.control_registers.restore();
+    }
+
+    fn setup_transition_msr_lists(&self) -> Result<(), HypervisorError> {
+        let guest_pa = PhysicalAddress::pa_from_va(
+            self.guest_msr_state.as_ref() as *const VmxMsrList as u64,
+        );
+        let host_pa = PhysicalAddress::pa_from_va(
+            self.host_msr_state.as_ref() as *const VmxMsrList as u64,
+        );
+
+        // Intel SDM requires all VM-entry/VM-exit MSR list addresses to be
+        // non-zero and 16-byte aligned.  Reject a bad translation here,
+        // before VMLAUNCH turns it into a late VM-entry failure.
+        if guest_pa == 0
+            || host_pa == 0
+            || (guest_pa & 0xF) != 0
+            || (host_pa & 0xF) != 0
+            || self.transition_msr_count == 0
+            || self.transition_msr_count as usize > MAX_TRANSITION_MSRS
+        {
+            log::error!(
+                "Invalid VM transition MSR lists: guest_pa={:#x} host_pa={:#x} count={}",
+                guest_pa,
+                host_pa,
+                self.transition_msr_count
+            );
+            return Err(HypervisorError::VirtualToPhysicalAddressFailed);
+        }
+
+        support::vmwrite_checked(vmcs::control::VMEXIT_MSR_STORE_ADDR_FULL, guest_pa)?;
+        support::vmwrite_checked(
+            vmcs::control::VMEXIT_MSR_STORE_COUNT,
+            self.transition_msr_count as u64,
+        )?;
+        support::vmwrite_checked(vmcs::control::VMEXIT_MSR_LOAD_ADDR_FULL, host_pa)?;
+        support::vmwrite_checked(
+            vmcs::control::VMEXIT_MSR_LOAD_COUNT,
+            self.transition_msr_count as u64,
+        )?;
+        support::vmwrite_checked(vmcs::control::VMENTRY_MSR_LOAD_ADDR_FULL, guest_pa)?;
+        support::vmwrite_checked(
+            vmcs::control::VMENTRY_MSR_LOAD_COUNT,
+            self.transition_msr_count as u64,
+        )?;
+        Ok(())
+    }
+
+    /// Guest IA32_TSC_AUX saved by the most recent VM-exit.
+    pub fn guest_tsc_aux(&self) -> u32 {
+        self.guest_msr_state.entries[0].value() as u32
+    }
+
+    /// Restore architectural guest MSRs when devirtualization returns without
+    /// a matching VM-entry.
+    pub unsafe fn restore_guest_transition_msrs(&self) {
+        for entry in &self.guest_msr_state.entries[..self.transition_msr_count as usize] {
+            msr::wrmsr(entry.index, entry.value());
+        }
     }
 
     /// Returns a shared reference to the shared data.
@@ -367,5 +527,20 @@ mod tests {
         fn assert_signature(_: fn(&mut Vmx, u32) -> Result<(), HypervisorError>) {}
 
         assert_signature(Vmx::run);
+    }
+
+    #[test]
+    fn transition_msr_lists_keep_tsc_aux_guest_owned_and_stop_root_pmu() {
+        let guest = VmxMsrList::guest(0x1234, Some(0x55));
+        let host = VmxMsrList::host(0x77, true);
+
+        assert_eq!(core::mem::size_of::<VmxMsrEntry>(), 16);
+        assert_eq!(guest.entries[0].index, IA32_TSC_AUX);
+        assert_eq!(guest.entries[0].value(), 0x1234);
+        assert_eq!(host.entries[0].value(), 0x77);
+        assert_eq!(guest.entries[1].index, IA32_PERF_GLOBAL_CTRL);
+        assert_eq!(guest.entries[1].value(), 0x55);
+        assert_eq!(host.entries[1].index, IA32_PERF_GLOBAL_CTRL);
+        assert_eq!(host.entries[1].value(), 0);
     }
 }

@@ -3,31 +3,43 @@
 //! intercepted and handled, with support for injecting faults for unauthorized accesses.
 
 use crate::{
-    intel::{events::EventInjection, support, vmexit::ExitType},
+    intel::{events::EventInjection, vmexit::ExitType},
     utils::capture::GuestRegisters,
 };
-use core::sync::atomic::AtomicU64;
-use x86::{msr, vmx::vmcs};
-
-/// Per-CPU shadow of IA32_TSC_AUX. Must be >= diag::MAX_TRACKED_CPUS since
-/// current_cpu_index() ranges over that. Kept as a plain const here to
-/// avoid a cross-module dependency on diag.
-pub(super) const MAX_TSC_AUX_SHADOW_CPUS: usize = 64;
+use core::sync::atomic::{AtomicBool, AtomicU64};
+use x86::{msr, time::rdtsc};
 
 #[allow(clippy::declare_interior_mutable_const)]
 const ZERO_U64: AtomicU64 = AtomicU64::new(0);
-pub(super) static TSC_AUX_SHADOW: [AtomicU64; MAX_TSC_AUX_SHADOW_CPUS] =
-    [ZERO_U64; MAX_TSC_AUX_SHADOW_CPUS];
 
-/// TSC_AUX shadow is a NEW code path added 2026-07-17 alongside a BSOD 0x1E
-/// during isolation testing. Gated OFF by default until root-cause isolated.
-/// Set HV_ENABLE_TSC_AUX_SHADOW=1 at build time to re-arm.
-pub(super) fn tsc_aux_shadow_enabled() -> bool {
-    option_env!("HV_ENABLE_TSC_AUX_SHADOW").map_or(false, |v| v == "1")
+#[allow(clippy::declare_interior_mutable_const)]
+const ZERO_BOOL: AtomicBool = AtomicBool::new(false);
+
+pub(super) const MAX_APERF_SHADOW_CPUS: usize = 64;
+pub(super) static APERF_SHADOW_VALID: [AtomicBool; MAX_APERF_SHADOW_CPUS] =
+    [ZERO_BOOL; MAX_APERF_SHADOW_CPUS];
+pub(super) static APERF_LAST_RAW: [AtomicU64; MAX_APERF_SHADOW_CPUS] =
+    [ZERO_U64; MAX_APERF_SHADOW_CPUS];
+pub(super) static MPERF_LAST_RAW: [AtomicU64; MAX_APERF_SHADOW_CPUS] =
+    [ZERO_U64; MAX_APERF_SHADOW_CPUS];
+pub(super) static APERF_LAST_TSC: [AtomicU64; MAX_APERF_SHADOW_CPUS] =
+    [ZERO_U64; MAX_APERF_SHADOW_CPUS];
+pub(super) static APERF_LAST_HOST_TSC: [AtomicU64; MAX_APERF_SHADOW_CPUS] =
+    [ZERO_U64; MAX_APERF_SHADOW_CPUS];
+pub(super) static APERF_CORRECTION: [AtomicU64; MAX_APERF_SHADOW_CPUS] =
+    [ZERO_U64; MAX_APERF_SHADOW_CPUS];
+pub(super) static MPERF_CORRECTION: [AtomicU64; MAX_APERF_SHADOW_CPUS] =
+    [ZERO_U64; MAX_APERF_SHADOW_CPUS];
+pub(super) static APERF_OFFSET: [AtomicU64; MAX_APERF_SHADOW_CPUS] =
+    [ZERO_U64; MAX_APERF_SHADOW_CPUS];
+pub(super) static MPERF_OFFSET: [AtomicU64; MAX_APERF_SHADOW_CPUS] =
+    [ZERO_U64; MAX_APERF_SHADOW_CPUS];
+
+pub(super) fn aperf_mperf_shadow_enabled() -> bool {
+    option_env!("HV_ENABLE_APERF_SHADOW").map_or(false, |v| v == "1")
 }
 
 const IA32_FEATURE_CONTROL_MSR: u32 = 0x3a;
-const IA32_TSC_AUX: u32 = 0xC000_0103;
 const IA32_VMX_MSR_START: u32 = 0x480;
 const IA32_VMX_MSR_END: u32 = 0x491;
 const IA32_SGXLEPUBKEYHASH_MSR_START: u32 = 0x8c;
@@ -44,18 +56,8 @@ const IA32_RTIT_STATUS_MSR: u32 = 0x571;
 const IA32_RTIT_CR3_MATCH_MSR: u32 = 0x572;
 const IA32_RTIT_ADDR_MSR_START: u32 = 0x580;
 const IA32_RTIT_ADDR_MSR_END: u32 = 0x58f;
-const IA32_EFER: u32 = 0xC000_0080;
 const IA32_MPERF: u32 = 0xE7;
 const IA32_APERF: u32 = 0xE8;
-const IA32_DEBUGCTL: u32 = 0x1D9;
-const IA32_LASTBRANCH_TOS: u32 = 0x1C9;
-// Intel SDM Vol 4: 32-entry LBR stack is split into two disjoint MSR blocks —
-// LASTBRANCH_FROM_i at 0x680+i and LASTBRANCH_TO_i at 0x6C0+i. The gap 0x6A0-0x6BF
-// is LASTBRANCH_INFO / reserved and MUST NOT be treated as part of the TO stack.
-const IA32_LBR_FROM_START: u32 = 0x680;
-const IA32_LBR_FROM_END: u32 = 0x69F;
-const IA32_LBR_TO_START: u32 = 0x6C0;
-const IA32_LBR_TO_END: u32 = 0x6DF;
 
 /// Enum representing the type of MSR access.
 ///
@@ -69,10 +71,9 @@ pub enum MsrAccessType {
 ///
 /// Handles intercepted MSR accesses.
 ///
-/// The MSR bitmap intercepts specific MSRs: IA32_FEATURE_CONTROL, VMX
-/// capability MSRs, SGX key-hash MSRs, Intel PT MSRs, and IA32_TSC_AUX.
-/// Reads are passed through to hardware (hiding VMX bits where needed);
-/// writes to read-only MSRs inject #GP to match bare-metal behavior.
+/// The MSR bitmap intercepts only the virtualized capability surface:
+/// IA32_FEATURE_CONTROL, VMX capability MSRs, hidden SGX key-hash MSRs, and
+/// hidden Intel PT MSRs. Native architectural MSRs remain outside the bitmap.
 pub fn handle_msr_access(
     guest_registers: &mut GuestRegisters,
     access_type: MsrAccessType,
@@ -106,84 +107,58 @@ pub fn handle_msr_access(
 fn handle_msr_access_with<R, W, G>(
     guest_registers: &mut GuestRegisters,
     access_type: MsrAccessType,
-    read_msr: R,
-    write_msr: W,
-    inject_gp: G,
+    mut read_msr: R,
+    mut write_msr: W,
+    mut inject_gp: G,
 ) -> ExitType
 where
-    R: FnOnce(u32) -> u64,
-    W: FnOnce(u32, u64),
-    G: FnOnce(u32),
+    R: FnMut(u32) -> u64,
+    W: FnMut(u32, u64),
+    G: FnMut(u32),
 {
     let msr = guest_registers.rcx as u32;
 
-    if intel_pt_msr_is_virtualized(msr) {
-        if matches!(access_type, MsrAccessType::Read) {
-            guest_registers.rax = 0;
-            guest_registers.rdx = 0;
-        }
-        return ExitType::IncrementRIP;
+    // These MSRs belong to capabilities hidden by the CPUID model. Faulting
+    // both directions keeps the feature leaves and MSR surface coherent.
+    if intel_pt_msr_is_virtualized(msr) || sgx_keyhash_msr(msr) {
+        inject_gp(0);
+        return ExitType::Continue;
     }
 
-    // IA32_TSC_AUX handling. Two modes selected at build time:
-    //
-    // Shadow ON (env HV_ENABLE_TSC_AUX_SHADOW=1): per-CPU shadow, R+W
-    // intercepted. Host's physical TSC_AUX carries the logical-CPU index
-    // used by rdtscp-based dispatch (see host_idt.rs); guest writes reach
-    // only the shadow, physical stays intact; guest reads return the
-    // shadow so wrmsr-then-rdmsr is consistent with bare metal.
-    //
-    // Shadow OFF (default, 2026-07-17): only writes are intercepted (and
-    // absorbed) — reads pass through to physical. This is the pre-shadow
-    // behaviour, preserved after a BSOD 0x1E was observed with the shadow
-    // active (STATUS_PRIVILEGED_INSTRUCTION at a kernel-dynamic MOV CR0,
-    // preceded by a WHEA fatal). Root cause not yet isolated; keeping the
-    // shadow gated lets us A/B-test cleanly. Read intercept must be
-    // disabled in msr_bitmap.rs when the shadow is off, otherwise a guest
-    // TSC_AUX read would exit into no-op territory and fall through the
-    // default #GP path below.
-    if msr == IA32_TSC_AUX {
-        if tsc_aux_shadow_enabled() {
-            let cpu = crate::intel::host_idt::current_cpu_index();
-            if cpu >= MAX_TSC_AUX_SHADOW_CPUS {
-                // Out-of-range CPU (shouldn't happen given MAX_TRACKED_CPUS=64,
-                // but guard anyway). Absorb writes, return 0 for reads.
-                match access_type {
-                    MsrAccessType::Read => {
-                        guest_registers.rax = 0;
-                        guest_registers.rdx = 0;
-                    }
-                    MsrAccessType::Write => {}
+    if aperf_mperf_shadow_enabled() && (msr == IA32_APERF || msr == IA32_MPERF) {
+        match access_type {
+            MsrAccessType::Read => {
+                let raw_aperf = read_msr(IA32_APERF);
+                let raw_mperf = read_msr(IA32_MPERF);
+                let cpu = crate::intel::host_idt::current_cpu_index();
+                let value = aperf_mperf_shadow_read(cpu, raw_aperf, raw_mperf, msr);
+                guest_registers.rax = value & 0xFFFF_FFFF;
+                guest_registers.rdx = value >> 32;
+                if msr == IA32_APERF {
+                    super::super::diag::APERF_READ_COUNT
+                        .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                } else {
+                    super::super::diag::MPERF_READ_COUNT
+                        .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
                 }
                 return ExitType::IncrementRIP;
             }
-            match access_type {
-                MsrAccessType::Read => {
-                    let value = TSC_AUX_SHADOW[cpu].load(core::sync::atomic::Ordering::Relaxed);
-                    guest_registers.rax = value & 0xFFFF_FFFF;
-                    guest_registers.rdx = value >> 32;
+            MsrAccessType::Write => {
+                let value = ((guest_registers.rdx as u64) << 32)
+                    | (guest_registers.rax as u64 & 0xFFFF_FFFF);
+                let cpu = crate::intel::host_idt::current_cpu_index();
+                let raw_aperf = read_msr(IA32_APERF);
+                let raw_mperf = read_msr(IA32_MPERF);
+                if cpu < MAX_APERF_SHADOW_CPUS {
+                    aperf_mperf_shadow_write(cpu, raw_aperf, raw_mperf, msr, value);
+                } else {
+                    // Keep the architectural operation working if the CPU
+                    // index is outside the tracked range.
+                    write_msr(msr, value);
                 }
-                MsrAccessType::Write => {
-                    let value = ((guest_registers.rdx as u64) << 32)
-                        | (guest_registers.rax as u64 & 0xFFFF_FFFF);
-                    TSC_AUX_SHADOW[cpu].store(value, core::sync::atomic::Ordering::Relaxed);
-                }
+                return ExitType::IncrementRIP;
             }
-            return ExitType::IncrementRIP;
         }
-        // Shadow OFF: absorb write, hand read to hardware. Reads should
-        // not normally VM-exit in this mode (bitmap read bit clear), but
-        // if one does — e.g. bitmap misconfig — return the raw MSR value
-        // rather than falling into the #GP path below.
-        match access_type {
-            MsrAccessType::Read => {
-                let value = read_msr(msr);
-                guest_registers.rax = value & 0xFFFF_FFFF;
-                guest_registers.rdx = value >> 32;
-            }
-            MsrAccessType::Write => {}
-        }
-        return ExitType::IncrementRIP;
     }
 
     if matches!(access_type, MsrAccessType::Read) && msr == IA32_FEATURE_CONTROL_MSR {
@@ -213,21 +188,6 @@ where
 
     // SGX key-hash MSRs (0x8C-0x8F) and IA32_FEATURE_CONTROL writes —
     // pass through reads; absorb or #GP writes as appropriate.
-    if sgx_keyhash_msr(msr) {
-        match access_type {
-            MsrAccessType::Read => {
-                let value = read_msr(msr);
-                guest_registers.rax = value & 0xFFFF_FFFF;
-                guest_registers.rdx = value >> 32;
-                return ExitType::IncrementRIP;
-            }
-            MsrAccessType::Write => {
-                inject_gp(0);
-                return ExitType::Continue;
-            }
-        }
-    }
-
     // IA32_FEATURE_CONTROL write — bare metal #GPs when lock bit is set,
     // which it always is after BIOS. Inject #GP to match.
     if matches!(access_type, MsrAccessType::Write) && msr == IA32_FEATURE_CONTROL_MSR {
@@ -237,33 +197,8 @@ where
 
     // ── P2 stealth MSRs (secret.club EAC detection vectors) ──
 
-    // IA32_EFER: pass through both directions. Guest sees real SCE bit so
-    // syscall works; counting reads reveals whether EAC is polling EFER for
-    // its 30-min syscall-hook check.
-    if msr == IA32_EFER {
-        match access_type {
-            MsrAccessType::Read => {
-                let value = read_msr(msr);
-                guest_registers.rax = value & 0xFFFF_FFFF;
-                guest_registers.rdx = value >> 32;
-                super::super::diag::EFER_READ_COUNT
-                    .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-                return ExitType::IncrementRIP;
-            }
-            MsrAccessType::Write => {
-                let value =
-                    ((guest_registers.rdx as u64) << 32) | (guest_registers.rax as u64 & 0xFFFF_FFFF);
-                write_msr(msr, value);
-                super::super::diag::EFER_WRITE_COUNT
-                    .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-                return ExitType::IncrementRIP;
-            }
-        }
-    }
-
-    // APERF / MPERF: pass through reads (very low VM-exit rate means ratio
-    // stays close to bare metal). Just count so we can tell if EAC polls
-    // them — writes are not intercepted at all.
+    // APERF / MPERF reach this path only when the optional shadow has added
+    // them to the bitmap; the default build leaves them native.
     if msr == IA32_APERF || msr == IA32_MPERF {
         if matches!(access_type, MsrAccessType::Read) {
             let value = read_msr(msr);
@@ -288,64 +223,111 @@ where
     // IA32_DEBUGCTL: route through the VMCS guest-state field, NOT bare
     // hardware. On VM-exit, Intel SDM 27.5.1 unconditionally clears the
     // *hardware* IA32_DEBUGCTL to 0; the guest's real value is saved to
-    // GUEST_IA32_DEBUGCTL_FULL (SAVE_DEBUG_CONTROLS is default-1). If we
+    // GUEST_IA32_DEBUGCTL_FULL. vmcs.rs explicitly requires the matching
+    // SAVE_DEBUG_CONTROLS / LOAD_DEBUG_CONTROLS pair. If we
     // read hardware here, the guest sees 0 no matter what they wrote.
     // If we write hardware here, VM-entry immediately overwrites it from
     // the guest area on the next VMRESUME so the guest still sees the
     // stale value. EAC probes DEBUGCTL specifically to check
     // write-then-read consistency — the old handler flunked that check,
     // exposing us as a hypervisor and triggering a bugcheck-IPI freeze.
-    if msr == IA32_DEBUGCTL {
-        match access_type {
-            MsrAccessType::Read => {
-                let value = support::vmread_checked(vmcs::guest::IA32_DEBUGCTL_FULL)
-                    .unwrap_or(0);
-                guest_registers.rax = value & 0xFFFF_FFFF;
-                guest_registers.rdx = value >> 32;
-                super::super::diag::DEBUGCTL_READ_COUNT
-                    .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-                return ExitType::IncrementRIP;
-            }
-            MsrAccessType::Write => {
-                let value =
-                    ((guest_registers.rdx as u64) << 32) | (guest_registers.rax as u64 & 0xFFFF_FFFF);
-                let _ = support::vmwrite_checked(vmcs::guest::IA32_DEBUGCTL_FULL, value);
-                super::super::diag::LBR_DEBUGCTL_SHADOW
-                    .store(value, core::sync::atomic::Ordering::Relaxed);
-                super::super::diag::DEBUGCTL_WRITE_COUNT
-                    .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-                return ExitType::IncrementRIP;
-            }
-        }
-    }
-
     // LBR TOS and LBR stack: pass through both directions. Returning 0 on
     // read broke kernel LBR/BTB users at boot (2026-07-09 BSOD 0x50 at
     // fffff8057ea8086f). Counters still tell us if EAC polls LBR stack.
-    if msr == IA32_LASTBRANCH_TOS
-        || (IA32_LBR_FROM_START..=IA32_LBR_FROM_END).contains(&msr)
-        || (IA32_LBR_TO_START..=IA32_LBR_TO_END).contains(&msr)
-    {
-        match access_type {
-            MsrAccessType::Read => {
-                let value = read_msr(msr);
-                guest_registers.rax = value & 0xFFFF_FFFF;
-                guest_registers.rdx = value >> 32;
-                super::super::diag::LBR_STACK_READ_COUNT
-                    .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-                return ExitType::IncrementRIP;
-            }
-            MsrAccessType::Write => {
-                let value =
-                    ((guest_registers.rdx as u64) << 32) | (guest_registers.rax as u64 & 0xFFFF_FFFF);
-                write_msr(msr, value);
-                return ExitType::IncrementRIP;
-            }
+    inject_gp(0);
+    ExitType::Continue
+}
+
+fn aperf_mperf_shadow_read(cpu: usize, raw_aperf: u64, raw_mperf: u64, msr: u32) -> u64 {
+    if cpu >= MAX_APERF_SHADOW_CPUS {
+        return if msr == IA32_APERF { raw_aperf } else { raw_mperf };
+    }
+
+    let now_tsc = unsafe { rdtsc() };
+    let host_tsc = super::super::diag::host_tsc_accum(cpu);
+    if APERF_SHADOW_VALID[cpu].load(core::sync::atomic::Ordering::Acquire) {
+        let total_tsc = now_tsc
+            .wrapping_sub(APERF_LAST_TSC[cpu].load(core::sync::atomic::Ordering::Relaxed));
+        let host_delta = host_tsc
+            .wrapping_sub(APERF_LAST_HOST_TSC[cpu].load(core::sync::atomic::Ordering::Relaxed))
+            .min(total_tsc);
+        if total_tsc != 0 && host_delta != 0 {
+            let aperf_delta = raw_aperf
+                .wrapping_sub(APERF_LAST_RAW[cpu].load(core::sync::atomic::Ordering::Relaxed));
+            let mperf_delta = raw_mperf
+                .wrapping_sub(MPERF_LAST_RAW[cpu].load(core::sync::atomic::Ordering::Relaxed));
+            APERF_CORRECTION[cpu].fetch_add(
+                proportional_counter_delta(aperf_delta, host_delta, total_tsc),
+                core::sync::atomic::Ordering::Relaxed,
+            );
+            MPERF_CORRECTION[cpu].fetch_add(
+                proportional_counter_delta(mperf_delta, host_delta, total_tsc),
+                core::sync::atomic::Ordering::Relaxed,
+            );
         }
     }
 
-    inject_gp(0);
-    ExitType::Continue
+    APERF_LAST_RAW[cpu].store(raw_aperf, core::sync::atomic::Ordering::Relaxed);
+    MPERF_LAST_RAW[cpu].store(raw_mperf, core::sync::atomic::Ordering::Relaxed);
+    APERF_LAST_TSC[cpu].store(now_tsc, core::sync::atomic::Ordering::Relaxed);
+    APERF_LAST_HOST_TSC[cpu].store(host_tsc, core::sync::atomic::Ordering::Relaxed);
+    APERF_SHADOW_VALID[cpu].store(true, core::sync::atomic::Ordering::Release);
+
+    if msr == IA32_APERF {
+        shadow_visible_value(
+            raw_aperf,
+            APERF_CORRECTION[cpu].load(core::sync::atomic::Ordering::Relaxed),
+            APERF_OFFSET[cpu].load(core::sync::atomic::Ordering::Relaxed),
+        )
+    } else {
+        shadow_visible_value(
+            raw_mperf,
+            MPERF_CORRECTION[cpu].load(core::sync::atomic::Ordering::Relaxed),
+            MPERF_OFFSET[cpu].load(core::sync::atomic::Ordering::Relaxed),
+        )
+    }
+}
+
+fn aperf_mperf_shadow_write(
+    cpu: usize,
+    raw_aperf: u64,
+    raw_mperf: u64,
+    msr: u32,
+    value: u64,
+) {
+    let now_tsc = unsafe { rdtsc() };
+    let host_tsc = super::super::diag::host_tsc_accum(cpu);
+    let correction = if msr == IA32_APERF {
+        APERF_CORRECTION[cpu].load(core::sync::atomic::Ordering::Relaxed)
+    } else {
+        MPERF_CORRECTION[cpu].load(core::sync::atomic::Ordering::Relaxed)
+    };
+    let raw = if msr == IA32_APERF { raw_aperf } else { raw_mperf };
+    let offset = shadow_offset_for_write(value, raw, correction);
+    if msr == IA32_APERF {
+        APERF_OFFSET[cpu].store(offset, core::sync::atomic::Ordering::Relaxed);
+    } else {
+        MPERF_OFFSET[cpu].store(offset, core::sync::atomic::Ordering::Relaxed);
+    }
+    APERF_LAST_RAW[cpu].store(raw_aperf, core::sync::atomic::Ordering::Relaxed);
+    MPERF_LAST_RAW[cpu].store(raw_mperf, core::sync::atomic::Ordering::Relaxed);
+    APERF_LAST_TSC[cpu].store(now_tsc, core::sync::atomic::Ordering::Relaxed);
+    APERF_LAST_HOST_TSC[cpu].store(host_tsc, core::sync::atomic::Ordering::Relaxed);
+    APERF_SHADOW_VALID[cpu].store(true, core::sync::atomic::Ordering::Release);
+}
+
+#[inline]
+fn shadow_visible_value(raw: u64, correction: u64, offset: u64) -> u64 {
+    raw.wrapping_sub(correction).wrapping_add(offset)
+}
+
+#[inline]
+fn shadow_offset_for_write(value: u64, raw: u64, correction: u64) -> u64 {
+    value.wrapping_sub(raw.wrapping_sub(correction))
+}
+
+fn proportional_counter_delta(counter_delta: u64, part: u64, whole: u64) -> u64 {
+    ((counter_delta as u128 * part as u128) / whole as u128) as u64
 }
 
 fn vmx_capability_msr(msr: u32) -> bool {
@@ -380,8 +362,8 @@ mod tests {
         inject_gp: G,
     ) -> ExitType
     where
-        R: FnOnce(u32) -> u64,
-        G: FnOnce(u32),
+        R: FnMut(u32) -> u64,
+        G: FnMut(u32),
     {
         handle_msr_access_with(guest_registers, access_type, read_msr, |_, _| (), inject_gp)
     }
@@ -462,7 +444,7 @@ mod tests {
     }
 
     #[test]
-    fn intel_pt_rdmsr_returns_disabled_state() {
+    fn hidden_intel_pt_rdmsr_injects_gp() {
         let mut regs = GuestRegisters::default();
         regs.rcx = 0x570;
         regs.rax = 0x1111;
@@ -476,66 +458,26 @@ mod tests {
             |code| injected_error = Some(code),
         );
 
-        assert_eq!(exit, ExitType::IncrementRIP);
-        assert_eq!(injected_error, None);
-        assert_eq!(regs.rax, 0);
-        assert_eq!(regs.rdx, 0);
+        assert_eq!(exit, ExitType::Continue);
+        assert_eq!(injected_error, Some(0));
+        assert_eq!(regs.rax, 0x1111);
+        assert_eq!(regs.rdx, 0x2222);
     }
 
     #[test]
-    fn tsc_aux_wrmsr_is_silently_absorbed() {
-        let mut regs = GuestRegisters::default();
-        regs.rcx = IA32_TSC_AUX as u64;
-        let mut injected_error = None;
-
-        let exit = handle_msr_access_test(
-            &mut regs,
-            MsrAccessType::Write,
-            |_| panic!("TSC_AUX write should not reach hardware"),
-            |code| injected_error = Some(code),
-        );
-
-        assert_eq!(exit, ExitType::IncrementRIP);
-        assert_eq!(injected_error, None);
-    }
-
-    /// TSC_AUX behaviour depends on the build-time HV_ENABLE_TSC_AUX_SHADOW
-    /// gate, so this test only runs when the gate is ON (matching what
-    /// production sees in that mode). With the gate OFF the code path reads
-    /// hardware, which the test harness can't simulate cleanly.
-    #[test]
-    fn tsc_aux_wrmsr_then_rdmsr_returns_shadow_value() {
-        if !tsc_aux_shadow_enabled() {
-            return;
-        }
-        let mut regs = GuestRegisters::default();
-        regs.rcx = IA32_TSC_AUX as u64;
-        regs.rax = 0xDEAD_BEEF;
-        regs.rdx = 0x1234_5678;
-
-        let exit = handle_msr_access_test(
-            &mut regs,
-            MsrAccessType::Write,
-            |_| panic!("TSC_AUX write must not reach hardware"),
-            |code| panic!("TSC_AUX write must not #GP (code={})", code),
-        );
-        assert_eq!(exit, ExitType::IncrementRIP);
-
-        regs.rax = 0;
-        regs.rdx = 0;
-        let exit = handle_msr_access_test(
-            &mut regs,
-            MsrAccessType::Read,
-            |_| panic!("TSC_AUX read must not reach hardware (must hit shadow)"),
-            |code| panic!("TSC_AUX read must not #GP (code={})", code),
-        );
-        assert_eq!(exit, ExitType::IncrementRIP);
-        assert_eq!(regs.rax, 0xDEAD_BEEF);
-        assert_eq!(regs.rdx, 0x1234_5678);
+    fn aperf_correction_scales_with_host_time() {
+        assert_eq!(proportional_counter_delta(1_000, 25, 100), 250);
     }
 
     #[test]
-    fn intel_pt_wrmsr_is_ignored_without_faulting() {
+    fn aperf_shadow_write_round_trips_after_correction() {
+        let desired = 77;
+        let offset = shadow_offset_for_write(desired, 1_000, 250);
+        assert_eq!(shadow_visible_value(1_000, 250, offset), desired);
+    }
+
+    #[test]
+    fn hidden_intel_pt_wrmsr_injects_gp() {
         let mut regs = GuestRegisters::default();
         regs.rcx = 0x570;
         let mut injected_error = None;
@@ -547,8 +489,8 @@ mod tests {
             |code| injected_error = Some(code),
         );
 
-        assert_eq!(exit, ExitType::IncrementRIP);
-        assert_eq!(injected_error, None);
+        assert_eq!(exit, ExitType::Continue);
+        assert_eq!(injected_error, Some(0));
     }
 
     #[test]
@@ -590,24 +532,6 @@ mod tests {
     }
 
     #[test]
-    fn efer_read_passes_through_hardware_value() {
-        let mut regs = GuestRegisters::default();
-        regs.rcx = IA32_EFER as u64;
-        let exit = handle_msr_access_test(
-            &mut regs,
-            MsrAccessType::Read,
-            |m| {
-                assert_eq!(m, IA32_EFER);
-                0xDEAD_BEEF_1234_5678
-            },
-            |_| panic!("EFER read must not #GP"),
-        );
-        assert_eq!(exit, ExitType::IncrementRIP);
-        assert_eq!(regs.rax, 0x1234_5678);
-        assert_eq!(regs.rdx, 0xDEAD_BEEF);
-    }
-
-    #[test]
     fn aperf_and_mperf_reads_pass_through() {
         for msr in [IA32_APERF, IA32_MPERF] {
             let mut regs = GuestRegisters::default();
@@ -630,50 +554,6 @@ mod tests {
     // tests can't mock without a live VMCS. Exercise this path in the
     // Windows integration self-check (`cpuid_ping` DEBUGCTL counters
     // reflect that guest writes now round-trip back correctly) instead.
-
-    #[test]
-    fn lbr_stack_reads_pass_through_hardware() {
-        for msr in [
-            IA32_LASTBRANCH_TOS,
-            IA32_LBR_FROM_START,
-            IA32_LBR_FROM_END,
-            IA32_LBR_TO_START,
-            IA32_LBR_TO_END,
-        ] {
-            let mut regs = GuestRegisters::default();
-            regs.rcx = msr as u64;
-            let read_exit = handle_msr_access_test(
-                &mut regs,
-                MsrAccessType::Read,
-                |m| {
-                    assert_eq!(m, msr);
-                    0xAAAA_BBBB_CCCC_DDDD
-                },
-                |_| panic!("LBR stack read must not #GP"),
-            );
-            assert_eq!(read_exit, ExitType::IncrementRIP);
-            assert_eq!(regs.rax, 0xCCCC_DDDD);
-            assert_eq!(regs.rdx, 0xAAAA_BBBB);
-        }
-    }
-
-    #[test]
-    fn lbr_stack_writes_reach_hardware() {
-        let mut regs = GuestRegisters::default();
-        regs.rcx = IA32_LBR_FROM_START as u64;
-        regs.rax = 0x1234_5678;
-        regs.rdx = 0x9abc_def0;
-        let mut hw_wrote = None;
-        let exit = handle_msr_access_with(
-            &mut regs,
-            MsrAccessType::Write,
-            |_| panic!("LBR stack write must not read hardware"),
-            |m, v| hw_wrote = Some((m, v)),
-            |_| panic!("LBR stack write must not #GP"),
-        );
-        assert_eq!(exit, ExitType::IncrementRIP);
-        assert_eq!(hw_wrote, Some((IA32_LBR_FROM_START, 0x9abc_def0_1234_5678)));
-    }
 
     #[test]
     fn vmx_capability_msr_range_boundary_all_reads_gp() {
@@ -699,19 +579,19 @@ mod tests {
     }
 
     #[test]
-    fn sgx_keyhash_rdmsr_passes_through_to_hardware() {
+    fn hidden_sgx_keyhash_rdmsr_injects_gp() {
         let mut regs = GuestRegisters::default();
         regs.rcx = 0x8c;
+        let mut injected_error = None;
 
         let exit = handle_msr_access_test(
             &mut regs,
             MsrAccessType::Read,
-            |_| 0x1122_3344_5566_7788,
-            |_| panic!("SGX keyhash MSR read should not inject #GP"),
+            |_| panic!("SGX keyhash MSR read must not reach hardware"),
+            |code| injected_error = Some(code),
         );
 
-        assert_eq!(exit, ExitType::IncrementRIP);
-        assert_eq!(regs.rax, 0x5566_7788);
-        assert_eq!(regs.rdx, 0x1122_3344);
+        assert_eq!(exit, ExitType::Continue);
+        assert_eq!(injected_error, Some(0));
     }
 }
