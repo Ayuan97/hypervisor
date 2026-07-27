@@ -1,0 +1,6 @@
+[mcp_servers.uc-mcp]
+command = "bun"
+args = [
+    "run",
+    "/Users/administer/.npm/_npx/a8184138cd76bf99/node_modules/uc-mcp-server/src/index.ts",
+]
