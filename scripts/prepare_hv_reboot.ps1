@@ -1,7 +1,5 @@
 param(
     [switch]$Restart,
-    [switch]$AutoLoad,
-    [switch]$NoSeal,
     [int]$DelaySeconds = 10
 )
 
@@ -26,8 +24,8 @@ $state = [ordered]@{
     created_at = (Get-Date).ToUniversalTime().ToString('o')
     commit = ([string]$commit).Trim()
     artifact = $artifact
-    auto_load = [bool]$AutoLoad
-    auto_seal = (-not $NoSeal)
+    auto_load = $true
+    auto_seal = $true
     last_log = $null
     error = $null
     boot_started_at = $null
