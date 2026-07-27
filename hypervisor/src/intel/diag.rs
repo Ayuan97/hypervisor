@@ -375,13 +375,12 @@ pub fn cmos_retention_experiment() {
 //                Only vectors 0-31 fit; sufficient for architectural
 //                exceptions. Value visible = HV took a fault while handling
 //                a VM-exit (or right at a fault handler).
-//   0xFC (P80_HV_ENTER)   : HV entered handle_vmexit but has not yet
-//                            read EXIT_REASON. Rare/interesting window.
+//   0xFC (P80_HV_ENTER)   : reserved entry sentinel.
 //   0xFD (P80_HV_LEAVE)   : reserved (devirtualize/teardown path).
 //   0xFE (P80_GUEST_RESUME): reserved (right before VMRESUME).
 //   0xFF                  : reserved (many boards default to 0xFF on reset).
 //
-// Overhead: 1 x outb, ~200-400 ns per write on typical hardware. Called
+// The software shadow is updated at every exit; hardware writes are sampled
 // at every VM-exit → measurable but tolerable diagnostics cost. Multi-CPU
 // races produce a "last writer wins" pattern on the display, which is
 // exactly the behaviour we want for a freeze-visible byte.
@@ -396,12 +395,20 @@ pub const P80_GUEST_RESUME: u8 = 0xFE;
 
 pub static PORT80_LAST: AtomicU8 = AtomicU8::new(0);
 pub static PORT80_WRITE_COUNT: AtomicU64 = AtomicU64::new(0);
+static PORT80_EVENT_COUNT: AtomicU64 = AtomicU64::new(0);
+const PORT80_VMEXIT_HW_INTERVAL: u64 = 16;
+
+#[inline]
+fn port80_vmexit_should_touch_hardware(count: u64) -> bool {
+    count % PORT80_VMEXIT_HW_INTERVAL == 0
+}
 
 /// Write a single byte to port 0x80 (POST code) and update the software
-/// shadow. Cheap enough to call at every VM-exit handler entry.
+/// shadow. This path is reserved for host-fault and fatal breadcrumbs.
 #[inline(always)]
 pub fn port80(val: u8) {
     PORT80_LAST.store(val, Relaxed);
+    PORT80_EVENT_COUNT.fetch_add(1, Relaxed);
     PORT80_WRITE_COUNT.fetch_add(1, Relaxed);
     crate::utils::instructions::outb(0x80, val);
 }
@@ -409,7 +416,17 @@ pub fn port80(val: u8) {
 /// Encode a VM-exit basic reason (0-127) into port 0x80.
 #[inline(always)]
 pub fn port80_vmexit(basic_reason: u32) {
-    port80((basic_reason & 0x7F) as u8);
+    let value = (basic_reason & 0x7F) as u8;
+    PORT80_LAST.store(value, Relaxed);
+    let count = PORT80_EVENT_COUNT.fetch_add(1, Relaxed).wrapping_add(1);
+
+    // Keep the RAM breadcrumb current on every exit, but only hit the legacy
+    // POST I/O port periodically. The CMOS Layer 3/6 snapshots remain the
+    // persistent source of truth for freezes and rare exits.
+    if port80_vmexit_should_touch_hardware(count) {
+        PORT80_WRITE_COUNT.fetch_add(1, Relaxed);
+        crate::utils::instructions::outb(0x80, value);
+    }
 }
 
 /// Encode a host IDT fault handler entry (vector 0-31) into port 0x80.
@@ -1083,13 +1100,12 @@ const SNAP_CMOS_CPU_REASON_BASE: u8 = 0x68;
 /// per CPU. Untracked CPUs still bump global sequence and RAM shadow but
 /// don't flush to CMOS.
 pub const SNAP_MAX_CPUS: usize = 24;
-/// Flush every N-th vmexit per CPU. Was 4 originally; bumped to 16 on
+/// Flush every N-th vmexit per CPU. A cadence of 64 keeps a sub-millisecond
 /// 2026-07-16 after boot-freeze happened faster with Layer 6 than without,
 /// suggesting CMOS I/O throughput (~20μs per flush) added enough handler
-/// latency to worsen the freeze race. 16 = 4x less CMOS traffic while
-/// still tight enough to capture pre-freeze state (16 vmexits ≈ few ms
-/// at typical rates).
-const SNAP_FLUSH_INTERVAL: u64 = 16;
+/// latency to worsen the freeze race. 64 reduces CMOS traffic while
+/// still tight enough to capture pre-freeze state at typical rates.
+const SNAP_FLUSH_INTERVAL: u64 = 64;
 
 /// Global monotonic sequence — bumped on every snap_flush attempt.
 static SNAP_GLOBAL_SEQ: AtomicU64 = AtomicU64::new(0);
@@ -2034,6 +2050,14 @@ mod tests {
         assert_eq!(parse_boot_stop_stage(Some("")), 0);
         assert_eq!(parse_boot_stop_stage(Some("700")), 700);
         assert_eq!(parse_boot_stop_stage(Some("70x")), 0);
+    }
+
+    #[test]
+    fn vmexit_port80_hardware_writes_are_periodic() {
+        assert!(!port80_vmexit_should_touch_hardware(1));
+        assert!(!port80_vmexit_should_touch_hardware(15));
+        assert!(port80_vmexit_should_touch_hardware(16));
+        assert!(port80_vmexit_should_touch_hardware(32));
     }
 
     #[test]

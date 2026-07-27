@@ -8,6 +8,7 @@ use {
             ept::{hooks::HookManager, paging::Ept},
             shared_data::SharedData,
             vcpu::Vcpu,
+            vmcs::Vmcs,
         },
         utils::{
             alloc::PhysicalAllocator,
@@ -122,6 +123,20 @@ impl Hypervisor {
     /// A `Result` which is `Ok` if the virtualization was successful, or `Err` if there was an error.
     pub fn virtualize_core(&mut self) -> Result<(), HypervisorError> {
         log::trace!("Virtualizing processors");
+
+        // Validate VMX control capabilities on every CPU before the first
+        // VMLAUNCH, avoiding partial virtualization on heterogeneous systems.
+        for processor in self.processors.iter() {
+            if cpu_virtualization_is_skipped(processor.id()) {
+                continue;
+            }
+            let Some(executor) = ProcessorExecutor::switch_to_processor(processor.id()) else {
+                return Err(HypervisorError::ProcessorSwitchFailed);
+            };
+            let result = Vmcs::preflight_vmcs_control_fields();
+            drop(executor);
+            result?;
+        }
 
         for processor in self.processors.iter_mut() {
             if cpu_virtualization_is_skipped(processor.id()) {

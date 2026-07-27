@@ -33,8 +33,11 @@
 
 use {
     crate::intel::{diag, support::vmread_checked},
-    core::{cell::UnsafeCell, sync::atomic::Ordering::Relaxed},
-    x86::vmx::vmcs::guest as vmcs_guest,
+    core::{
+        cell::UnsafeCell,
+        sync::atomic::{AtomicU8, Ordering::Relaxed},
+    },
+    x86::{cpuid::cpuid, vmx::vmcs::guest as vmcs_guest},
 };
 
 const IA32_LASTBRANCH_TOS: u32 = 0x1C9;
@@ -51,6 +54,10 @@ const IA32_LASTBRANCH_TO_BASE: u32 = 0x6C0;
 /// slots on smaller CPUs will fault via #GP, which we accept as a deployment
 /// error (log via BLR_CPUID_MISMATCH counter and fall back).
 const LBR_NR_ENTRIES: usize = 32;
+const LBR_CAPABILITY_UNKNOWN: u8 = 0;
+const LBR_CAPABILITY_SUPPORTED: u8 = 1;
+const LBR_CAPABILITY_UNSUPPORTED: u8 = 2;
+static LBR_32_CAPABILITY: AtomicU8 = AtomicU8::new(LBR_CAPABILITY_UNKNOWN);
 
 /// Match `diag::MAX_TRACKED_CPUS`. Kept as a separate const so this module
 /// does not depend on `diag`'s public re-export.
@@ -109,6 +116,35 @@ fn cpu_slot() -> &'static mut LbrSlot {
     unsafe { &mut *SLOTS.0[cpu_index()].get() }
 }
 
+fn depth_mask_supports_32(mask: u32) -> bool {
+    // CPUID.1C:EAX[n] advertises support for an architectural LBR depth of
+    // 8*(n+1). Bit 3 therefore means a 32-entry stack is available.
+    mask & (1 << 3) != 0
+}
+
+fn host_lbr_32_supported() -> bool {
+    match LBR_32_CAPABILITY.load(Relaxed) {
+        LBR_CAPABILITY_SUPPORTED => return true,
+        LBR_CAPABILITY_UNSUPPORTED => return false,
+        _ => {}
+    }
+
+    let max_basic = cpuid!(0, 0).eax;
+    let supported = max_basic >= 0x1C && depth_mask_supports_32(cpuid!(0x1C, 0).eax);
+    let state = if supported {
+        LBR_CAPABILITY_SUPPORTED
+    } else {
+        LBR_CAPABILITY_UNSUPPORTED
+    };
+    let _ = LBR_32_CAPABILITY.compare_exchange(
+        LBR_CAPABILITY_UNKNOWN,
+        state,
+        core::sync::atomic::Ordering::Release,
+        Relaxed,
+    );
+    supported
+}
+
 /// If the guest currently has LBR recording enabled, snapshot the entire LBR
 /// stack to a per-CPU buffer. VM-exit has already
 /// cleared host DEBUGCTL, so handler branches do not leak into it.
@@ -123,6 +159,13 @@ pub fn save_and_disable_lbr() -> bool {
     let slot = cpu_slot();
     slot.debugctl = debugctl;
     if (debugctl & 1) == 0 {
+        return false;
+    }
+    // Never probe unimplemented LASTBRANCH_* MSRs. On CPUs without the
+    // advertised 32-entry architectural depth, leave the guest's native
+    // LBR state alone; VM-exit already cleared DEBUGCTL while root code runs.
+    if !host_lbr_32_supported() {
+        slot.debugctl = 0;
         return false;
     }
 
@@ -166,4 +209,19 @@ pub fn restore_lbr() {
         i += 1;
     }
     diag::LBR_RESTORE_COUNT.fetch_add(1, Relaxed);
+    // Make recovery idempotent.  The VM-exit error path may call this after a
+    // normal handler already restored the guest snapshot.
+    slot.debugctl = 0;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::depth_mask_supports_32;
+
+    #[test]
+    fn architectural_lbr_depth_mask_requires_32_entry_bit() {
+        assert!(!depth_mask_supports_32(0));
+        assert!(!depth_mask_supports_32(1 << 2));
+        assert!(depth_mask_supports_32(1 << 3));
+    }
 }

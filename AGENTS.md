@@ -115,7 +115,7 @@ kdmapper 映射的实例**不能通过 unload.bat 卸载**，只能重启。
 | `HV_BOOT_STOP_STAGE=N` | **构建时** 变量：让 driver 在 boot stage N 提前停下，便于隔离启动流程失败点。用 `scripts\build_stage.bat N` 重建，产物 `matrix_stage_N.sys` |
 | `HV_USER_CLIENT_READS=1` | 允许用户态 client-read 通道（普通生产环境保持 0，即禁用） |
 | `HV_DRIVER=<path>` | 覆盖 `start_hv.bat` 默认的 driver 路径 |
-| `HV_TRANSPARENT=1` | **构建时**：CPUID 完全透传（诊断模式，无 masking），只用于隔离测试 |
+| `HV_TRANSPARENT=1` | **构建时**：透传普通硬件 feature leaves；hypervisor、诊断和被隐藏 capability leaves 仍为 0，只用于隔离测试 |
 
 ### 日志与监控
 

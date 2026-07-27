@@ -139,11 +139,6 @@ impl VmExit {
         // guest DEBUGCTL.LBR are both enabled. See intel/lbr.rs.
         let lbr_saved = crate::intel::lbr::save_and_disable_lbr();
 
-        // Port 0x80 breadcrumb: mark that we entered handle_vmexit. Overwritten
-        // by the real exit reason a few lines below; this sentinel only "wins"
-        // if we freeze between LBR save and EXIT_REASON read. See diag.rs.
-        diag::port80(diag::P80_HV_ENTER);
-
         let exit_reason = vmread_checked(ro::EXIT_REASON)? as u32;
         diag::watchdog_handler_start(exit_tsc_start, exit_reason as u64);
         let vm_entry_failure = (exit_reason & 0x8000_0000) != 0;
@@ -179,6 +174,7 @@ impl VmExit {
             // be the basic reason (0x01..=0x7F), handler_active bitmap
             // will include this CPU, and the CMOS slot will pin this state
             // permanently since fatal_vmx_failure_loop_pub() never returns.
+            diag::port80(basic_reason as u8);
             diag::layer3_force_flush();
             crate::intel::vmlaunch::fatal_vmx_failure_loop_pub();
         }
@@ -541,6 +537,41 @@ impl VmExit {
         Ok(exit_type)
     }
 
+    /// Recover from a Rust-side VM-exit handling error without attempting to
+    /// resume a VMCS whose state may only be partially updated.
+    ///
+    /// The assembly stub interprets a non-zero return from `vmexit_handler` as
+    /// "VMX has already been left" and restores the interrupted host context.
+    /// Keeping that contract on the error path avoids the old failure mode
+    /// where an `Err` returned zero and the stub executed `VMRESUME` with stale
+    /// guest/entry state.
+    pub(crate) fn recover_from_handler_error(
+        &self,
+        guest_registers: &mut GuestRegisters,
+        vmx: &Vmx,
+    ) -> Result<(), HypervisorError> {
+        guest_registers.rip = vmread_checked(guest::RIP)?;
+        guest_registers.rsp = vmread_checked(guest::RSP)?;
+        guest_registers.rflags = vmread_checked(guest::RFLAGS)?;
+
+        // Do not deliver a stale event after abandoning this VM-entry.
+        if let Err(error) = vmwrite_checked(
+            x86::vmx::vmcs::control::VMENTRY_INTERRUPTION_INFO_FIELD,
+            0u64,
+        ) {
+            log::warn!(
+                "Failed to clear VM-entry interruption state during recovery: {:?}",
+                error
+            );
+        }
+
+        // `restore_lbr` is idempotent and clears its per-CPU saved-state
+        // marker, so it is safe both when the normal path already restored and
+        // when the error happened before the matching restore.
+        crate::intel::lbr::restore_lbr();
+        self.leave_vmx_root(vmx)
+    }
+
     /// Advances the guest's instruction pointer (RIP) after a VM exit.
     ///
     /// When a VM exit occurs, the guest's execution is interrupted, and control is transferred
@@ -556,7 +587,7 @@ impl VmExit {
         Ok(())
     }
 
-    fn leave_vmx_root(&self, vmx: &Vmx) -> Result<(), HypervisorError> {
+    pub(crate) fn leave_vmx_root(&self, vmx: &Vmx) -> Result<(), HypervisorError> {
         let guest_state = GuestRootState::read_from_vmcs()?;
 
         let invalidation_error = match Vcpu::invalidate_contexts() {
@@ -596,7 +627,16 @@ impl VmExit {
             );
         }
         clear_virtualized();
-        invalidation_error.map_or(Ok(()), Err)
+        if let Some(error) = invalidation_error {
+            // VMXOFF and guest-state restoration already completed. Returning
+            // this error would make the caller fall through to the VMRESUME
+            // path even though VMX is no longer active.
+            log::warn!(
+                "Context invalidation failed after VMXOFF; guest state restored: {:?}",
+                error
+            );
+        }
+        Ok(())
     }
 }
 

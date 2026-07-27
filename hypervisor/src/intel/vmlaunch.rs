@@ -395,13 +395,19 @@ pub unsafe extern "C" fn vmexit_handler(registers: *mut GuestRegisters, vmx: *mu
     match vmexit.handle_vmexit(registers, vmx) {
         Ok(crate::intel::vmexit::ExitType::ExitHypervisor) => 1,
         Ok(_) => 0,
-        Err(_e) => {
+        Err(error) => {
             crate::intel::diag::cpu_enter_phase(crate::intel::diag::PHASE_ERROR_HANDLER);
-            let _ = crate::intel::support::vmwrite_checked(
-                x86::vmx::vmcs::control::VMENTRY_INTERRUPTION_INFO_FIELD,
-                0u64,
-            );
-            0
+            match vmexit.recover_from_handler_error(registers, vmx) {
+                Ok(()) => 1,
+                Err(recovery_error) => {
+                    log::error!(
+                        "VM-exit handler failed ({:?}) and recovery failed ({:?})",
+                        error,
+                        recovery_error
+                    );
+                    fatal_vmx_failure_loop()
+                }
+            }
         }
     }
 }

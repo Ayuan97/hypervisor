@@ -453,6 +453,47 @@ impl Vmcs {
         Ok(())
     }
 
+    /// Validate the VMX control capability MSRs on the current logical CPU
+    /// without allocating or loading a VMCS.
+    pub fn preflight_vmcs_control_fields() -> Result<(), HypervisorError> {
+        let primary_ctl = required_primary_controls();
+        let secondary_ctl = required_secondary_controls();
+        let requested_secondary_ctl = requested_secondary_controls();
+        let entry_ctl = required_entry_controls();
+        let requested_entry_ctl = requested_entry_controls();
+        let exit_ctl = required_exit_controls();
+        let requested_exit_ctl = requested_exit_controls();
+        let pinbased_ctl = requested_pinbased_controls();
+
+        let ctl_pin = adjust_vmx_controls(VmxControl::PinBased, pinbased_ctl)?;
+        let ctl_pri = adjust_vmx_controls(VmxControl::ProcessorBased, primary_ctl)?;
+        let ctl_sec = adjust_vmx_controls(VmxControl::ProcessorBased2, requested_secondary_ctl)?;
+        let ctl_ent = adjust_vmx_controls(VmxControl::VmEntry, requested_entry_ctl)?;
+        let ctl_ext = adjust_vmx_controls(VmxControl::VmExit, requested_exit_ctl)?;
+
+        if !required_controls_present(primary_ctl, ctl_pri)
+            || !required_controls_present(secondary_ctl, ctl_sec)
+            || !required_controls_present(entry_ctl, ctl_ent)
+            || !required_controls_present(exit_ctl, ctl_ext)
+            || !pinbased_interrupt_exiting_ready(ctl_pin)
+            || unsupported_primary_exit_controls(ctl_pri) != 0
+            || unsupported_secondary_controls(ctl_sec) != 0
+            || unsupported_entry_controls(ctl_ent) != 0
+            || unsupported_exit_controls(ctl_ext) != 0
+        {
+            return Err(HypervisorError::VMXUnsupported);
+        }
+
+        let (host_leaf7_ebx, host_leaf12_eax) = host_sgx_feature_bits();
+        if !sgx_instruction_exiting_ready(host_leaf7_ebx, host_leaf12_eax, ctl_sec)
+            || !pt_vmx_concealment_ready(host_leaf7_ebx, ctl_sec, ctl_ext, ctl_ent)
+        {
+            return Err(HypervisorError::VMXUnsupported);
+        }
+
+        Ok(())
+    }
+
     /// Retrieves the VMCS revision ID.
     pub fn get_vmcs_revision_id() -> u32 {
         unsafe { (msr::rdmsr(msr::IA32_VMX_BASIC) as u32) & 0x7FFF_FFFF }
@@ -473,6 +514,20 @@ fn required_primary_controls() -> u64 {
     // crashed the box inside a couple of minutes today.
     let _ = option_env!("HV_NO_CSTATE_CLAMP");
     bits as u64
+}
+
+fn requested_pinbased_controls() -> u64 {
+    let mut bits: u64 = if minimal_mode() || nmi_passthrough_mode() {
+        0
+    } else {
+        (vmcs::control::PinbasedControls::NMI_EXITING.bits()
+            | vmcs::control::PinbasedControls::VIRTUAL_NMIS.bits()) as u64
+    };
+
+    if !minimal_mode() {
+        bits |= vmcs::control::PinbasedControls::VMX_PREEMPTION_TIMER.bits() as u64;
+    }
+    bits
 }
 
 fn ept_disabled() -> bool {
