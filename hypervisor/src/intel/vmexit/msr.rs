@@ -188,7 +188,7 @@ where
 
     if matches!(access_type, MsrAccessType::Read) && msr == IA32_FEATURE_CONTROL_MSR {
         let raw = read_msr(msr);
-        let value = if option_env!("HV_TRANSPARENT").is_some() {
+        let value = if super::cpuid::transparent_mode_enabled(option_env!("HV_TRANSPARENT")) {
             raw
         } else {
             raw & !FEATURE_CONTROL_HIDDEN_BITS

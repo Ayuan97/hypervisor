@@ -652,6 +652,7 @@ fn process_batch_buffer_with(
 
     let header_ptr = batch_header_ptr(base);
     let header = unsafe { core::ptr::read_volatile(header_ptr) };
+    core::sync::atomic::fence(Ordering::Acquire);
     if header.magic != BATCH_MAGIC
         || header.version != BATCH_VERSION
         || header.state != BATCH_STATE_SUBMITTED
@@ -697,6 +698,7 @@ fn process_batch_buffer_with(
     }
 
     let current = unsafe { core::ptr::read_volatile(header_ptr) };
+    core::sync::atomic::fence(Ordering::Acquire);
     if current.sequence != header.sequence || current.state != BATCH_STATE_SUBMITTED {
         return READ_PENDING;
     }
@@ -823,17 +825,36 @@ pub fn start_worker_if_enabled() -> bool {
     true
 }
 
-pub fn stop_worker() {
+pub fn stop_worker() -> bool {
     WORKER_SHUTDOWN.store(true, Ordering::Release);
     request_batch_cleanup_on_worker_exit();
-    let handle = WORKER_HANDLE.swap(0, Ordering::AcqRel) as HANDLE;
-    if !handle.is_null() {
-        unsafe {
-            let _ = ZwWaitForSingleObject(handle, false as _, null_mut());
-            let _ = ZwClose(handle);
+    let handle_bits = WORKER_HANDLE.load(Ordering::Acquire);
+    let handle = handle_bits as HANDLE;
+    if handle.is_null() {
+        mark_worker_started(false);
+        return true;
+    }
+
+    unsafe {
+        let wait_status = ZwWaitForSingleObject(handle, false as _, null_mut());
+        if !NT_SUCCESS(wait_status) {
+            log::error!("Client-read worker wait failed: {:#x}", wait_status);
+            return false;
+        }
+
+        let close_status = ZwClose(handle);
+        if !NT_SUCCESS(close_status) {
+            log::error!(
+                "Client-read worker handle close failed: {:#x}",
+                close_status
+            );
+            return false;
         }
     }
+
+    WORKER_HANDLE.store(0, Ordering::Release);
     mark_worker_started(false);
+    true
 }
 
 unsafe extern "C" fn worker_main(_start_context: PVOID) {
@@ -1601,7 +1622,7 @@ mod tests {
         BATCH_REG_MDL.store(0x2000, Ordering::Release);
         BATCH_REG_EPROCESS.store(0x3000, Ordering::Release);
 
-        stop_worker();
+        assert!(stop_worker());
 
         assert!(WORKER_SHUTDOWN.load(Ordering::Acquire));
         assert!(!worker_started());

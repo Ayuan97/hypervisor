@@ -166,17 +166,29 @@ impl Hypervisor {
             return Ok(());
         }
 
+        let mut first_error = None;
         for processor in self.processors.iter_mut() {
             diag::set_boot_stage(800 + processor.id() as u64);
             let Some(executor) = ProcessorExecutor::switch_to_processor(processor.id()) else {
                 diag::set_boot_stage(890 + processor.id() as u64);
-                return Err(HypervisorError::ProcessorSwitchFailed);
+                if first_error.is_none() {
+                    first_error = Some(HypervisorError::ProcessorSwitchFailed);
+                }
+                continue;
             };
 
-            processor.devirtualize_cpu()?;
+            if let Err(error) = processor.devirtualize_cpu() {
+                if first_error.is_none() {
+                    first_error = Some(error);
+                }
+            }
             diag::set_boot_stage(820 + processor.id() as u64);
 
             drop(executor);
+        }
+
+        if let Some(error) = first_error {
+            return Err(error);
         }
 
         self.devirtualized = true;

@@ -319,7 +319,6 @@ impl HookManager {
             }
 
             let original_page = hook.original_pa.align_down_to_large_page().as_u64();
-            let hooked_copy_page = hook.hook_pa.align_down_to_large_page().as_u64();
 
             log::debug!(
                 "Splitting 2MB page to 4KB pages for Primary EPT: {:#x}",
@@ -329,7 +328,7 @@ impl HookManager {
 
             log::debug!(
                 "Splitting 2MB page to 4KB pages for Secondary EPT: {:#x}",
-                hooked_copy_page
+                original_page
             );
             secondary_ept.split_2mb_to_4kb(original_page, AccessType::READ_WRITE_EXECUTE)?;
 

@@ -49,24 +49,17 @@ const CMD_GET_WATCHDOG: u64 = 0x2C;
 pub const CMD_DEVIRTUALIZE: u64 = 0xFF;
 const CLIENT_READ_ARM_TOKEN: u64 = 0xC17E_A2D5_90B4_6F31;
 
-/// User-mode CPL3 clients are allowed to invoke the client-read VMCALL
-/// path by default so `game_overlay` can call `CMD_READ_PHYS` /
-/// `CMD_TRANSLATE_VA` / etc. without needing to run through a kernel
-/// shim. Set `HV_DISABLE_USER_READS=1` at build time to lock the
-/// interface down to CPL0 callers only.
+/// Build-time gate for the user-mode CPUID client-read channel. The normal
+/// production build leaves this unset; `build_client.bat` sets it to `1`.
 const USER_CLIENT_READS_ENABLED: bool =
-    user_client_read_flag_enabled(option_env!("HV_DISABLE_USER_READS"));
+    user_client_read_flag_enabled(option_env!("HV_USER_CLIENT_READS"));
 
 fn cs_selector_is_ring0(selector: u64) -> bool {
     selector & 0x3 == 0
 }
 
-const fn user_client_read_flag_enabled(disable_value: Option<&str>) -> bool {
-    // Enabled by default; only "1" for HV_DISABLE_USER_READS turns it off.
-    match disable_value {
-        Some(v) => !(v.as_bytes().len() == 1 && v.as_bytes()[0] == b'1'),
-        None => true,
-    }
+const fn user_client_read_flag_enabled(enable_value: Option<&str>) -> bool {
+    matches!(enable_value, Some(v) if v.as_bytes().len() == 1 && v.as_bytes()[0] == b'1')
 }
 
 fn user_client_reads_are_enabled() -> bool {
@@ -503,8 +496,11 @@ mod tests {
     }
 
     #[test]
-    fn user_client_reads_are_disabled_by_default() {
-        assert!(!user_client_reads_are_enabled());
+    fn user_client_reads_follow_build_flag() {
+        assert_eq!(
+            user_client_reads_are_enabled(),
+            user_client_read_flag_enabled(option_env!("HV_USER_CLIENT_READS"))
+        );
     }
 
     #[test]

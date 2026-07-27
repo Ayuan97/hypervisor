@@ -92,7 +92,13 @@ impl Vcpu {
             };
 
             if let Err(error) = diag::boot_stage(430 + self.index as u64) {
-                vmx.teardown_vmx_operation("boot-stage stop");
+                if let Err(teardown_error) = vmx.teardown_vmx_operation("boot-stage stop") {
+                    log::error!(
+                        "VMX teardown failed after boot-stage stop: {:?}",
+                        teardown_error
+                    );
+                    return Err(teardown_error);
+                }
                 return Err(error);
             }
             set_virtualized();

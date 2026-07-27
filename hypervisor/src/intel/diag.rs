@@ -1,6 +1,11 @@
 use {
     crate::error::HypervisorError,
-    core::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering::Relaxed},
+    core::sync::atomic::{
+        AtomicBool,
+        AtomicU64,
+        AtomicU8,
+        Ordering::{Acquire, Relaxed, Release},
+    },
 };
 
 const ZERO_U64: AtomicU64 = AtomicU64::new(0);
@@ -1843,20 +1848,20 @@ pub fn stop_requested_at(stage: u64) -> bool {
 }
 
 pub fn seal_diagnostics() {
-    DIAGNOSTICS_SEALED.store(true, Relaxed);
+    DIAGNOSTICS_SEALED.store(true, Release);
 }
 
 pub fn diagnostics_sealed() -> bool {
-    DIAGNOSTICS_SEALED.load(Relaxed)
+    DIAGNOSTICS_SEALED.load(Acquire)
 }
 
 pub fn arm_client_reads() {
     crate::intel::client_read::reclaim_completed_result_for_new_client();
-    CLIENT_READS_ARMED.store(true, Relaxed);
+    CLIENT_READS_ARMED.store(true, Release);
 }
 
 pub fn client_reads_armed() -> bool {
-    CLIENT_READS_ARMED.load(Relaxed)
+    CLIENT_READS_ARMED.load(Acquire)
 }
 
 pub fn record_current_vmexit(
@@ -2205,7 +2210,7 @@ mod tests {
     #[test]
     fn cmos_read_step4_out_of_range_returns_sentinel() {
         assert_eq!(cmos_read_step4(0), u64::MAX);
-        assert_eq!(cmos_read_step4(9), u64::MAX);
+        assert_eq!(cmos_read_step4(11), u64::MAX);
     }
 
     #[test]

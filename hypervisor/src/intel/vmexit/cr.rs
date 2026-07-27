@@ -71,7 +71,9 @@ fn sanitize_cr4_write(
 ) -> Result<Cr4Update, Cr4WriteError> {
     // In stealth mode, reject guest attempts to set VMXE — we advertise no VMX support.
     // Bare metal without VMX would #GP on setting this bit.
-    if !option_env!("HV_TRANSPARENT").is_some() && (requested_value & CR4_VMXE != 0) {
+    if !super::cpuid::transparent_mode_enabled(option_env!("HV_TRANSPARENT"))
+        && (requested_value & CR4_VMXE != 0)
+    {
         return Err(Cr4WriteError::DisallowedFixed1Bits);
     }
 
@@ -84,7 +86,7 @@ fn sanitize_cr4_write(
         return Err(Cr4WriteError::DisallowedFixed1Bits);
     }
 
-    let shadow_value = if option_env!("HV_TRANSPARENT").is_some() {
+    let shadow_value = if super::cpuid::transparent_mode_enabled(option_env!("HV_TRANSPARENT")) {
         guest_value
     } else {
         requested_value & !CR4_VMXE

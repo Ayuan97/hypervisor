@@ -169,18 +169,25 @@ impl Vmx {
         Ok(instance)
     }
 
-    pub fn teardown_vmx_operation(&self, context: &str) {
+    pub fn teardown_vmx_operation(&self, context: &str) -> Result<(), HypervisorError> {
+        let mut first_error = None;
         if let Err(error) = Vcpu::invalidate_contexts() {
             log::error!(
                 "Failed to invalidate contexts during {}: {:?}",
                 context,
                 error
             );
+            first_error = Some(error);
         }
         if let Err(error) = support::vmxoff() {
             log::error!("Failed to cleanup VMXON during {}: {:?}", context, error);
+            if first_error.is_none() {
+                first_error = Some(error);
+            }
         }
         self.restore_control_registers();
+
+        first_error.map_or(Ok(()), Err)
     }
 
     /// Sets up the virtualization environment using the VMX capabilities.
@@ -203,40 +210,20 @@ impl Vmx {
 
         Vmxon::setup(&mut self.vmxon_region)?;
         if let Err(error) = diag::boot_stage(610) {
-            if let Err(vmxoff_error) = support::vmxoff() {
-                log::error!(
-                    "Failed to cleanup VMXON after boot-stage stop: {:?}",
-                    vmxoff_error
-                );
-            }
-            self.restore_control_registers();
-            return Err(error);
+            return Err(self.cleanup_vmxon_failure("boot-stage stop", error, false));
         }
         if let Err(error) = Vcpu::invalidate_contexts() {
             log::error!(
                 "Initial context invalidation failed after VMXON: {:?}",
                 error
             );
-            if let Err(vmxoff_error) = support::vmxoff() {
-                log::error!(
-                    "Failed to cleanup VMXON after context invalidation failure: {:?}",
-                    vmxoff_error
-                );
-            }
-            self.restore_control_registers();
+            let error = self.cleanup_vmxon_failure("context invalidation failure", error, false);
             let _ = diag::boot_stage(611);
             return Err(error);
         }
 
         if let Err(error) = diag::boot_stage(620) {
-            if let Err(vmxoff_error) = support::vmxoff() {
-                log::error!(
-                    "Failed to cleanup VMXON after boot-stage stop: {:?}",
-                    vmxoff_error
-                );
-            }
-            self.restore_control_registers();
-            return Err(error);
+            return Err(self.cleanup_vmxon_failure("boot-stage stop", error, true));
         }
         let setup_result = (|| -> Result<(), HypervisorError> {
             Vmcs::setup(&mut self.vmcs_region)?;
@@ -267,29 +254,49 @@ impl Vmx {
         if let Err(error) = setup_result {
             log::error!("Virtualization setup failed after VMXON: {:?}", error);
             let _ = diag::boot_stage(621);
-            if let Err(invalidate_error) = Vcpu::invalidate_contexts() {
-                log::error!(
-                    "Failed to invalidate contexts during VMXON cleanup: {:?}",
-                    invalidate_error
-                );
-            }
-            if let Err(vmxoff_error) = support::vmxoff() {
-                log::error!(
-                    "Failed to cleanup VMXON after setup failure: {:?}",
-                    vmxoff_error
-                );
-            }
-            self.restore_control_registers();
-            return Err(error);
+            return Err(self.cleanup_vmxon_failure("setup failure", error, true));
         }
 
         log::debug!("Virtualization setup successfully!");
         if let Err(error) = diag::boot_stage(630) {
-            self.teardown_vmx_operation("boot-stage stop");
+            if let Err(teardown_error) = self.teardown_vmx_operation("boot-stage stop") {
+                log::error!(
+                    "VMX teardown failed after boot-stage stop: {:?}",
+                    teardown_error
+                );
+                return Err(teardown_error);
+            }
             return Err(error);
         }
 
         Ok(())
+    }
+
+    fn cleanup_vmxon_failure(
+        &self,
+        context: &str,
+        original_error: HypervisorError,
+        invalidate_contexts: bool,
+    ) -> HypervisorError {
+        let mut cleanup_error = None;
+        if invalidate_contexts {
+            if let Err(error) = Vcpu::invalidate_contexts() {
+                log::error!(
+                    "Failed to invalidate contexts during VMXON {}: {:?}",
+                    context,
+                    error
+                );
+                cleanup_error = Some(error);
+            }
+        }
+        if let Err(error) = support::vmxoff() {
+            log::error!("Failed to cleanup VMXON after {}: {:?}", context, error);
+            if cleanup_error.is_none() {
+                cleanup_error = Some(error);
+            }
+        }
+        self.restore_control_registers();
+        cleanup_error.unwrap_or(original_error)
     }
 
     /// Executes the Virtual Machine (VM) and handles VM-exits.
@@ -308,7 +315,13 @@ impl Vmx {
         log::info!("Launching VM for processor {}", cpu_index);
         crate::intel::diag_trace::trace("vmlaunch: entering guest");
         if let Err(error) = diag::boot_stage(700 + cpu_index as u64) {
-            self.teardown_vmx_operation("boot-stage stop");
+            if let Err(teardown_error) = self.teardown_vmx_operation("boot-stage stop") {
+                log::error!(
+                    "VMX teardown failed after boot-stage stop: {:?}",
+                    teardown_error
+                );
+                return Err(teardown_error);
+            }
             return Err(error);
         }
         unsafe { launch_vm(&mut self.guest_registers, vmcs_host_rsp as *mut u64) };

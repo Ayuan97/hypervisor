@@ -56,6 +56,18 @@ fn failed_entry_may_clear_hypervisor(current: *mut Hypervisor) -> bool {
     current == hypervisor_initializing()
 }
 
+fn failure_status_after_cleanup(
+    cleanup_failed: bool,
+    callback_cleanup_succeeded: bool,
+    failure_status: NTSTATUS,
+) -> NTSTATUS {
+    if cleanup_failed || !callback_cleanup_succeeded {
+        STATUS_SUCCESS
+    } else {
+        failure_status
+    }
+}
+
 const fn parse_boot_stop_stage(value: Option<&str>) -> u64 {
     let Some(value) = value else {
         return 0;
@@ -128,7 +140,9 @@ unsafe extern "C" fn driver_unload(_driver_object: PDRIVER_OBJECT) {
     if !deregister_bugcheck_callback() {
         log::error!("driver_unload proceeding with bug-check callback still linked");
     }
-    hypervisor::intel::client_read::stop_worker();
+    if !hypervisor::intel::client_read::stop_worker() {
+        log::error!("Client-read worker cleanup did not complete successfully");
+    }
     let hv = HYPERVISOR.swap(null_mut(), Ordering::AcqRel);
     if !hv.is_null() && hv != hypervisor_initializing() {
         let mut hv_box = Box::from_raw(hv);
@@ -336,8 +350,7 @@ fn virtualize_system_claimed() -> NTSTATUS {
     register_bugcheck_callback();
 
     if let Some(status) = boot_stage(240) {
-        deregister_bugcheck_callback();
-        return status;
+        return failure_status_after_cleanup(false, deregister_bugcheck_callback(), status);
     }
     match hv.virtualize_core() {
         Ok(_) => {
@@ -346,33 +359,48 @@ fn virtualize_system_claimed() -> NTSTATUS {
         Err(e) => {
             let _ = boot_stage(241);
             let status = hv_err_to_code(0xE0050000, e);
-            if let Err(error) = hv.devirtualize_system() {
+            let cleanup_failed = if let Err(error) = hv.devirtualize_system() {
                 log::error!(
                     "Failed to cleanup after partial virtualization failure: {}",
                     error
                 );
                 let hv = Box::new(hv);
                 HYPERVISOR.store(Box::into_raw(hv), Ordering::Release);
-            }
+                true
+            } else {
+                false
+            };
             // We are about to unload the driver image but the callback record
             // still points into it — deregister first or the next bugcheck
             // would call into freed pages.
-            deregister_bugcheck_callback();
-            return status;
+            let callback_cleanup_succeeded = deregister_bugcheck_callback();
+            return failure_status_after_cleanup(
+                cleanup_failed,
+                callback_cleanup_succeeded,
+                status,
+            );
         }
     }
 
     if !hypervisor::intel::client_read::start_worker_if_enabled() {
         log::error!("Failed to start client read worker");
-        if let Err(error) = hv.devirtualize_system() {
+        let cleanup_failed = if let Err(error) = hv.devirtualize_system() {
             log::error!(
                 "Failed to cleanup after client read worker failure: {}",
                 error
             );
             let hv = Box::new(hv);
             HYPERVISOR.store(Box::into_raw(hv), Ordering::Release);
-        }
-        return 0xE0053600u32 as NTSTATUS;
+            true
+        } else {
+            false
+        };
+        let callback_cleanup_succeeded = deregister_bugcheck_callback();
+        return failure_status_after_cleanup(
+            cleanup_failed,
+            callback_cleanup_succeeded,
+            0xE0053600u32 as NTSTATUS,
+        );
     }
 
     let hv = Box::new(hv);
@@ -392,6 +420,14 @@ mod tests {
         assert!(!failed_entry_may_clear_hypervisor(
             0x1000usize as *mut Hypervisor
         ));
+    }
+
+    #[test]
+    fn cleanup_failure_keeps_driver_resident() {
+        let failure = 0xE0053600u32 as NTSTATUS;
+        assert_eq!(failure_status_after_cleanup(false, true, failure), failure);
+        assert_eq!(failure_status_after_cleanup(true, true, failure), STATUS_SUCCESS);
+        assert_eq!(failure_status_after_cleanup(false, false, failure), STATUS_SUCCESS);
     }
 
     #[test]

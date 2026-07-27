@@ -192,7 +192,11 @@ unsafe extern "C" fn bugcheck_callback(_buffer: PVOID, _length: ULONG) {
 ///
 /// Setting `HV_ENABLE_BUGCHECK_CALLBACK=1` at build time restores the old
 /// registration for developers who need callback dispatch to fire.
-const REGISTRATION_ENABLED: bool = option_env!("HV_ENABLE_BUGCHECK_CALLBACK").is_some();
+const REGISTRATION_ENABLED: bool = build_flag_enabled(option_env!("HV_ENABLE_BUGCHECK_CALLBACK"));
+
+const fn build_flag_enabled(value: Option<&str>) -> bool {
+    matches!(value, Some(v) if v.as_bytes().len() == 1 && v.as_bytes()[0] == b'1')
+}
 
 pub fn register_bugcheck_callback() {
     if !REGISTRATION_ENABLED {
@@ -265,4 +269,17 @@ extern "system" {
     /// Otherwise, the caller must be running at IRQL <= APC_LEVEL.
     /// https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/wdm/nf-wdm-rtlcopymemory
     pub fn RtlCopyMemory(destination: *mut u64, source: *mut u64, length: usize);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bugcheck_callback_flag_requires_explicit_one() {
+        assert!(build_flag_enabled(Some("1")));
+        assert!(!build_flag_enabled(None));
+        assert!(!build_flag_enabled(Some("0")));
+        assert!(!build_flag_enabled(Some("true")));
+    }
 }

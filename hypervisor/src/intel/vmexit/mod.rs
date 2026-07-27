@@ -511,6 +511,9 @@ impl VmExit {
         }
 
         if exit_type == ExitType::ExitHypervisor {
+            if lbr_saved {
+                crate::intel::lbr::restore_lbr();
+            }
             self.leave_vmx_root(vmx)?;
             return Ok(exit_type);
         }
@@ -557,9 +560,13 @@ impl VmExit {
     fn leave_vmx_root(&self, vmx: &Vmx) -> Result<(), HypervisorError> {
         let guest_state = GuestRootState::read_from_vmcs()?;
 
-        if let Err(error) = Vcpu::invalidate_contexts() {
-            log::error!("Context invalidation before VMXOFF failed: {:?}", error);
-        }
+        let invalidation_error = match Vcpu::invalidate_contexts() {
+            Ok(()) => None,
+            Err(error) => {
+                log::error!("Context invalidation before VMXOFF failed: {:?}", error);
+                Some(error)
+            }
+        };
 
         // Preserve the guest MXCSR across VMXOFF. Host handler code may have
         // executed SSE instructions and mutated MXCSR (rounding mode, flush-to-
@@ -589,7 +596,7 @@ impl VmExit {
             );
         }
         clear_virtualized();
-        Ok(())
+        invalidation_error.map_or(Ok(()), Err)
     }
 }
 

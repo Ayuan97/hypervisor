@@ -188,7 +188,11 @@ pub fn disable_rdtsc_exiting() {
     }
 }
 
-const TRANSPARENT_MODE: bool = option_env!("HV_TRANSPARENT").is_some();
+const TRANSPARENT_MODE: bool = transparent_mode_enabled(option_env!("HV_TRANSPARENT"));
+
+pub(super) const fn transparent_mode_enabled(value: Option<&str>) -> bool {
+    matches!(value, Some(v) if v.as_bytes().len() == 1 && v.as_bytes()[0] == b'1')
+}
 
 fn guest_cpuid_result(
     leaf: u32,
@@ -475,6 +479,14 @@ mod tests {
         assert_eq!(result.ebx, 0);
         assert_eq!(result.ecx, 0);
         assert_eq!(result.edx, 0);
+    }
+
+    #[test]
+    fn transparent_mode_requires_explicit_one() {
+        assert!(transparent_mode_enabled(Some("1")));
+        assert!(!transparent_mode_enabled(None));
+        assert!(!transparent_mode_enabled(Some("0")));
+        assert!(!transparent_mode_enabled(Some("true")));
     }
 
     #[test]
