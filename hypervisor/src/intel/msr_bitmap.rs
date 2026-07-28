@@ -130,10 +130,9 @@ impl MsrBitmap {
             set_msr_bitmap_bit(&mut self.write_low_msrs, msr);
         }
 
-        // IA32_TSC_AUX — both directions are intercepted. The guest gets a
-        // per-CPU shadow while the host keeps its physical CPU-index value.
-        // TSC_AUX is swapped by VM-entry/VM-exit MSR lists, so it remains
-        // native in the guest without exposing the host's CPU-index value.
+        // IA32_TSC_AUX is intentionally not intercepted. VM-entry/VM-exit
+        // MSR lists swap the guest value around root transitions, so RDTSCP
+        // remains native in the guest without exposing the host's CPU index.
         // EFER, DEBUGCTL, and LBR MSRs likewise remain native.
 
         // APERF / MPERF — optional shadow with proportional host-time

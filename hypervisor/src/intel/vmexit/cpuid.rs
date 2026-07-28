@@ -10,7 +10,7 @@ use {
         utils::capture::GuestRegisters,
     },
     bitfield::BitMut,
-    core::sync::atomic::{AtomicU64, Ordering},
+    core::sync::atomic::{AtomicBool, AtomicU64, Ordering},
     x86::{
         cpuid::{cpuid, CpuIdResult},
         time::rdtsc,
@@ -29,6 +29,8 @@ pub const CPUID_BARE_METAL_COST_DEFAULT: u64 = 120;
 pub const VMEXIT_ENTRY_OVERHEAD: u64 = 600;
 
 static CPUID_BARE_METAL_COST: AtomicU64 = AtomicU64::new(0);
+static HIGH_CR8_CPUID_RECORDED: AtomicBool = AtomicBool::new(false);
+const HIGH_CR8_BREADCRUMB_THRESHOLD: u64 = 13;
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 /// Enum representing the various CPUID leaves for feature and interface discovery.
@@ -135,7 +137,13 @@ pub fn handle_cpuid(guest_registers: &mut GuestRegisters, vmx: &mut Vmx, exit_ts
     // something we can't diagnose from here. Rolled back to record-only.
     let cr8: u64;
     unsafe { core::arch::asm!("mov {}, cr8", out(reg) cr8, options(nomem, nostack)); }
-    if cr8 >= 13 {
+    if should_record_high_cr8_breadcrumb(
+        cr8,
+        HIGH_CR8_CPUID_RECORDED.load(Ordering::Relaxed),
+    ) && HIGH_CR8_CPUID_RECORDED
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed)
+        .is_ok()
+    {
         // Write CR8 value to CMOS as diagnostic marker (survives hard reset).
         unsafe {
             core::arch::asm!("out dx, al", in("dx") 0x70u16, in("al") 0x72u8, options(nomem, nostack));
@@ -175,6 +183,11 @@ pub fn handle_cpuid(guest_registers: &mut GuestRegisters, vmx: &mut Vmx, exit_ts
     }
 
     ExitType::IncrementRIP
+}
+
+#[inline]
+const fn should_record_high_cr8_breadcrumb(cr8: u64, already_recorded: bool) -> bool {
+    cr8 >= HIGH_CR8_BREADCRUMB_THRESHOLD && !already_recorded
 }
 
 pub fn cpuid_bare_metal_cost() -> u64 {
@@ -555,6 +568,14 @@ mod tests {
         assert!(!transparent_mode_enabled(None));
         assert!(!transparent_mode_enabled(Some("0")));
         assert!(!transparent_mode_enabled(Some("true")));
+    }
+
+    #[test]
+    fn high_cr8_breadcrumb_is_one_shot() {
+        assert!(!should_record_high_cr8_breadcrumb(12, false));
+        assert!(should_record_high_cr8_breadcrumb(13, false));
+        assert!(should_record_high_cr8_breadcrumb(15, false));
+        assert!(!should_record_high_cr8_breadcrumb(15, true));
     }
 
     #[test]
