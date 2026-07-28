@@ -45,98 +45,38 @@ try {
         $mapper = Join-Path $workspaceRoot 'tools\kdmapper\x64\Release\kdmapper_Release.exe'
     }
 
-    if (-not (Test-Path -LiteralPath $state.artifact)) {
-        throw "driver artifact not found: $($state.artifact)"
-    }
-    if (-not [string]::IsNullOrWhiteSpace([string]$state.artifact_sha256)) {
-        $actualSha256 = (Get-FileHash -Algorithm SHA256 -LiteralPath $state.artifact).Hash
-        if ($actualSha256 -ne [string]$state.artifact_sha256) {
-            throw "driver artifact hash mismatch: expected $($state.artifact_sha256), got $actualSha256"
-        }
-    }
-
     Start-Sleep -Seconds 30
 
+    $state.artifact_present = Test-Path -LiteralPath $state.artifact
+    $state.mapper_present = Test-Path -LiteralPath $mapper
+    $state.ping_present = Test-Path -LiteralPath $ping
+    $state.probe_present = Test-Path -LiteralPath $probe
+    $state.artifact_hash_ok = $false
+    if ($state.artifact_present -and
+        -not [string]::IsNullOrWhiteSpace([string]$state.artifact_sha256)) {
+        $actualSha256 = (Get-FileHash -Algorithm SHA256 -LiteralPath $state.artifact).Hash
+        $state.artifact_hash_ok = ($actualSha256 -eq [string]$state.artifact_sha256)
+        Write-Host "[*] Artifact hash expected=$($state.artifact_sha256) actual=$actualSha256"
+    }
+
     $deadline = (Get-Date).AddSeconds($WaitSeconds)
-    while ((Get-Date) -lt $deadline -and -not (Test-Path -LiteralPath $ping)) {
+    while ((Get-Date) -lt $deadline -and -not $state.ping_present) {
         Start-Sleep -Seconds 5
+        $state.ping_present = Test-Path -LiteralPath $ping
     }
-    if (-not (Test-Path -LiteralPath $ping)) {
-        throw "cpuid_ping.exe not found: $ping"
-    }
-
-    function Invoke-PingStatus {
+    if ($state.ping_present) {
         & $ping --status 2>&1 | Out-Host
-        return $LASTEXITCODE
-    }
-
-    $statusCode = 2
-    for ($attempt = 0; $attempt -lt 3; $attempt++) {
-        $statusCode = Invoke-PingStatus
-        if ($statusCode -eq 0) {
-            break
-        }
-        Start-Sleep -Seconds 5
-    }
-    if ($statusCode -ne 0 -and [bool]$state.auto_load) {
-        if (-not (Test-Path -LiteralPath $mapper)) {
-            throw "kdmapper not found: $mapper"
-        }
-
-        $state.status = 'mapping'
-        $state.phase = 'auto_load'
-        Save-State $state
-        Write-Host "[*] HV inactive; mapping the checkpointed artifact."
-        & $mapper $state.artifact 2>&1 | Out-Host
-        if ($LASTEXITCODE -ne 0) {
-            throw "kdmapper failed with exit code $LASTEXITCODE"
-        }
-        Start-Sleep -Seconds 2
-        $statusCode = 2
-        for ($attempt = 0; $attempt -lt 5; $attempt++) {
-            $statusCode = Invoke-PingStatus
-            if ($statusCode -eq 0) {
-                break
-            }
-            Start-Sleep -Seconds 2
-        }
-    }
-
-    if ($statusCode -ne 0) {
-        throw 'HV is inactive after boot; automatic mapping was not requested or failed.'
-    }
-
-    $state.status = 'self_test'
-    $state.phase = 'cpuid_and_probe'
-    Save-State $state
-    & $ping 2>&1 | Out-Host
-    if ($LASTEXITCODE -ne 0) {
-        throw "cpuid_ping self-test failed with exit code $LASTEXITCODE"
-    }
-
-    if (Test-Path -LiteralPath $probe) {
-        & $probe 2>&1 | Out-Host
-        if ($LASTEXITCODE -ne 0) {
-            throw "probe_test failed with exit code $LASTEXITCODE"
-        }
-    }
-
-    if ([bool]$state.auto_seal) {
-        $state.status = 'sealing'
-        $state.phase = 'diagnostic_seal'
-        Save-State $state
-        & $ping --seal 2>&1 | Out-Host
-        if ($LASTEXITCODE -ne 0) {
-            throw "diagnostic seal failed with exit code $LASTEXITCODE"
-        }
+        $state.hv_status_code = $LASTEXITCODE
+        $state.hv_active = ($state.hv_status_code -eq 0)
     }
 
     $state.status = 'ready_for_codex'
-    $state.phase = 'codex_resume'
+    $state.phase = 'codex_decision'
     $state.pending = $true
-    $state.hv_self_test_completed_at = (Get-Date).ToUniversalTime().ToString('o')
+    $state.action_owner = 'codex'
+    $state.hv_self_test_completed_at = $null
     Save-State $state
-    Write-Host '[+] HV boot recovery completed; Codex resume layer is now responsible for the next decision.'
+    Write-Host '[+] Boot facts collected; Codex owns the next action decision.'
 }
 catch {
     $state.status = 'failed'

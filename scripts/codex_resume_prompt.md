@@ -6,12 +6,13 @@ reboot. Work only in `D:\rust-cheat\hypervisor`.
 1. Read `logs\hv_resume.json`.
 2. If the file is absent, `pending` is false, or `codex_resume_armed` is false,
    stop immediately without changing code, loading the driver, or rebooting.
-3. If `status` is `boot_check` or `mapping`, wait for the boot task to finish;
-   do not duplicate its work.
-4. When `phase` is `codex_resume`, inspect the recorded commit, artifact hash,
-   `last_log`, and all relevant self-test/diagnostic output. Decide the next
-   engineering action from the evidence: run more tests, inspect code, fix a
-   defect, rebuild, or perform a single explicitly justified reboot cycle.
+3. The boot task is observational only: it may collect file presence, artifact
+   hash, and a read-only HV status. It must not load, map, seal, or decide.
+4. When `phase` is `codex_decision` or `needs_review`, inspect the recorded
+   commit, artifact hash, `last_log`, status fields, and all relevant
+   self-test/diagnostic output. Decide the next engineering action from the
+   evidence: run tests, inspect code, load the driver, fix a defect, rebuild,
+   seal, or perform a single explicitly justified reboot cycle.
 5. Never map over an active HV instance. Never start an unbounded reboot or
    polling loop. Preserve all unrelated user changes.
 6. Mark the state `status=completed`, `phase=complete`, `pending=false`,
