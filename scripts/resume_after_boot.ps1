@@ -131,12 +131,12 @@ try {
         }
     }
 
-    $state.status = 'completed'
-    $state.phase = 'ready_for_codex'
-    $state.pending = $false
-    $state.completed_at = (Get-Date).ToUniversalTime().ToString('o')
+    $state.status = 'ready_for_codex'
+    $state.phase = 'codex_resume'
+    $state.pending = $true
+    $state.hv_self_test_completed_at = (Get-Date).ToUniversalTime().ToString('o')
     Save-State $state
-    Write-Host '[+] Boot recovery completed; Codex heartbeat can resume the task.'
+    Write-Host '[+] HV boot recovery completed; Codex resume layer is now responsible for the next decision.'
 }
 catch {
     $state.status = 'failed'

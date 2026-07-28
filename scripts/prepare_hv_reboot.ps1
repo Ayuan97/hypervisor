@@ -12,6 +12,7 @@ $workspaceRoot = Split-Path -Parent $root
 $ping = Join-Path $root 'tools\cpuid_ping.exe'
 $probe = Join-Path $root 'tools\probe_test.exe'
 $mapper = Join-Path $workspaceRoot 'tools\kdmapper\x64\Release\kdmapper_Release.exe'
+$codexThreadId = '019fa318-d9f0-7d01-9c8a-660c008df30a'
 
 New-Item -ItemType Directory -Force -Path $logsDir | Out-Null
 
@@ -44,11 +45,14 @@ $state = [ordered]@{
     artifact = $artifact
     artifact_sha256 = $artifactSha256
     mapper = $mapper
+    codex_thread_id = $codexThreadId
+    codex_resume_armed = $true
     auto_load = $true
     auto_seal = $true
     last_log = $null
     error = $null
     boot_started_at = $null
+    hv_self_test_completed_at = $null
     completed_at = $null
     failed_at = $null
 }
