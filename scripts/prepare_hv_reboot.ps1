@@ -52,13 +52,13 @@ $state = [ordered]@{
     error = $null
     boot_started_at = $null
     hv_self_test_completed_at = $null
-    artifact_present = $false
-    artifact_hash_ok = $false
-    mapper_present = $false
-    ping_present = $false
-    probe_present = $false
+    artifact_present = $null
+    artifact_hash_ok = $null
+    mapper_present = $null
+    ping_present = $null
+    probe_present = $null
     hv_status_code = $null
-    hv_active = $false
+    hv_active = $null
     completed_at = $null
     failed_at = $null
 }
@@ -70,8 +70,6 @@ Move-Item -LiteralPath $tmpPath -Destination $statePath -Force
 Write-Host "[+] Wrote reboot checkpoint: $statePath"
 Write-Host "    commit: $($state.commit)"
 Write-Host "    artifact: $artifact"
-Write-Host "    auto-load: $($state.auto_load)"
-Write-Host "    auto-seal: $($state.auto_seal)"
 
 if ($Restart) {
     if ($DelaySeconds -lt 5) {
