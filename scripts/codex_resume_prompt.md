@@ -6,8 +6,8 @@ reboot. Work only in `D:\rust-cheat\hypervisor`.
 1. Read `logs\hv_resume.json`.
 2. If the file is absent, `pending` is false, or `codex_resume_armed` is false,
    stop immediately without changing code, loading the driver, or rebooting.
-3. The boot task is observational only: it may collect file presence, artifact
-   hash, and a read-only HV status. It must not load, map, seal, or decide.
+3. The logon task only marks the machine as booted and opens this Codex thread.
+   It must not inspect, load, map, seal, test, or decide anything about the HV.
 4. When `phase` is `codex_decision` or `needs_review`, inspect the recorded
    commit, artifact hash, `last_log`, status fields, and all relevant
    self-test/diagnostic output. Decide the next engineering action from the
