@@ -13,15 +13,21 @@ reboot. Work only in `D:\rust-cheat\hypervisor`.
    self-test/diagnostic output. Decide the next engineering action from the
    evidence: run tests, inspect code, load the driver, fix a defect, rebuild,
    seal, or perform a single explicitly justified reboot cycle.
-5. Never map over an active HV instance. Never start an unbounded reboot or
+5. The logon task runs with limited privileges. If Codex decides that the
+   checkpointed driver should be loaded, invoke `scripts\request_hv_action.ps1`.
+   That helper requests the on-demand, highest-privilege task only after
+   validating the pending state and driver hash. The elevated worker accepts
+   only `load_selftest_seal`, rechecks the hash and HV status, skips mapping
+   when the HV is already active, and records a bounded result under `logs`.
+6. Never map over an active HV instance. Never start an unbounded reboot or
    polling loop. Preserve all unrelated user changes.
-6. Mark the state `status=completed`, `phase=complete`, `pending=false`,
+7. Mark the state `status=completed`, `phase=complete`, `pending=false`,
    `codex_resume_armed=false`, and set `completed_at` only after the requested
    verification is genuinely complete and no required work remains.
-7. If safe progress requires user input, missing privilege, or an external
+8. If safe progress requires user input, missing privilege, or an external
    state change, mark `status=blocked`, `phase=needs_user`, `pending=false`,
    `codex_resume_armed=false`, record the reason, and stop.
-8. After either `completed` or `blocked`, delete the Codex automation
+9. After either `completed` or `blocked`, delete the Codex automation
    `hv-autonomous-continuation`; it must not continue waking the thread.
 
 The final response must summarize the evidence, actions, and whether the task

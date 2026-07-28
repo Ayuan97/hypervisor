@@ -36,7 +36,7 @@ if (-not $commit) {
 $artifactSha256 = (Get-FileHash -Algorithm SHA256 -LiteralPath $artifact).Hash
 
 $state = [ordered]@{
-    version = 1
+    version = 2
     pending = $true
     status = 'awaiting_boot'
     phase = 'pre_reboot_checkpoint'
@@ -48,6 +48,9 @@ $state = [ordered]@{
     codex_thread_id = $codexThreadId
     codex_resume_armed = $true
     action_owner = 'codex'
+    privileged_task = 'Codex HV privileged action'
+    action_request = (Join-Path $logsDir 'hv_action_request.json')
+    action_result = (Join-Path $logsDir 'hv_action_result.json')
     last_log = $null
     error = $null
     boot_started_at = $null
