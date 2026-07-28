@@ -20,6 +20,8 @@ reboot. Work only in `D:\rust-cheat\hypervisor`.
 7. If safe progress requires user input, missing privilege, or an external
    state change, mark `status=blocked`, `phase=needs_user`, `pending=false`,
    `codex_resume_armed=false`, record the reason, and stop.
+8. After either `completed` or `blocked`, delete the Codex automation
+   `hv-autonomous-continuation`; it must not continue waking the thread.
 
 The final response must summarize the evidence, actions, and whether the task
 ended as `completed` or `blocked`.
