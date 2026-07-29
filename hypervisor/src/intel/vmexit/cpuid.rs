@@ -255,11 +255,11 @@ fn write_cpuid_result(guest_registers: &mut GuestRegisters, result: CpuIdResult)
     guest_registers.rdx = result.edx as u64;
 }
 
+#[inline(always)]
 fn mask_cpuid_result(leaf: u32, sub_leaf: u32, cpuid_result: &mut CpuIdResult) {
     match leaf {
         // Handle CPUID for standard feature information.
         leaf if leaf == CpuidLeaf::FeatureInformation as u32 => {
-            log::trace!("CPUID leaf 1 detected (Standard Feature Information).");
             // Hide hypervisor presence by setting the appropriate bit in ECX.
             cpuid_result
                 .ecx
@@ -277,7 +277,6 @@ fn mask_cpuid_result(leaf: u32, sub_leaf: u32, cpuid_result: &mut CpuIdResult) {
         // Keep hidden hypervisor leaves zeroed unless they were authenticated and
         // handled before reaching this masking path.
         0x4000_0000..=0x4fff_ffff => {
-            log::trace!("CPUID leaf {:#x} hidden.", leaf);
             *cpuid_result = CpuIdResult {
                 eax: 0,
                 ebx: 0,
@@ -286,7 +285,6 @@ fn mask_cpuid_result(leaf: u32, sub_leaf: u32, cpuid_result: &mut CpuIdResult) {
             };
         }
         leaf if leaf == CpuidLeaf::ExtendedFeatureInformation as u32 && sub_leaf == 0 => {
-            log::trace!("CPUID leaf 7 detected (Extended Feature Information).");
             cpuid_result.ebx.set_bit(2, false);
             cpuid_result.ebx.set_bit(25, false);
             cpuid_result.ecx.set_bit(5, false);
@@ -298,7 +296,6 @@ fn mask_cpuid_result(leaf: u32, sub_leaf: u32, cpuid_result: &mut CpuIdResult) {
                 || leaf == CpuidLeaf::ProcessorTraceCapabilities as u32
                 || leaf == CpuidLeaf::ArchitecturalLbrCapabilities as u32 =>
         {
-            log::trace!("CPUID capability leaf {:#x} hidden.", leaf);
             *cpuid_result = CpuIdResult {
                 eax: 0,
                 ebx: 0,
