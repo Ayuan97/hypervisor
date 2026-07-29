@@ -26,7 +26,11 @@ use {
         },
     },
     alloc::boxed::Box,
-    core::{cell::UnsafeCell, ptr::NonNull},
+    core::{
+        cell::UnsafeCell,
+        ptr::NonNull,
+        sync::atomic::Ordering,
+    },
     x86::{cpuid::cpuid, msr, vmx::vmcs},
 };
 
@@ -179,7 +183,7 @@ impl Vmx {
     ///
     /// Returns a `Result` with a boxed `Vmx` instance or an `HypervisorError`.
     #[rustfmt::skip]
-    pub fn new(shared_data: &mut SharedData, context: &CONTEXT) -> Result<Box<Self>, HypervisorError> {
+    pub fn new(shared_data: &SharedData, context: &CONTEXT) -> Result<Box<Self>, HypervisorError> {
         log::debug!("Setting up VMX");
         diag::boot_stage(500)?;
 
@@ -221,11 +225,7 @@ impl Vmx {
         host_paging.init_hypervisor_paging(unsafe { NTOSKRNL_CR3 });
         host_paging.build_identity();
         let identity_cr3 = host_paging.get_pml4_pa()?;
-        unsafe {
-            if IDENTITY_CR3 == 0 {
-                IDENTITY_CR3 = identity_cr3;
-            }
-        }
+        let _ = IDENTITY_CR3.compare_exchange(0, identity_cr3, Ordering::AcqRel, Ordering::Acquire);
         diag::boot_stage(530)?;
 
         log::trace!("Creating Vmx instance");
@@ -242,7 +242,12 @@ impl Vmx {
             host_paging,
             control_registers,
             guest_registers,
-            shared_data: unsafe { NonNull::new_unchecked(shared_data as *mut _) },
+            // VM-exit commands may mutate shared EPT/client state; the
+            // launch path only borrows it immutably while constructing each
+            // VCPU, then the VMX owner serializes mutable commands.
+            shared_data: unsafe {
+                NonNull::new_unchecked(shared_data as *const _ as *mut _)
+            },
             mtf_recloak_pa: None,
             bugcheck_hook_mtf_recloak: false,
             tsc_offset: 0,
@@ -298,7 +303,7 @@ impl Vmx {
     /// Returns a `Result` indicating the success or failure of the setup process.
     pub fn setup_virtualization(
         &mut self,
-        shared_data: &mut SharedData,
+        shared_data: &SharedData,
         context: &CONTEXT,
     ) -> Result<(), HypervisorError> {
         log::debug!("Setting up virtualization");
@@ -506,16 +511,6 @@ impl Vmx {
         unsafe { self.shared_data.as_ref() }
     }
 
-    /// Returns a mutable reference to the shared data.
-    ///
-    /// # Safety
-    ///
-    /// Caller must ensure no other CPU concurrently accesses the same
-    /// fields being mutated (e.g., EPT page table modifications via VMCALL
-    /// are serialized by the single-threaded CPL0 caller).
-    pub fn shared_data_mut(&mut self) -> &mut SharedData {
-        unsafe { self.shared_data.as_mut() }
-    }
 }
 
 #[cfg(test)]

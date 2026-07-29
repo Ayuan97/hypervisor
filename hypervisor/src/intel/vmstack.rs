@@ -14,8 +14,12 @@ use {
 /// The size of the kernel stack in bytes.
 pub const KERNEL_STACK_SIZE: usize = 0x6000;
 
-const VM_STACK_FOOTER_SIZE: usize =
-    size_of::<*mut u64>() + size_of::<u64>() + size_of::<M128A>() * 10;
+const VM_STACK_FOOTER_SIZE: usize = size_of::<*mut u64>()
+    + size_of::<u64>()
+    + size_of::<M128A>() * 10
+    // host_mxcsr plus the trailing padding needed to keep the 16-byte
+    // M128A-aligned footer size stable.
+    + size_of::<u64>() * 2;
 
 /// The size reserved for host RSP. This includes space allocated for padding.
 pub const STACK_CONTENTS_SIZE: usize = KERNEL_STACK_SIZE - VM_STACK_FOOTER_SIZE;
@@ -45,6 +49,10 @@ pub struct VmStack {
     pub host_xmm13: M128A,
     pub host_xmm14: M128A,
     pub host_xmm15: M128A,
+
+    /// Host MXCSR saved before loading the guest floating-point state.
+    pub host_mxcsr: u32,
+    pub _host_mxcsr_pad: u32,
 }
 const_assert_eq!(size_of::<VmStack>(), KERNEL_STACK_SIZE);
 const_assert_eq!(size_of::<VmStack>() % 4096, 0);
@@ -81,6 +89,8 @@ impl VmStack {
         vmstack.host_xmm13 = M128A::default();
         vmstack.host_xmm14 = M128A::default();
         vmstack.host_xmm15 = M128A::default();
+        vmstack.host_mxcsr = 0x1F80;
+        vmstack._host_mxcsr_pad = 0;
 
         log::debug!("VMCS_HOST_RSP setup successfully!");
 
@@ -109,6 +119,8 @@ mod tests {
         assert_eq!(offset_of!(VmStack, host_xmm13) - vmx_offset, 0x80);
         assert_eq!(offset_of!(VmStack, host_xmm14) - vmx_offset, 0x90);
         assert_eq!(offset_of!(VmStack, host_xmm15) - vmx_offset, 0xa0);
+        assert_eq!(offset_of!(VmStack, host_mxcsr) - vmx_offset, 0xb0);
+        assert_eq!(offset_of!(VmStack, _host_mxcsr_pad) - vmx_offset, 0xb4);
     }
 
     #[test]

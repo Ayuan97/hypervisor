@@ -190,6 +190,10 @@ impl Vmcs {
         guest_registers.xmm13 = xmm_context.Xmm13;
         guest_registers.xmm14 = xmm_context.Xmm14;
         guest_registers.xmm15 = xmm_context.Xmm15;
+        // MXCSR is software-managed by the VM-entry/VM-exit stubs. Capture
+        // the pre-VMX guest value so the first VMLAUNCH and every VMRESUME
+        // restore the exact guest floating-point control state.
+        guest_registers.mxcsr_guest = context.MxCsr;
 
         guest_registers.rax = context.Rax;
         guest_registers.rbx = context.Rbx;
@@ -267,7 +271,7 @@ impl Vmcs {
     /// # Arguments
     /// * `shared_data` - Shared data between processors.
     #[rustfmt::skip]
-    pub fn setup_vmcs_control_fields(shared_data: &mut SharedData) -> Result<(), HypervisorError> {
+    pub fn setup_vmcs_control_fields(shared_data: &SharedData) -> Result<(), HypervisorError> {
         log::debug!("Setting up VMCS Control Fields");
 
         let primary_ctl = required_primary_controls();
@@ -277,7 +281,7 @@ impl Vmcs {
         let requested_entry_ctl = requested_entry_controls();
         let exit_ctl = required_exit_controls();
         let requested_exit_ctl = requested_exit_controls();
-        let mut pinbased_ctl: u64 = if minimal_mode() || nmi_passthrough_mode() {
+        let pinbased_ctl: u64 = if minimal_mode() || nmi_passthrough_mode() {
             // Pass NMIs directly to the guest IDT[2] instead of exiting. This
             // matches bare-metal behaviour so an EAC self-NMI probe measuring
             // NMI-delivery latency cannot tell an HV is in the middle, and
@@ -289,17 +293,8 @@ impl Vmcs {
             (vmcs::control::PinbasedControls::NMI_EXITING.bits()
                 | vmcs::control::PinbasedControls::VIRTUAL_NMIS.bits()) as u64
         };
-        // Enable the VMX preemption timer so the freeze-stall detector in
-        // diag::freeze_check_cpuid_stall actually receives periodic exits.
-        // Without this pin-based bit set the value we write to
-        // GUEST_VMX_PREEMPTION_TIMER never counts down, EXIT_PREEMPT stays
-        // 0, and the CPUID-stall check never runs. Not requesting when
-        // minimal_mode() is on — that path deliberately keeps controls
-        // empty.
-        if !minimal_mode() {
-            pinbased_ctl |= vmcs::control::PinbasedControls::VMX_PREEMPTION_TIMER.bits() as u64;
-        }
-
+        // Do not request the VMX preemption timer. Its active freeze response
+        // is disabled, while periodic exits add clock-interrupt latency.
         use crate::intel::diag_trace as dt;
         dt::trace("vmcs: adjusting controls");
         dt::trace_val("  requested pri", primary_ctl);
@@ -445,8 +440,6 @@ impl Vmcs {
             try_invvpid_single_context(VPID_TAG)?;
         }
 
-        vmwrite_checked(vmcs::guest::VMX_PREEMPTION_TIMER_VALUE, 0x0060_0000u64)?;
-
         dt::trace("vmcs: control fields done");
         log::debug!("VMCS Control Fields setup successfully!");
 
@@ -501,7 +494,7 @@ impl Vmcs {
 }
 
 fn required_primary_controls() -> u64 {
-    let mut bits = vmcs::control::PrimaryControls::SECONDARY_CONTROLS.bits()
+    let bits = vmcs::control::PrimaryControls::SECONDARY_CONTROLS.bits()
         | vmcs::control::PrimaryControls::USE_MSR_BITMAPS.bits()
         | vmcs::control::PrimaryControls::USE_TSC_OFFSETTING.bits();
     // MWAIT/MONITOR exiting: clamp guest package C-state hints to C1 in
@@ -517,17 +510,12 @@ fn required_primary_controls() -> u64 {
 }
 
 fn requested_pinbased_controls() -> u64 {
-    let mut bits: u64 = if minimal_mode() || nmi_passthrough_mode() {
+    if minimal_mode() || nmi_passthrough_mode() {
         0
     } else {
         (vmcs::control::PinbasedControls::NMI_EXITING.bits()
             | vmcs::control::PinbasedControls::VIRTUAL_NMIS.bits()) as u64
-    };
-
-    if !minimal_mode() {
-        bits |= vmcs::control::PinbasedControls::VMX_PREEMPTION_TIMER.bits() as u64;
     }
-    bits
 }
 
 fn ept_disabled() -> bool {
@@ -645,6 +633,7 @@ fn secondary_control_present(effective: u64, control: vmcs::control::SecondaryCo
 
 fn pinbased_interrupt_exiting_ready(effective_pinbased: u64) -> bool {
     let unsupported = (vmcs::control::PinbasedControls::EXTERNAL_INTERRUPT_EXITING.bits()
+        | vmcs::control::PinbasedControls::VMX_PREEMPTION_TIMER.bits()
         | vmcs::control::PinbasedControls::POSTED_INTERRUPTS.bits()) as u64;
 
     effective_pinbased & unsupported == 0
@@ -1051,7 +1040,7 @@ mod tests {
     }
 
     #[test]
-    fn external_interrupt_exiting_is_rejected_without_irq_delivery_support() {
+    fn unsupported_pinbased_exit_sources_are_rejected() {
         let ext_int = vmcs::control::PinbasedControls::EXTERNAL_INTERRUPT_EXITING.bits() as u64;
         let virtual_nmis = vmcs::control::PinbasedControls::VIRTUAL_NMIS.bits() as u64;
         let preemption_timer = vmcs::control::PinbasedControls::VMX_PREEMPTION_TIMER.bits() as u64;
@@ -1061,10 +1050,17 @@ mod tests {
 
         assert!(pinbased_interrupt_exiting_ready(0));
         assert!(pinbased_interrupt_exiting_ready(nmi_exiting));
-        assert!(pinbased_interrupt_exiting_ready(preemption_timer));
+        assert!(!pinbased_interrupt_exiting_ready(preemption_timer));
         assert!(pinbased_interrupt_exiting_ready(virtual_nmis));
         assert!(!pinbased_interrupt_exiting_ready(ext_int));
         assert!(!pinbased_interrupt_exiting_ready(posted_interrupts));
+    }
+
+    #[test]
+    fn requested_pinbased_controls_do_not_enable_preemption_timer() {
+        let preemption_timer = vmcs::control::PinbasedControls::VMX_PREEMPTION_TIMER.bits() as u64;
+
+        assert_eq!(requested_pinbased_controls() & preemption_timer, 0);
     }
 
     #[test]

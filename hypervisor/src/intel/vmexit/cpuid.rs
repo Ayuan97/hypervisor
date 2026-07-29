@@ -10,7 +10,7 @@ use {
         utils::capture::GuestRegisters,
     },
     bitfield::BitMut,
-    core::sync::atomic::{AtomicBool, AtomicU64, Ordering},
+    core::sync::atomic::{AtomicU64, Ordering},
     x86::{
         cpuid::{cpuid, CpuIdResult},
         time::rdtsc,
@@ -29,8 +29,6 @@ pub const CPUID_BARE_METAL_COST_DEFAULT: u64 = 120;
 pub const VMEXIT_ENTRY_OVERHEAD: u64 = 600;
 
 static CPUID_BARE_METAL_COST: AtomicU64 = AtomicU64::new(0);
-static HIGH_CR8_CPUID_RECORDED: AtomicBool = AtomicBool::new(false);
-const HIGH_CR8_BREADCRUMB_THRESHOLD: u64 = 13;
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 /// Enum representing the various CPUID leaves for feature and interface discovery.
@@ -128,36 +126,6 @@ pub fn handle_cpuid(guest_registers: &mut GuestRegisters, vmx: &mut Vmx, exit_ts
     let r = guest_cpuid_result(leaf, sub_leaf, |l, s| cpuid!(l, s));
     write_cpuid_result(guest_registers, r);
 
-    // Record high-CR8 CPUIDs to CMOS purely as a diagnostic breadcrumb —
-    // don't act on them. Auto-devirtualizing at CR8 >= 15 seemed like a
-    // way to let a mid-flight bugcheck finish (see 22:14:46 session where
-    // it did produce a proper BSOD 0x139), but the follow-up run went
-    // straight to black-screen restart after ~46 s of gameplay: yanking
-    // a CPU out of VMX-root while Windows is at HIGH_LEVEL destabilises
-    // something we can't diagnose from here. Rolled back to record-only.
-    let cr8: u64;
-    unsafe { core::arch::asm!("mov {}, cr8", out(reg) cr8, options(nomem, nostack)); }
-    if should_record_high_cr8_breadcrumb(
-        cr8,
-        HIGH_CR8_CPUID_RECORDED.load(Ordering::Relaxed),
-    ) && HIGH_CR8_CPUID_RECORDED
-        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed)
-        .is_ok()
-    {
-        // Write CR8 value to CMOS as diagnostic marker (survives hard reset).
-        unsafe {
-            core::arch::asm!("out dx, al", in("dx") 0x70u16, in("al") 0x72u8, options(nomem, nostack));
-            core::arch::asm!("out dx, al", in("dx") 0x71u16, in("al") 0xBCu8, options(nomem, nostack));
-            core::arch::asm!("out dx, al", in("dx") 0x70u16, in("al") 0x73u8, options(nomem, nostack));
-            core::arch::asm!("out dx, al", in("dx") 0x71u16, in("al") cr8 as u8, options(nomem, nostack));
-            // Write leaf to CMOS 0x74-0x75
-            core::arch::asm!("out dx, al", in("dx") 0x70u16, in("al") 0x74u8, options(nomem, nostack));
-            core::arch::asm!("out dx, al", in("dx") 0x71u16, in("al") leaf as u8, options(nomem, nostack));
-            core::arch::asm!("out dx, al", in("dx") 0x70u16, in("al") 0x75u8, options(nomem, nostack));
-            core::arch::asm!("out dx, al", in("dx") 0x71u16, in("al") (leaf >> 8) as u8, options(nomem, nostack));
-        }
-    }
-
     // Ophion CPUID→RDTSC spoofing (2026-07-16 EXPERIMENT: disabled).
     //
     // Ophion spoofs the NEXT RDTSC after a CPUID to make (rdtsc_after -
@@ -183,11 +151,6 @@ pub fn handle_cpuid(guest_registers: &mut GuestRegisters, vmx: &mut Vmx, exit_ts
     }
 
     ExitType::IncrementRIP
-}
-
-#[inline]
-const fn should_record_high_cr8_breadcrumb(cr8: u64, already_recorded: bool) -> bool {
-    cr8 >= HIGH_CR8_BREADCRUMB_THRESHOLD && !already_recorded
 }
 
 pub fn cpuid_bare_metal_cost() -> u64 {
@@ -568,14 +531,6 @@ mod tests {
         assert!(!transparent_mode_enabled(None));
         assert!(!transparent_mode_enabled(Some("0")));
         assert!(!transparent_mode_enabled(Some("true")));
-    }
-
-    #[test]
-    fn high_cr8_breadcrumb_is_one_shot() {
-        assert!(!should_record_high_cr8_breadcrumb(12, false));
-        assert!(should_record_high_cr8_breadcrumb(13, false));
-        assert!(should_record_high_cr8_breadcrumb(15, false));
-        assert!(!should_record_high_cr8_breadcrumb(15, true));
     }
 
     #[test]

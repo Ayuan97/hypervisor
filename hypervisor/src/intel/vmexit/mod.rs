@@ -50,6 +50,7 @@ pub mod rdtsc;
 pub mod vmcall;
 pub mod xsetbv;
 
+#[allow(dead_code)]
 static BUGCHECK_BAILOUT: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
 /// Represents the type of VM exit.
@@ -129,12 +130,6 @@ impl VmExit {
         // never drops, so the flag stays 1 to record "died in HV". See diag.rs.
         let _handler_guard = diag::handler_enter();
 
-        // Layer 3: every LAYER3_FLUSH_INTERVAL exits (64), mirror
-        // PORT80_LAST + HANDLER_ACTIVE bitmap to CMOS 0x30-0x4E (double-buffered).
-        // After a freeze + hard reset, cpuid_ping reads back the last snapshot
-        // that made it to persistent storage. See diag.rs::layer3_maybe_flush.
-        diag::layer3_maybe_flush();
-
         // Snapshot the LBR stack only when the explicit shadow build gate and
         // guest DEBUGCTL.LBR are both enabled. See intel/lbr.rs.
         let lbr_saved = crate::intel::lbr::save_and_disable_lbr();
@@ -143,18 +138,9 @@ impl VmExit {
         diag::watchdog_handler_start(exit_tsc_start, exit_reason as u64);
         let vm_entry_failure = (exit_reason & 0x8000_0000) != 0;
         let basic_reason = exit_reason & 0xFFFF;
-        // Overwrite the sentinel with the actual basic exit reason so the
-        // Q-Code display / PORT80_LAST reflects the handler we are about to
-        // dispatch to. If we freeze inside that handler, this value stays.
+        // Keep the RAM breadcrumb current. Ordinary VM-exits must not touch
+        // POST/CMOS ports; fatal paths retain explicit persistent breadcrumbs.
         diag::port80_vmexit(basic_reason);
-
-        // Layer 6 persistent per-CPU snapshot — CLAUDE.md observation rule #1
-        // says data must be in persistent storage BEFORE death, not written
-        // AT death. snap_flush writes this CPU's sequence + last exit reason
-        // to CMOS every SNAP_FLUSH_INTERVAL vmexits. On post-freeze reboot,
-        // reader compares each CPU's last-flushed sequence to global to see
-        // which CPU stopped exiting first (= died first). See diag.rs.
-        diag::snap_flush(basic_reason as u64);
 
         if vm_entry_failure {
             use core::sync::atomic::Ordering::Relaxed;
@@ -479,16 +465,8 @@ impl VmExit {
             VmxBasicExitReason::VmxPreemptionTimerExpired => {
                 diag::EXIT_PREEMPT.fetch_add(1, Relaxed);
                 diag::LAST_HANDLER_ID.store(19, Relaxed);
-                let _ = vmwrite_checked(
-                    x86::vmx::vmcs::guest::VMX_PREEMPTION_TIMER_VALUE,
-                    0x0060_0000u64,
-                );
-                // Legacy per-CPU stuck-RIP tracker kept for existing GET_CTL
-                // diagnostics — always returns false. The old auto-NMI and
-                // new smart-detector NMI paths were both disabled 2026-07-16
-                // because they violated CLAUDE.md observation rule #1 ("data
-                // must be in persistent storage BEFORE death"). Layer 6
-                // (snap_flush in the shared prologue) replaces both.
+                // Defensive handling only: preflight rejects an active timer,
+                // and this path deliberately does not re-arm an unexpected one.
                 let _ = diag::cpu_record_timer_rip(guest_registers.rip);
                 ExitType::Continue
             }

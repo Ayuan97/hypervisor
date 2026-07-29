@@ -368,28 +368,36 @@ pub fn dispatch_command(guest_registers: &mut GuestRegisters, vmx: &mut Vmx) -> 
         }
         CMD_CLOAK_PAGE => {
             let pa = arg1 & !0xFFF;
-            let shared_data = vmx.shared_data_mut();
-            let ept = &mut shared_data.primary_ept;
+            let update = vmx.shared_data_ref().with_primary_ept_mut(|ept| {
+                let split_ok = ept
+                    .split_2mb_to_4kb(pa, AccessType::READ_WRITE_EXECUTE)
+                    .or_else(|e| {
+                        if matches!(e, crate::error::HypervisorError::PageAlreadySplit) {
+                            Ok(())
+                        } else {
+                            Err(e)
+                        }
+                    });
 
-            let split_ok = ept
-                .split_2mb_to_4kb(pa, AccessType::READ_WRITE_EXECUTE)
-                .or_else(|e| {
-                    if matches!(e, crate::error::HypervisorError::PageAlreadySplit) {
-                        Ok(())
-                    } else {
-                        Err(e)
-                    }
-                });
+                if split_ok.is_err() {
+                    1
+                } else if ept.set_page_access(pa, AccessType::empty()).is_err() {
+                    2
+                } else {
+                    0
+                }
+            });
 
-            if split_ok.is_ok() {
-                if ept.set_page_access(pa, AccessType::empty()).is_ok() {
+            match update {
+                Some(0) => {
                     invept_all_contexts();
                     guest_registers.rax = 0;
-                } else {
-                    guest_registers.rax = 2;
                 }
-            } else {
-                guest_registers.rax = 1;
+                Some(status) => guest_registers.rax = status,
+                None => {
+                    log::error!("Timed out acquiring the primary EPT update lock");
+                    guest_registers.rax = 3;
+                }
             }
             ExitType::IncrementRIP
         }

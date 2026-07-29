@@ -82,7 +82,9 @@ impl SegmentAccessRights {
         // Extract bits 40-55 from the descriptor
         let access_bits = desc.get_bits(40..56) as u32;
 
-        // Mask out the unwanted bits to get only the relevant access rights
+        // Keep the type/S/DPL/P low byte and the AVL/L/DB/G high nibble in
+        // the VMCS access-rights encoding. The limit-high nibble in bits
+        // 8..11 is intentionally excluded.
         let relevant_bits = access_bits & 0xf0ff;
 
         Self::from_bits_truncate(relevant_bits)

@@ -69,8 +69,13 @@ pub fn handle_ept_violation(_guest_registers: &mut GuestRegisters, _vmx: &mut Vm
     // neighbouring instruction and re-cloak in the MTF handler.
     if eq.instruction_fetch && bugcheck_hook::matches(guest_physical_address) {
         let guest_rip = vmread_checked(vmcs_guest::RIP).unwrap_or(0);
-        let ept = &mut *_vmx.shared_data_mut().primary_ept;
-        match bugcheck_hook::check_ept_violation(guest_physical_address, guest_rip, ept) {
+        let Some(outcome) = _vmx.shared_data_ref().with_primary_ept_mut(|ept| {
+            bugcheck_hook::check_ept_violation(guest_physical_address, guest_rip, ept)
+        }) else {
+            log::error!("Timed out acquiring the primary EPT update lock");
+            return ExitType::Continue;
+        };
+        match outcome {
             bugcheck_hook::HookOutcome::Latched => {
                 return ExitType::Continue;
             }
@@ -184,8 +189,13 @@ pub fn handle_mtf(vmx: &mut Vmx) -> ExitType {
 
     if vmx.bugcheck_hook_mtf_recloak {
         vmx.bugcheck_hook_mtf_recloak = false;
-        let ept = &mut *vmx.shared_data_mut().primary_ept;
-        bugcheck_hook::recloak_after_step(ept);
+        if vmx
+            .shared_data_ref()
+            .with_primary_ept_mut(bugcheck_hook::recloak_after_step)
+            .is_none()
+        {
+            log::error!("Timed out acquiring the primary EPT update lock for recloak");
+        }
         invept_all_contexts();
     }
 

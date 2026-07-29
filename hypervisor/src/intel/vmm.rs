@@ -13,15 +13,50 @@ use {
         },
         utils::{
             alloc::PhysicalAllocator,
-            processor::{processor_count, ProcessorExecutor},
+            processor::{
+                clear_virtualization_failures, current_processor_index, mark_virtualization_failure,
+                is_virtualized, processor_count, virtualization_failure_count, yield_execution,
+                ProcessorExecutor,
+            },
         },
     },
     alloc::{boxed::Box, vec::Vec},
-    core::mem::ManuallyDrop,
+    core::{
+        mem::ManuallyDrop,
+        sync::atomic::{AtomicBool, AtomicU32, Ordering},
+    },
+    wdk_sys::{
+        ntddk::{
+            KeDelayExecutionThread, PsCreateSystemThread, PsTerminateSystemThread, ZwClose,
+            ZwWaitForSingleObject,
+        },
+        _MODE, HANDLE, LARGE_INTEGER, NT_SUCCESS, PVOID, STATUS_SUCCESS, THREAD_ALL_ACCESS,
+    },
 };
 
 const NO_SKIP_CPU: u32 = u32::MAX;
 const SKIP_CPU_INDEX: u32 = parse_skip_cpu(option_env!("HV_SKIP_CPU"));
+const SMP_LAUNCH_YIELD_LIMIT: u32 = 2_000_000;
+const SMP_WORKER_WAIT_TIMEOUT_100NS: i64 = -5_000_000; // 500 ms
+
+struct SmpLaunchState {
+    ready: AtomicU32,
+    released: AtomicU32,
+    active: AtomicU32,
+    go: AtomicBool,
+    abort: AtomicBool,
+    stop: AtomicBool,
+}
+
+struct SmpLaunchContext {
+    vcpu: *mut Vcpu,
+    shared_data: *const SharedData,
+    state: *const SmpLaunchState,
+    cpu_index: u32,
+}
+
+unsafe impl Send for SmpLaunchContext {}
+unsafe impl Sync for SmpLaunchContext {}
 
 #[derive(Default)]
 pub struct HypervisorBuilder {
@@ -79,6 +114,8 @@ impl HypervisorBuilder {
             processors: ManuallyDrop::new(processors),
             shared_data: ManuallyDrop::new(shared_data),
             devirtualized: true,
+            smp_state: None,
+            smp_worker_handles: Vec::new(),
         })
     }
 
@@ -109,6 +146,143 @@ pub struct Hypervisor {
 
     /// Whether all processors are known to be outside VMX non-root operation.
     devirtualized: bool,
+
+    /// SMP launch state is kept alive until every worker has exited. A worker
+    /// returns from the captured guest context while VMX is still active and
+    /// therefore cannot borrow a short-lived launch barrier.
+    smp_state: Option<Box<SmpLaunchState>>,
+
+    /// Thread handles for SMP launch workers. They are joined before VCPU and
+    /// shared hypervisor state is released.
+    smp_worker_handles: Vec<HANDLE>,
+}
+
+/// A successful VMLAUNCH returns to the captured guest context, not to the
+/// worker's root-mode call stack. Keep the worker pinned while VMX is live,
+/// then terminate it only after the owner has completed VMXOFF on that CPU.
+fn park_virtualized_worker(state: &SmpLaunchState, executor: ProcessorExecutor) {
+    let mut interval = LARGE_INTEGER { QuadPart: -10_000 };
+    loop {
+        if state.stop.load(Ordering::Acquire) {
+            drop(executor);
+            unsafe {
+                let _ = PsTerminateSystemThread(STATUS_SUCCESS);
+            }
+            return;
+        }
+        unsafe {
+            let _ = KeDelayExecutionThread(_MODE::KernelMode as _, 0, &mut interval);
+        }
+    }
+}
+
+unsafe extern "C" fn smp_launch_thread(start_context: PVOID) {
+    if start_context.is_null() {
+        let _ = PsTerminateSystemThread(STATUS_SUCCESS);
+        return;
+    }
+
+    let context = Box::from_raw(start_context as *mut SmpLaunchContext);
+    let state = &*context.state;
+    let Some(executor) = ProcessorExecutor::switch_to_processor(context.cpu_index) else {
+        state.ready.fetch_add(1, Ordering::Release);
+        state.abort.store(true, Ordering::Release);
+        let _ = PsTerminateSystemThread(STATUS_SUCCESS);
+        return;
+    };
+
+    if current_processor_index() != context.cpu_index {
+        state.ready.fetch_add(1, Ordering::Release);
+        state.abort.store(true, Ordering::Release);
+        drop(executor);
+        let _ = PsTerminateSystemThread(STATUS_SUCCESS);
+        return;
+    }
+
+    state.ready.fetch_add(1, Ordering::Release);
+    while !state.go.load(Ordering::Acquire) {
+        if state.abort.load(Ordering::Acquire) {
+            drop(executor);
+            let _ = PsTerminateSystemThread(STATUS_SUCCESS);
+            return;
+        }
+        yield_execution();
+    }
+
+    state.released.fetch_add(1, Ordering::Release);
+    if state.abort.load(Ordering::Acquire) || state.stop.load(Ordering::Acquire) {
+        drop(executor);
+        let _ = PsTerminateSystemThread(STATUS_SUCCESS);
+        return;
+    }
+
+    // Do not execute VMLAUNCH from KeExpandKernelStackAndCallout. Its
+    // expanded stack is temporary, while the guest return context must stay
+    // valid after the launch returns to the worker.
+    let result = (&mut *context.vcpu).virtualize_cpu(&*context.shared_data);
+    if result.is_err() {
+        // A post-launch boot-stage failure returns through the guest
+        // continuation while VMX is still active. Tear it down from that
+        // same guest context before terminating the worker; otherwise a dead
+        // worker can leave the logical processor permanently in VMX non-root.
+        if is_virtualized() {
+            if let Err(error) = (&*context.vcpu).devirtualize_cpu() {
+                log::error!(
+                    "Failed to devirtualize worker CPU {} after launch error: {:?}",
+                    context.cpu_index,
+                    error
+                );
+            }
+        }
+        mark_virtualization_failure(context.cpu_index);
+        drop(executor);
+        let _ = PsTerminateSystemThread(STATUS_SUCCESS);
+        return;
+    }
+
+    // `virtualize_cpu` returned from the captured guest context while VMX
+    // remains active. Publish readiness and keep the affinity guard alive
+    // until `devirtualize_system` has completed VMXOFF.
+    state.active.fetch_add(1, Ordering::Release);
+    park_virtualized_worker(state, executor);
+}
+
+fn wait_for_smp_ready(state_ptr: *const SmpLaunchState, expected: u32) -> bool {
+    for _ in 0..SMP_LAUNCH_YIELD_LIMIT {
+        let state = unsafe { &*state_ptr };
+        if state.abort.load(Ordering::Acquire) {
+            return false;
+        }
+        if state.ready.load(Ordering::Acquire) >= expected {
+            return true;
+        }
+        yield_execution();
+    }
+    false
+}
+
+fn wait_for_smp_released(state_ptr: *const SmpLaunchState, expected: u32) -> bool {
+    for _ in 0..SMP_LAUNCH_YIELD_LIMIT {
+        if unsafe { (&*state_ptr).released.load(Ordering::Acquire) } >= expected {
+            return true;
+        }
+        yield_execution();
+    }
+    false
+}
+
+fn wait_for_smp_active(state_ptr: *const SmpLaunchState, expected: u32) -> bool {
+    for _ in 0..SMP_LAUNCH_YIELD_LIMIT {
+        let state = unsafe { &*state_ptr };
+        if state.abort.load(Ordering::Acquire) || virtualization_failure_count() != 0 {
+            return false;
+        }
+        if state.active.load(Ordering::Acquire) >= expected {
+            return true;
+        }
+        yield_execution();
+    }
+    false
 }
 
 impl Hypervisor {
@@ -125,6 +299,15 @@ impl Hypervisor {
     pub fn virtualize_core(&mut self) -> Result<(), HypervisorError> {
         log::trace!("Virtualizing processors");
 
+        let smp = processor_count() > 1;
+        if smp && SKIP_CPU_INDEX != NO_SKIP_CPU {
+            log::error!(
+                "Refusing SMP virtualization with HV_SKIP_CPU={} because all CPUs must enter VMX",
+                SKIP_CPU_INDEX
+            );
+            return Err(HypervisorError::VMXUnsupported);
+        }
+
         // Validate VMX control capabilities on every CPU before the first
         // VMLAUNCH, avoiding partial virtualization on heterogeneous systems.
         for processor in self.processors.iter() {
@@ -139,6 +322,16 @@ impl Hypervisor {
             result?;
         }
 
+        // VMLAUNCH captures the current guest continuation stack. Always use
+        // the persistent worker path for the normal configuration, including
+        // a one-CPU machine, so the captured context never points into
+        // KeExpandKernelStackAndCallout's temporary expanded stack.
+        if smp || SKIP_CPU_INDEX == NO_SKIP_CPU {
+            return self.virtualize_processors_smp();
+        }
+
+        // A deliberately skipped single CPU is retained only for the legacy
+        // test configuration. It must not be used by the normal driver path.
         for processor in self.processors.iter_mut() {
             if cpu_virtualization_is_skipped(processor.id()) {
                 log::warn!("Skipping virtualization for processor {}", processor.id());
@@ -158,7 +351,7 @@ impl Hypervisor {
                 return Err(error);
             }
             self.devirtualized = false;
-            processor.virtualize_cpu(self.shared_data.as_mut())?;
+            processor.virtualize_cpu(self.shared_data.as_ref())?;
             if let Err(error) = diag::boot_stage(320 + processor.id() as u64) {
                 drop(executor);
                 return Err(error);
@@ -170,6 +363,137 @@ impl Hypervisor {
         Ok(())
     }
 
+    /// Launches one pinned worker per logical processor. Workers remain
+    /// resident after the guest context returns so a live VMX CPU is never
+    /// torn down by `PsTerminateSystemThread`.
+    fn virtualize_processors_smp(&mut self) -> Result<(), HypervisorError> {
+        let count = self.processors.len() as u32;
+        if count != processor_count() || count == 0 {
+            return Err(HypervisorError::ProcessorSwitchFailed);
+        }
+
+        self.devirtualized = false;
+        clear_virtualization_failures();
+        let state = Box::new(SmpLaunchState {
+            ready: AtomicU32::new(0),
+            released: AtomicU32::new(0),
+            active: AtomicU32::new(0),
+            go: AtomicBool::new(false),
+            abort: AtomicBool::new(false),
+            stop: AtomicBool::new(false),
+        });
+        let state_ptr = state.as_ref() as *const SmpLaunchState;
+        let processors_ptr = self.processors.as_mut_ptr();
+        let shared_data_ptr = self.shared_data.as_ref() as *const SharedData;
+
+        for index in 0..count {
+            let context = Box::new(SmpLaunchContext {
+                vcpu: unsafe { processors_ptr.add(index as usize) },
+                shared_data: shared_data_ptr,
+                state: state_ptr,
+                cpu_index: index,
+            });
+            let context_ptr = Box::into_raw(context);
+            let mut handle: HANDLE = core::ptr::null_mut();
+            let status = unsafe {
+                PsCreateSystemThread(
+                    &mut handle,
+                    THREAD_ALL_ACCESS,
+                    core::ptr::null_mut(),
+                    core::ptr::null_mut(),
+                    core::ptr::null_mut(),
+                    Some(smp_launch_thread),
+                    context_ptr as PVOID,
+                )
+            };
+            if !NT_SUCCESS(status) {
+                unsafe {
+                    drop(Box::from_raw(context_ptr));
+                    (*state_ptr).abort.store(true, Ordering::Release);
+                }
+                for _ in 0..SMP_LAUNCH_YIELD_LIMIT {
+                    if unsafe { (*state_ptr).ready.load(Ordering::Acquire) } >= index {
+                        break;
+                    }
+                    yield_execution();
+                }
+                // Keep the barrier owned by `self`; workers may still be
+                // observing `abort` and must never dereference freed state.
+                self.smp_state = Some(state);
+                return Err(HypervisorError::ProcessorSwitchFailed);
+            }
+            self.smp_worker_handles.push(handle);
+        }
+
+        if !wait_for_smp_ready(state_ptr, count) {
+            unsafe {
+                (*state_ptr).abort.store(true, Ordering::Release);
+            }
+            self.smp_state = Some(state);
+            return Err(HypervisorError::ProcessorSwitchFailed);
+        }
+        unsafe {
+            (*state_ptr).go.store(true, Ordering::Release);
+        }
+        if !wait_for_smp_released(state_ptr, count) {
+            unsafe {
+                (*state_ptr).abort.store(true, Ordering::Release);
+            }
+            self.smp_state = Some(state);
+            return Err(HypervisorError::ProcessorSwitchFailed);
+        }
+        if !wait_for_smp_active(state_ptr, count) {
+            self.smp_state = Some(state);
+            return Err(HypervisorError::ProcessorSwitchFailed);
+        }
+
+        // Workers continue to use the barrier while parked. Keep it owned by
+        // the Hypervisor until VMXOFF has completed and all workers joined.
+        self.smp_state = Some(state);
+        Ok(())
+    }
+
+    fn stop_smp_workers(&mut self) -> bool {
+        let Some(state) = self.smp_state.as_ref() else {
+            return self.smp_worker_handles.is_empty();
+        };
+
+        state.stop.store(true, Ordering::Release);
+        let mut all_stopped = true;
+        for handle in &mut self.smp_worker_handles {
+            if handle.is_null() {
+                continue;
+            }
+
+            let mut timeout = LARGE_INTEGER {
+                QuadPart: SMP_WORKER_WAIT_TIMEOUT_100NS,
+            };
+            let wait_status = unsafe { ZwWaitForSingleObject(*handle, false as _, &mut timeout) };
+            if !NT_SUCCESS(wait_status) {
+                log::error!(
+                    "SMP worker did not exit within bounded wait (status {:#x})",
+                    wait_status
+                );
+                all_stopped = false;
+                continue;
+            }
+
+            let close_status = unsafe { ZwClose(*handle) };
+            if !NT_SUCCESS(close_status) {
+                log::error!("SMP worker handle close failed: {:#x}", close_status);
+                all_stopped = false;
+                continue;
+            }
+            *handle = core::ptr::null_mut();
+        }
+
+        if all_stopped {
+            self.smp_worker_handles.clear();
+            self.smp_state = None;
+        }
+        all_stopped
+    }
+
     /// Reverts the virtualization of the system's processors.
     ///
     /// # Returns
@@ -179,7 +503,13 @@ impl Hypervisor {
         log::trace!("Devirtualizing processors");
 
         if self.devirtualized {
-            return Ok(());
+            return if self.smp_state.is_none() && self.smp_worker_handles.is_empty() {
+                Ok(())
+            } else if self.stop_smp_workers() {
+                Ok(())
+            } else {
+                Err(HypervisorError::ProcessorSwitchFailed)
+            };
         }
 
         let mut first_error = None;
@@ -205,6 +535,10 @@ impl Hypervisor {
 
         if let Some(error) = first_error {
             return Err(error);
+        }
+
+        if !self.stop_smp_workers() {
+            return Err(HypervisorError::ProcessorSwitchFailed);
         }
 
         self.devirtualized = true;
@@ -320,8 +654,9 @@ impl Drop for Hypervisor {
     /// When a `Hypervisor` instance goes out of scope or is explicitly dropped,
     /// this method attempts to devirtualize the system and logs the result.
     fn drop(&mut self) {
-        let was_devirtualized = self.devirtualized;
-        let cleanup_succeeded = if was_devirtualized {
+        let resources_quiesced =
+            self.devirtualized && self.smp_state.is_none() && self.smp_worker_handles.is_empty();
+        let cleanup_succeeded = if resources_quiesced {
             true
         } else {
             match self.devirtualize_system() {
@@ -339,12 +674,19 @@ impl Drop for Hypervisor {
             }
         };
 
-        if drop_should_release_owned_resources(was_devirtualized, cleanup_succeeded) {
+        if drop_should_release_owned_resources(resources_quiesced, cleanup_succeeded) {
             unsafe {
-                crate::utils::nt::IDENTITY_CR3 = 0;
+                crate::utils::nt::IDENTITY_CR3.store(0, Ordering::Release);
                 ManuallyDrop::drop(&mut self.processors);
                 ManuallyDrop::drop(&mut self.shared_data);
             }
+        } else {
+            // `Hypervisor` is about to be dropped even when cleanup failed.
+            // Keep worker state and handles leaked rather than letting their
+            // destructors free the barrier while a kernel thread can still
+            // dereference it.
+            core::mem::forget(self.smp_state.take());
+            core::mem::forget(core::mem::take(&mut self.smp_worker_handles));
         }
     }
 }

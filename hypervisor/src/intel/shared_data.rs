@@ -12,7 +12,13 @@ use {
         utils::alloc::PhysicalAllocator,
     },
     alloc::boxed::Box,
+    core::{
+        cell::UnsafeCell,
+        sync::atomic::{AtomicBool, Ordering},
+    },
 };
+
+const EPT_UPDATE_RETRIES: usize = 100_000;
 
 /// Represents shared data structures for hypervisor operations.
 ///
@@ -24,7 +30,7 @@ pub struct SharedData {
     pub msr_bitmap: Box<MsrBitmap, PhysicalAllocator>,
 
     /// The primary Extended Page Table.
-    pub primary_ept: Box<Ept, PhysicalAllocator>,
+    primary_ept: UnsafeCell<Box<Ept, PhysicalAllocator>>,
 
     /// The pointer to the primary EPT (Extended Page Table Pointer).
     pub primary_eptp: u64,
@@ -39,6 +45,10 @@ pub struct SharedData {
 
     /// The hook manager.
     pub hook_manager: Box<HookManager>,
+
+    /// Serializes mutable primary-EPT updates originating from different
+    /// VM-exit handlers. Read-only EPTP access remains lock-free.
+    ept_update_lock: AtomicBool,
 }
 
 impl SharedData {
@@ -69,11 +79,12 @@ impl SharedData {
 
         Ok(Box::new(Self {
             msr_bitmap: { bitmap },
-            primary_ept,
+            primary_ept: UnsafeCell::new(primary_ept),
             primary_eptp,
             secondary_ept,
             secondary_eptp,
             hook_manager,
+            ept_update_lock: AtomicBool::new(false),
         }))
     }
 
@@ -100,9 +111,31 @@ impl SharedData {
 
         Ok(Box::new(Self {
             msr_bitmap: { bitmap },
-            primary_ept,
+            primary_ept: UnsafeCell::new(primary_ept),
             primary_eptp,
             hook_manager,
+            ept_update_lock: AtomicBool::new(false),
         }))
+    }
+
+    /// Run a bounded, serialized update against the shared primary EPT.
+    ///
+    /// VM-exit handlers must not hold a mutable reference to the global EPT
+    /// without this guard: more than one logical CPU can process a cloak or
+    /// bugcheck-hook transition at the same time.
+    pub fn with_primary_ept_mut<R>(&self, update: impl FnOnce(&mut Ept) -> R) -> Option<R> {
+        for _ in 0..EPT_UPDATE_RETRIES {
+            if self
+                .ept_update_lock
+                .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+                .is_ok()
+            {
+                let result = update(unsafe { &mut **self.primary_ept.get() });
+                self.ept_update_lock.store(false, Ordering::Release);
+                return Some(result);
+            }
+            core::hint::spin_loop();
+        }
+        None
     }
 }

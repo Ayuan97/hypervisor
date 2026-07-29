@@ -25,7 +25,9 @@ use {
     },
 };
 
-const POOL_TAG: u32 = u32::from_ne_bytes(*b"FMfn");
+// Use a legitimate Windows pool tag to avoid EAC whitelist detection.
+// "Mm  " (Memory Manager) is a common, safe choice.
+const POOL_TAG: u32 = u32::from_ne_bytes(*b"Mm  ");
 
 /// Physical memory allocator for kernel space.
 ///

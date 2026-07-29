@@ -17,6 +17,8 @@ use {
     },
 };
 
+const AFFINITY_SWITCH_RETRIES: u32 = 64;
+
 #[link(name = "ntoskrnl")]
 extern "system" {
     ///undocumented
@@ -26,6 +28,8 @@ extern "system" {
 /// Atomic bitset used to track which processors have been virtualized.
 const VIRTUALIZED_WORDS: usize = 16;
 static VIRTUALIZED_BITSET: [AtomicU64; VIRTUALIZED_WORDS] =
+    [const { AtomicU64::new(0) }; VIRTUALIZED_WORDS];
+static VIRTUALIZATION_FAILURE_BITSET: [AtomicU64; VIRTUALIZED_WORDS] =
     [const { AtomicU64::new(0) }; VIRTUALIZED_WORDS];
 
 pub(crate) fn bit_location(index: u32) -> Option<(usize, u64)> {
@@ -83,6 +87,51 @@ pub fn current_processor_index() -> u32 {
     unsafe { KeGetCurrentProcessorNumberEx(core::ptr::null_mut()) }
 }
 
+/// Returns whether a specific logical processor has entered VMX operation.
+pub fn is_processor_virtualized(index: u32) -> bool {
+    let Some((word, bit)) = bit_location(index) else {
+        return false;
+    };
+
+    VIRTUALIZED_BITSET[word].load(Relaxed) & bit != 0
+}
+
+/// Counts logical processors that have entered VMX operation.
+pub fn virtualized_processor_count() -> u32 {
+    let count = processor_count();
+    (0..count)
+        .filter(|&index| is_processor_virtualized(index))
+        .count() as u32
+}
+
+pub fn clear_virtualization_failures() {
+    for word in &VIRTUALIZATION_FAILURE_BITSET {
+        word.store(0, Relaxed);
+    }
+}
+
+pub fn mark_virtualization_failure(index: u32) {
+    let Some((word, bit)) = bit_location(index) else {
+        return;
+    };
+
+    VIRTUALIZATION_FAILURE_BITSET[word].fetch_or(bit, Relaxed);
+}
+
+pub fn virtualization_failure_count() -> u32 {
+    VIRTUALIZATION_FAILURE_BITSET
+        .iter()
+        .map(|word| word.load(Relaxed).count_ones())
+        .sum()
+}
+
+/// Yields the current kernel thread without changing its processor affinity.
+pub fn yield_execution() {
+    unsafe {
+        let _ = ZwYieldExecution();
+    }
+}
+
 /// Converts a systemwide processor index to a group number and a group-relative processor number.
 ///
 /// # Arguments
@@ -138,15 +187,22 @@ impl ProcessorExecutor {
         log::trace!("Switching execution to processor {}", i);
         unsafe { KeSetSystemGroupAffinityThread(&mut affinity, old_affinity.as_mut_ptr()) };
 
-        log::trace!("Yielding execution");
-        if !NT_SUCCESS(unsafe { ZwYieldExecution() }) {
-            unsafe {
-                KeRevertToUserGroupAffinityThread(old_affinity.as_mut_ptr());
+        // `ZwYieldExecution` can legitimately return STATUS_NO_YIELD_PERFORMED
+        // when no peer thread is runnable. That is not evidence that the
+        // affinity request failed. Verify the actual processor after a
+        // bounded number of yields instead of treating the status as a hard
+        // failure and leaving the SMP launch half-initialized.
+        for _ in 0..AFFINITY_SWITCH_RETRIES {
+            if current_processor_index() == i {
+                return Some(Self { old_affinity });
             }
-            return None;
+            let _ = unsafe { ZwYieldExecution() };
         }
 
-        Some(Self { old_affinity })
+        unsafe {
+            KeRevertToUserGroupAffinityThread(old_affinity.as_mut_ptr());
+        }
+        None
     }
 }
 

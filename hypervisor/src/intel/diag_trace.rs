@@ -1,8 +1,12 @@
+#[cfg(feature = "debug-log")]
 use core::sync::atomic::{AtomicU64, Ordering::Relaxed};
 
+#[cfg(feature = "debug-log")]
 const COM2_DATA: u16 = 0x2f8;
+#[cfg(feature = "debug-log")]
 const COM2_LSR: u16 = 0x2fd;
 
+#[cfg(feature = "debug-log")]
 static TRACE_SEQ: AtomicU64 = AtomicU64::new(0);
 
 #[cfg(feature = "debug-log")]

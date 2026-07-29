@@ -61,7 +61,7 @@ impl Vcpu {
     /// # Returns
     ///
     /// A `Result` indicating the success or failure of the virtualization process.
-    pub fn virtualize_cpu(&mut self, shared_data: &mut SharedData) -> Result<(), HypervisorError> {
+    pub fn virtualize_cpu(&mut self, shared_data: &SharedData) -> Result<(), HypervisorError> {
         log::info!("Virtualizing processor {}", self.index);
         diag::boot_stage(400 + self.index as u64)?;
 

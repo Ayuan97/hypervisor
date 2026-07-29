@@ -75,7 +75,6 @@ core::arch::global_asm!(
 .set registers_xmm14, 0x170
 .set registers_xmm15, 0x180
 .set registers_mxcsr, 0x190
-.set mxcsr_safe_scratch, 0x194
 .set vmstack_original_rsp, 0x8
 .set vmstack_host_xmm6, 0x10
 .set vmstack_host_xmm7, 0x20
@@ -87,6 +86,7 @@ core::arch::global_asm!(
 .set vmstack_host_xmm13, 0x80
 .set vmstack_host_xmm14, 0x90
 .set vmstack_host_xmm15, 0xA0
+.set vmstack_host_mxcsr, 0xB0
 .set launch_saved_r15, 0x08
 .set launch_saved_r14, 0x10
 .set launch_saved_r13, 0x18
@@ -107,6 +107,7 @@ core::arch::global_asm!(
 .set launch_host_xmm13, 0x100
 .set launch_host_xmm14, 0x110
 .set launch_host_xmm15, 0x120
+.set launch_host_mxcsr, 0x130
 
 .global launch_vm
 launch_vm:
@@ -123,6 +124,7 @@ launch_vm:
     movdqu  [rdx + vmstack_host_xmm13], xmm13
     movdqu  [rdx + vmstack_host_xmm14], xmm14
     movdqu  [rdx + vmstack_host_xmm15], xmm15
+    stmxcsr [rdx + vmstack_host_mxcsr]
 
     // Set host stack pointer (RSP) to the end of stack_contents in VmStack.
     mov rsp, rdx
@@ -164,14 +166,25 @@ launch_vm:
     mov     r11, [r15 + registers_r11]
     mov     r12, [r15 + registers_r12]
 
-    // Restore only volatile guest XMM registers; xmm6-xmm15 are callee-saved
-    // and already hold the correct values at initial launch.
+    // Restore all guest XMM registers. XMM6-XMM15 are nonvolatile for the
+    // Windows host ABI, but they are ordinary guest state while in non-root.
     movdqu  xmm0, [r15 + registers_xmm0]
     movdqu  xmm1, [r15 + registers_xmm1]
     movdqu  xmm2, [r15 + registers_xmm2]
     movdqu  xmm3, [r15 + registers_xmm3]
     movdqu  xmm4, [r15 + registers_xmm4]
     movdqu  xmm5, [r15 + registers_xmm5]
+    movdqu  xmm6, [r15 + registers_xmm6]
+    movdqu  xmm7, [r15 + registers_xmm7]
+    movdqu  xmm8, [r15 + registers_xmm8]
+    movdqu  xmm9, [r15 + registers_xmm9]
+    movdqu  xmm10, [r15 + registers_xmm10]
+    movdqu  xmm11, [r15 + registers_xmm11]
+    movdqu  xmm12, [r15 + registers_xmm12]
+    movdqu  xmm13, [r15 + registers_xmm13]
+    movdqu  xmm14, [r15 + registers_xmm14]
+    movdqu  xmm15, [r15 + registers_xmm15]
+    ldmxcsr [r15 + registers_mxcsr]
 
     // Prepare VMCS for VM launch: set HOST_RSP and HOST_RIP.
     mov     r14, 0x6C14 // VMCS_HOST_RSP
@@ -202,6 +215,7 @@ launch_vm:
     movdqu  xmm13, [rsp + launch_host_xmm13]
     movdqu  xmm14, [rsp + launch_host_xmm14]
     movdqu  xmm15, [rsp + launch_host_xmm15]
+    ldmxcsr [rsp + launch_host_mxcsr]
 
     mov     rbx, [rsp + launch_saved_rbx]
     mov     rbp, [rsp + launch_saved_rbp]
@@ -237,19 +251,38 @@ vmexit_stub:
     mov     [r15 + registers_r13], r13
     mov     [r15 + registers_r14], r14
 
-    // Save only volatile XMM registers (xmm0-xmm5 per Windows x64 ABI).
-    // xmm6-xmm15 are callee-saved — the Rust compiler preserves them.
+    // Save all guest XMM registers before switching to host ABI state.
     movdqu  [r15 + registers_xmm0], xmm0
     movdqu  [r15 + registers_xmm1], xmm1
     movdqu  [r15 + registers_xmm2], xmm2
     movdqu  [r15 + registers_xmm3], xmm3
     movdqu  [r15 + registers_xmm4], xmm4
     movdqu  [r15 + registers_xmm5], xmm5
+    movdqu  [r15 + registers_xmm6], xmm6
+    movdqu  [r15 + registers_xmm7], xmm7
+    movdqu  [r15 + registers_xmm8], xmm8
+    movdqu  [r15 + registers_xmm9], xmm9
+    movdqu  [r15 + registers_xmm10], xmm10
+    movdqu  [r15 + registers_xmm11], xmm11
+    movdqu  [r15 + registers_xmm12], xmm12
+    movdqu  [r15 + registers_xmm13], xmm13
+    movdqu  [r15 + registers_xmm14], xmm14
+    movdqu  [r15 + registers_xmm15], xmm15
 
-    // Save guest MXCSR and load safe value (all SSE exceptions masked).
+    // Save guest MXCSR, then load the original host value for Rust/Windows.
     stmxcsr [r15 + registers_mxcsr]
-    mov     dword ptr [r15 + mxcsr_safe_scratch], 0x1F80
-    ldmxcsr [r15 + mxcsr_safe_scratch]
+    mov     rax, [rsp + 0x80]
+    movdqu  xmm6, [rax + vmstack_host_xmm6]
+    movdqu  xmm7, [rax + vmstack_host_xmm7]
+    movdqu  xmm8, [rax + vmstack_host_xmm8]
+    movdqu  xmm9, [rax + vmstack_host_xmm9]
+    movdqu  xmm10, [rax + vmstack_host_xmm10]
+    movdqu  xmm11, [rax + vmstack_host_xmm11]
+    movdqu  xmm12, [rax + vmstack_host_xmm12]
+    movdqu  xmm13, [rax + vmstack_host_xmm13]
+    movdqu  xmm14, [rax + vmstack_host_xmm14]
+    movdqu  xmm15, [rax + vmstack_host_xmm15]
+    ldmxcsr [rax + vmstack_host_mxcsr]
 
     // Set rcx to point to the saved guest registers for `vmexit_handler` (1st parameter).
     mov rcx, r15
@@ -303,13 +336,23 @@ vmexit_restore:
     mov     r13, [r15 + registers_r13]
     mov     r14, [r15 + registers_r14]
 
-    // Restore only volatile XMM registers (xmm0-xmm5).
+    // Restore all guest XMM registers for VMRESUME.
     movdqu  xmm0, [r15 + registers_xmm0]
     movdqu  xmm1, [r15 + registers_xmm1]
     movdqu  xmm2, [r15 + registers_xmm2]
     movdqu  xmm3, [r15 + registers_xmm3]
     movdqu  xmm4, [r15 + registers_xmm4]
     movdqu  xmm5, [r15 + registers_xmm5]
+    movdqu  xmm6, [r15 + registers_xmm6]
+    movdqu  xmm7, [r15 + registers_xmm7]
+    movdqu  xmm8, [r15 + registers_xmm8]
+    movdqu  xmm9, [r15 + registers_xmm9]
+    movdqu  xmm10, [r15 + registers_xmm10]
+    movdqu  xmm11, [r15 + registers_xmm11]
+    movdqu  xmm12, [r15 + registers_xmm12]
+    movdqu  xmm13, [r15 + registers_xmm13]
+    movdqu  xmm14, [r15 + registers_xmm14]
+    movdqu  xmm15, [r15 + registers_xmm15]
 
     // Restore guest MXCSR before returning to guest.
     ldmxcsr [r15 + registers_mxcsr]
@@ -322,6 +365,18 @@ vmexit_restore:
 
     // If VMRESUME fails, handle the failure.
     mov     rcx, [rsp + 0x80]
+    mov     rax, rcx
+    movdqu  xmm6, [rax + vmstack_host_xmm6]
+    movdqu  xmm7, [rax + vmstack_host_xmm7]
+    movdqu  xmm8, [rax + vmstack_host_xmm8]
+    movdqu  xmm9, [rax + vmstack_host_xmm9]
+    movdqu  xmm10, [rax + vmstack_host_xmm10]
+    movdqu  xmm11, [rax + vmstack_host_xmm11]
+    movdqu  xmm12, [rax + vmstack_host_xmm12]
+    movdqu  xmm13, [rax + vmstack_host_xmm13]
+    movdqu  xmm14, [rax + vmstack_host_xmm14]
+    movdqu  xmm15, [rax + vmstack_host_xmm15]
+    ldmxcsr [rax + vmstack_host_mxcsr]
     sub     rsp, 0x20
     call x2
     add     rsp, 0x20
@@ -339,13 +394,24 @@ vmexit_devirtualize_restore:
     mov     [rax + 0x8], r11
     mov     rsp, rax
 
-    // Restore only volatile XMMs; xmm6-xmm15 are callee-saved and already correct.
+    // Restore all guest XMMs before returning to the guest after VMXOFF.
     movdqu  xmm0, [r15 + registers_xmm0]
     movdqu  xmm1, [r15 + registers_xmm1]
     movdqu  xmm2, [r15 + registers_xmm2]
     movdqu  xmm3, [r15 + registers_xmm3]
     movdqu  xmm4, [r15 + registers_xmm4]
     movdqu  xmm5, [r15 + registers_xmm5]
+    movdqu  xmm6, [r15 + registers_xmm6]
+    movdqu  xmm7, [r15 + registers_xmm7]
+    movdqu  xmm8, [r15 + registers_xmm8]
+    movdqu  xmm9, [r15 + registers_xmm9]
+    movdqu  xmm10, [r15 + registers_xmm10]
+    movdqu  xmm11, [r15 + registers_xmm11]
+    movdqu  xmm12, [r15 + registers_xmm12]
+    movdqu  xmm13, [r15 + registers_xmm13]
+    movdqu  xmm14, [r15 + registers_xmm14]
+    movdqu  xmm15, [r15 + registers_xmm15]
+    ldmxcsr [r15 + registers_mxcsr]
 
     mov     rax, [r15 + registers_rax]
     mov     rbx, [r15 + registers_rbx]

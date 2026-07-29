@@ -314,3 +314,21 @@ impl fmt::Debug for M128A {
         write!(f, "({:#018x}, {:#018x})", self.Low, self.High)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::GuestRegisters;
+    use core::mem::offset_of;
+
+    #[test]
+    fn guest_registers_offsets_match_vmexit_assembly() {
+        assert_eq!(offset_of!(GuestRegisters, rip), 0x78);
+        assert_eq!(offset_of!(GuestRegisters, rsp), 0x80);
+        assert_eq!(offset_of!(GuestRegisters, rflags), 0x88);
+        assert_eq!(offset_of!(GuestRegisters, xmm0), 0x90);
+        assert_eq!(offset_of!(GuestRegisters, xmm5), 0xe0);
+        assert_eq!(offset_of!(GuestRegisters, xmm6), 0xf0);
+        assert_eq!(offset_of!(GuestRegisters, xmm15), 0x180);
+        assert_eq!(offset_of!(GuestRegisters, mxcsr_guest), 0x190);
+    }
+}

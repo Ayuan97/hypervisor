@@ -7,7 +7,7 @@ use {
     alloc::vec::Vec,
     core::{
         cell::UnsafeCell,
-        sync::atomic::{AtomicBool, Ordering},
+        sync::atomic::{AtomicBool, AtomicU64, Ordering},
     },
     wdk_sys::{
         ntddk::{
@@ -84,7 +84,7 @@ pub static mut NTOSKRNL_CR3: u64 = 0;
 
 /// Physical address of the identity-mapped PML4, for temporary CR3 switching
 /// in VMX root mode when accessing arbitrary physical memory.
-pub static mut IDENTITY_CR3: u64 = 0;
+pub static IDENTITY_CR3: AtomicU64 = AtomicU64::new(0);
 
 /// Updates the `NTOSKRNL_CR3` static with the CR3 of the system process.
 ///

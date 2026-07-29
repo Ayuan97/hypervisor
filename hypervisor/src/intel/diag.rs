@@ -380,10 +380,8 @@ pub fn cmos_retention_experiment() {
 //   0xFE (P80_GUEST_RESUME): reserved (right before VMRESUME).
 //   0xFF                  : reserved (many boards default to 0xFF on reset).
 //
-// The software shadow is updated at every exit; hardware writes are sampled
-// at every VM-exit → measurable but tolerable diagnostics cost. Multi-CPU
-// races produce a "last writer wins" pattern on the display, which is
-// exactly the behaviour we want for a freeze-visible byte.
+// The software shadow is updated at every exit. Hardware writes are reserved
+// for host-fault and fatal paths so ordinary exits never perform legacy I/O.
 //
 // A software shadow (PORT80_LAST) is also updated so cpuid_ping can read
 // the last value via CTL id 100 (useful on boards without a Q-Code display,
@@ -395,38 +393,21 @@ pub const P80_GUEST_RESUME: u8 = 0xFE;
 
 pub static PORT80_LAST: AtomicU8 = AtomicU8::new(0);
 pub static PORT80_WRITE_COUNT: AtomicU64 = AtomicU64::new(0);
-static PORT80_EVENT_COUNT: AtomicU64 = AtomicU64::new(0);
-const PORT80_VMEXIT_HW_INTERVAL: u64 = 16;
-
-#[inline]
-fn port80_vmexit_should_touch_hardware(count: u64) -> bool {
-    count % PORT80_VMEXIT_HW_INTERVAL == 0
-}
 
 /// Write a single byte to port 0x80 (POST code) and update the software
 /// shadow. This path is reserved for host-fault and fatal breadcrumbs.
 #[inline(always)]
 pub fn port80(val: u8) {
     PORT80_LAST.store(val, Relaxed);
-    PORT80_EVENT_COUNT.fetch_add(1, Relaxed);
     PORT80_WRITE_COUNT.fetch_add(1, Relaxed);
     crate::utils::instructions::outb(0x80, val);
 }
 
-/// Encode a VM-exit basic reason (0-127) into port 0x80.
+/// Record a VM-exit basic reason (0-127) in the RAM shadow.
 #[inline(always)]
 pub fn port80_vmexit(basic_reason: u32) {
     let value = (basic_reason & 0x7F) as u8;
     PORT80_LAST.store(value, Relaxed);
-    let count = PORT80_EVENT_COUNT.fetch_add(1, Relaxed).wrapping_add(1);
-
-    // Keep the RAM breadcrumb current on every exit, but only hit the legacy
-    // POST I/O port periodically. The CMOS Layer 3/6 snapshots remain the
-    // persistent source of truth for freezes and rare exits.
-    if port80_vmexit_should_touch_hardware(count) {
-        PORT80_WRITE_COUNT.fetch_add(1, Relaxed);
-        crate::utils::instructions::outb(0x80, value);
-    }
 }
 
 /// Encode a host IDT fault handler entry (vector 0-31) into port 0x80.
@@ -1033,8 +1014,8 @@ pub fn cpu_record_timer_rip(rip: u64) -> bool {
 //     can distinguish "we triggered the BSOD" from "unrelated bugcheck".
 // ---------------------------------------------------------------------------
 
-/// Preempt timer fires ~every 50ms (VMX_PREEMPTION_TIMER_VALUE = 0x60_0000).
-/// 20 hits ≈ 1 second of guest being stuck at same 128-byte RIP block.
+/// Defensive thresholds for the legacy preemption-timer diagnostic path.
+/// The VMX preemption timer is not requested by the normal VMCS controls.
 const FREEZE_STUCK_THRESHOLD: u64 = 20;
 /// Minimum simultaneously-stuck CPUs before we inject. 4 is high enough that
 /// single-CPU legitimate high-IRQL work (rare) won't trigger.
@@ -1330,9 +1311,8 @@ pub fn snap_capture_prev_boot() {
     snap_capture_prev_rare();
 }
 
-/// Called from EVERY vmexit prologue (in handle_vmexit). Every Nth call for
-/// this CPU actually flushes to CMOS; between flushes only RAM shadow is
-/// updated. `exit_reason` is the basic exit reason from `EXIT_REASON`.
+/// Optional persistent snapshot helper. It is intentionally not called from
+/// the common VM-exit prologue; callers must explicitly opt into CMOS I/O.
 #[inline]
 pub fn snap_flush(exit_reason: u64) {
     let cpu = super::host_idt::current_cpu_index();
@@ -1386,7 +1366,7 @@ pub fn snap_flush(exit_reason: u64) {
 /// caller from the host CR8 register (which reflects guest's last CR8 value
 /// since we don't intercept CR8 access — see msr_bitmap / secondary ctrls).
 #[inline]
-pub fn preempt_timer_check_freeze(rip: u64, rflags: u64, cr8: u64) {
+pub fn preempt_timer_check_freeze(_rip: u64, rflags: u64, cr8: u64) {
     let cpu = super::host_idt::current_cpu_index();
     if cpu >= MAX_TRACKED_CPUS {
         return;
@@ -1479,6 +1459,7 @@ pub fn freeze_stuck_cpu_count() -> u64 {
 
 /// Write just this CPU's RIP to CMOS. Uses extended CMOS (ports 0x72/0x73)
 /// which BIOS POST typically does NOT clear.
+#[allow(dead_code)]
 fn cmos_write_rip(cpu: u8, rip: u64) {
     ext_cmos_write(0x00, 0xDE); // magic
     ext_cmos_write(0x01, cpu);
@@ -1528,6 +1509,7 @@ fn ext_cmos_read(offset: u8) -> u8 {
     }
 }
 
+#[allow(dead_code)]
 static CMOS_WRITTEN: AtomicBool = AtomicBool::new(false);
 
 /// Write freeze diagnostic data to CMOS RAM (survives hard reboot).
@@ -1540,6 +1522,7 @@ static CMOS_WRITTEN: AtomicBool = AtomicBool::new(false);
 ///   0x4C: number of CPUs with stuck_count > 50
 ///   0x4D: second most-stuck CPU index
 ///   0x4E-0x55: RIP of second CPU (8 bytes LE)
+#[allow(dead_code)]
 fn freeze_write_cmos_snapshot() {
 
     // Find CPU with highest stuck count
@@ -1586,6 +1569,7 @@ fn freeze_write_cmos_snapshot() {
 }
 
 #[inline]
+#[allow(dead_code)]
 fn cmos_write(offset: u8, value: u8) {
     unsafe {
         core::arch::asm!(
@@ -2053,14 +2037,6 @@ mod tests {
     }
 
     #[test]
-    fn vmexit_port80_hardware_writes_are_periodic() {
-        assert!(!port80_vmexit_should_touch_hardware(1));
-        assert!(!port80_vmexit_should_touch_hardware(15));
-        assert!(port80_vmexit_should_touch_hardware(16));
-        assert!(port80_vmexit_should_touch_hardware(32));
-    }
-
-    #[test]
     fn client_read_request_waits_for_worker_completion() {
         let _guard = crate::intel::client_read::test_lock();
         crate::intel::client_read::reset_for_test();
@@ -2293,7 +2269,7 @@ pub fn control(id: u64) -> u64 {
         2 => CTL_SECONDARY.load(Relaxed),
         3 => CTL_EXIT.load(Relaxed),
         4 => CTL_ENTRY.load(Relaxed),
-        5 => unsafe { crate::utils::nt::IDENTITY_CR3 },
+        5 => crate::utils::nt::IDENTITY_CR3.load(Relaxed),
         6 => LAST_EXIT_REASON.load(Relaxed),
         7 => super::host_idt::GP_FAULT_RIP.load(Relaxed),
         8 => TSC_OFFSET.load(Relaxed),
