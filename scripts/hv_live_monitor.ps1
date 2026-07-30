@@ -207,10 +207,11 @@ Write-SyncText -Path $contextPath -Text (([pscustomobject]@{
     cpuidExecutable = $CpuidExe
     breadcrumbExecutable = $BreadcrumbExe
     activeHvProbes = [bool]$ActiveHvProbes
+    kernelLog = "C:\hv_diag_live.log"
     note = if ($ActiveHvProbes) {
         "Active mode: cpuid_ping and optional hv_breadcrumb generate diagnostic VM-exits."
     } else {
-        "Passive local mode: no CPUID/breadcrumb HV queries; use the second-PC serial receiver for HV telemetry."
+        "Passive local mode: no CPUID/breadcrumb HV queries; diagnostic HV telemetry is in C:\hv_diag_live.log."
     }
 } | ConvertTo-Json -Depth 5) + "`r`n")
 Initialize-EventWatermarks

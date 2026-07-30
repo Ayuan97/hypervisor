@@ -30,5 +30,5 @@ Active mode calls `cpuid_ping` once per interval and starts
 timing/counters. Do not use active mode when reproducing the freeze unless the
 extra interference is intentional.
 
-For HV state without diagnostic CPUID polling, use the second-PC COM2 receiver
-described in `docs\hv-serial-monitor.md`.
+For HV state without diagnostic CPUID polling, use the local kernel log
+described in `docs\hv-local-monitor.md`. It writes `C:\hv_diag_live.log`.

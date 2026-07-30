@@ -2,15 +2,15 @@
 setlocal
 
 set "HV_BOOT_STOP_STAGE="
-set "HV_SERIAL_DIAG=1"
+set "HV_LOCAL_DIAG=1"
 set "HV_USER_CLIENT_READS=1"
 set "HV_PT_CONCEAL_MASK=7"
 set "CARGO_PROFILE_RELEASE_CODEGEN_UNITS=1"
-set "DRIVER_PATH=%~dp0..\target\release\matrix_serial_diag.sys"
+set "DRIVER_PATH=%~dp0..\target\release\matrix_local_diag.sys"
 set "DLL_PATH=%~dp0..\target\release\matrix.dll"
 
-echo [*] Building passive COM2 diagnostic driver...
-echo [*] Build flags: HV_SERIAL_DIAG=%HV_SERIAL_DIAG% HV_USER_CLIENT_READS=%HV_USER_CLIENT_READS% HV_PT_CONCEAL_MASK=%HV_PT_CONCEAL_MASK%
+echo [*] Building local-file diagnostic driver...
+echo [*] Build flags: HV_LOCAL_DIAG=%HV_LOCAL_DIAG% HV_USER_CLIENT_READS=%HV_USER_CLIENT_READS% HV_PT_CONCEAL_MASK=%HV_PT_CONCEAL_MASK%
 cd /d "%~dp0.."
 cargo clean -p matrix -p hypervisor >nul 2>&1
 cargo build -p matrix --release
@@ -27,5 +27,6 @@ if %errorlevel% neq 0 (
     exit /b 1
 )
 
-echo [+] Serial diagnostic driver ready: %DRIVER_PATH%
+echo [+] Local diagnostic driver ready: %DRIVER_PATH%
+echo [+] Runtime log: C:\hv_diag_live.log
 pause
