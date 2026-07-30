@@ -164,4 +164,5 @@ echo.
 echo ============================================
 echo   Done. You can now start the game.
 echo ============================================
+if defined HV_AUTOMATION exit /b 0
 pause

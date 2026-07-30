@@ -22,8 +22,9 @@ flushed records remain available after reboot.
 Do this before starting the game/EAC:
 
 1. Reboot so no old HV instance remains.
-2. Double-click `scripts\build_local_diag.bat`.
-3. Run `scripts\start_local_diag.bat` as Administrator.
+2. Double-click `scripts\build_local_diag.bat` once after a code change.
+3. Run `scripts\start_local_diag.bat` as Administrator. This single script
+   loads the diagnostic HV and automatically opens both passive monitors.
 
 The build creates:
 
@@ -39,9 +40,10 @@ Do not hot-load or replace the HV while the game/EAC is running.
 
 ## Watch the log
 
-Double-click `scripts\hv_local_log_viewer.bat`. The viewer waits for the file
-to appear and then follows new records. Closing the viewer does not stop kernel
-logging.
+`start_local_diag.bat` opens the local viewer automatically. The standalone
+`scripts\hv_local_log_viewer.bat` is available when the driver is already
+loaded. The viewer waits for the file to appear and then follows new records.
+Closing the viewer does not stop kernel logging.
 
 The existing `scripts\hv_live_monitor.bat` may run at the same time to capture
 Windows System/Application events and process/OS state. Its default mode does
