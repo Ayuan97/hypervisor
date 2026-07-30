@@ -197,7 +197,7 @@ hypervisor/      VT-x 核心逻辑
     vmlaunch.rs  VM-entry/VM-exit 汇编入口
     host_idt.rs  host IDT patch（NMI/#DF/#GP/#PF/#MC/default handlers）+ first-fault breadcrumb
     client_read.rs 物理读快路径
-scripts/         构建、签名、加载、监控（.bat + .ps1）
+scripts/         仓库内部构建、签名、加载、卸载（.bat + .ps1）
 tools/           用户态诊断/探针工具（.rs 源 + 编译产物 .exe）
 docs/            eac-hv-research-2026-07.md、research-report-2026-07-09.md
 ```

@@ -21,14 +21,25 @@ use {
 
 const WORKER_DELAY_100NS: i64 = -1_000_000; // 100 ms
 const CPU_RECORDS_PER_TICK: usize = 16;
-const LOG_PATH_DISPLAY: &str = r"C:\hv_diag_live.log";
+const LOG_PATH_DISPLAY: &str = r"D:\rust-cheat\hv_diag_live.log";
 static LOG_PATH_UTF16: &[u16] = &[
     '\\' as u16,
     '?' as u16,
     '?' as u16,
     '\\' as u16,
-    'C' as u16,
+    'D' as u16,
     ':' as u16,
+    '\\' as u16,
+    'r' as u16,
+    'u' as u16,
+    's' as u16,
+    't' as u16,
+    '-' as u16,
+    'c' as u16,
+    'h' as u16,
+    'e' as u16,
+    'a' as u16,
+    't' as u16,
     '\\' as u16,
     'h' as u16,
     'v' as u16,
@@ -387,6 +398,7 @@ impl<const N: usize> Write for FixedBuffer<N> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloc::string::String;
 
     #[test]
     fn local_diag_build_flag_requires_exact_one() {
@@ -394,6 +406,13 @@ mod tests {
         assert!(!enabled_by_build_flag(None));
         assert!(!enabled_by_build_flag(Some("0")));
         assert!(!enabled_by_build_flag(Some("true")));
+    }
+
+    #[test]
+    fn kernel_log_path_matches_display_path() {
+        let nt_path = String::from_utf16(&LOG_PATH_UTF16[..LOG_PATH_UTF16.len() - 1]).unwrap();
+        assert_eq!(nt_path, r"\??\D:\rust-cheat\hv_diag_live.log");
+        assert_eq!(&nt_path[4..], LOG_PATH_DISPLAY);
     }
 
     #[test]

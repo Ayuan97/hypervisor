@@ -88,7 +88,7 @@ scripts\build_stage.bat 600   # 产物 target\release\matrix_stage_600.sys
 - `HV_TRANSPARENT=1`：**构建时**，透传普通硬件 feature leaves；hypervisor、诊断和被隐藏 capability leaves 仍保持为 0，只用于隔离测试。
 - `HV_USER_CLIENT_READS=1`：允许用户态 client-read 通道；生产环境保持 0。
 - `HV_ENABLE_APERF_SHADOW=1`：拦截并按 host handler TSC 时间补偿 APERF/MPERF；默认 0。
-- `HV_LOCAL_DIAG=1`：构建时启用本地文件诊断 worker；使用 `scripts\build_local_diag.bat` 构建专用版本，运行时写入 `C:\hv_diag_live.log`。
+- `HV_LOCAL_DIAG=1`：构建时启用本地文件诊断 worker；使用 `D:\rust-cheat\scripts\build_local_diag.bat` 构建专用版本，运行时写入 `D:\rust-cheat\hv_diag_live.log`。
 - LBR 栈保存/恢复默认开启：guest 看到的是自己的 LBR 状态，不需要构建开关。
 - `HV_DRIVER=<path>`：覆盖 `start_hv.bat` 默认的 driver 路径。
 

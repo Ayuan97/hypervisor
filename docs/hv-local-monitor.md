@@ -3,7 +3,7 @@
 The local diagnostic build writes HV telemetry directly to:
 
 ```text
-C:\hv_diag_live.log
+D:\rust-cheat\hv_diag_live.log
 ```
 
 The file is overwritten whenever the diagnostic driver is loaded, so every
@@ -22,15 +22,16 @@ flushed records remain available after reboot.
 Do this before starting the game/EAC:
 
 1. Reboot so no old HV instance remains.
-2. Double-click `scripts\build_local_diag.bat` once after a code change.
-3. Double-click `scripts\start_local_diag.bat`. It requests Administrator
-   privileges through UAC, loads the diagnostic HV, and automatically opens
-   both passive monitors.
+2. Double-click `D:\rust-cheat\scripts\build_local_diag.bat` once after a code
+   change.
+3. Double-click `D:\rust-cheat\scripts\start_local_diag.bat`. It requests
+   Administrator privileges through UAC, loads the diagnostic HV, and
+   automatically opens both passive monitors.
 
 The build creates:
 
 ```text
-target\release\matrix_local_diag.sys
+D:\rust-cheat\hypervisor\target\release\matrix_local_diag.sys
 ```
 
 It enables the normal client-read and concealment settings plus the build-time
@@ -42,13 +43,14 @@ Do not hot-load or replace the HV while the game/EAC is running.
 ## Watch the log
 
 `start_local_diag.bat` opens the local viewer automatically. The standalone
-`scripts\hv_local_log_viewer.bat` is available when the driver is already
-loaded. The viewer waits for the file to appear and then follows new records.
-Closing the viewer does not stop kernel logging.
+`D:\rust-cheat\scripts\hv_local_log_viewer.bat` is available when the driver is
+already loaded. The viewer waits for the file to appear and then follows new
+records. Closing the viewer does not stop kernel logging.
 
-The existing `scripts\hv_live_monitor.bat` may run at the same time to capture
-Windows System/Application events and process/OS state. Its default mode does
-not issue diagnostic CPUID requests.
+The existing `D:\rust-cheat\scripts\hv_live_monitor.bat` may run at the same
+time to capture Windows System/Application events and process/OS state in
+`D:\rust-cheat\hv_monitor_live`. Its default mode does not issue diagnostic
+CPUID requests.
 
 ## Record format
 

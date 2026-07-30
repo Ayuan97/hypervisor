@@ -1,15 +1,15 @@
 # HV live monitor
 
-`scripts\hv_live_monitor.bat` now starts in passive local mode. It clears
-`logs\hv_monitor_live` and records Windows System/Application events, process
-presence, uptime, and memory state. It does not call `cpuid_ping` or
-`hv_breadcrumb`, so the monitor itself does not create diagnostic CPUID
-VM-exits.
+`D:\rust-cheat\scripts\hv_live_monitor.bat` starts in passive local mode. It
+clears `D:\rust-cheat\hv_monitor_live` and records Windows System/Application
+events, process presence, uptime, and memory state. It does not call
+`cpuid_ping` or `hv_breadcrumb`, so the monitor itself does not create
+diagnostic CPUID VM-exits.
 
-Double-click `scripts\hv_live_monitor.bat`, or run:
+Double-click `D:\rust-cheat\scripts\hv_live_monitor.bat`, or run:
 
 ```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File scripts\hv_live_monitor.ps1
+powershell -NoProfile -ExecutionPolicy Bypass -File D:\rust-cheat\scripts\hv_live_monitor.ps1
 ```
 
 Local passive files:
@@ -22,7 +22,7 @@ Local passive files:
 The old active behavior remains available only when explicitly requested:
 
 ```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File scripts\hv_live_monitor.ps1 -ActiveHvProbes
+powershell -NoProfile -ExecutionPolicy Bypass -File D:\rust-cheat\scripts\hv_live_monitor.ps1 -ActiveHvProbes
 ```
 
 Active mode calls `cpuid_ping` once per interval and starts
@@ -31,4 +31,5 @@ timing/counters. Do not use active mode when reproducing the freeze unless the
 extra interference is intentional.
 
 For HV state without diagnostic CPUID polling, use the local kernel log
-described in `docs\hv-local-monitor.md`. It writes `C:\hv_diag_live.log`.
+described in `docs\hv-local-monitor.md`. It writes
+`D:\rust-cheat\hv_diag_live.log`.
