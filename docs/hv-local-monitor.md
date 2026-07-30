@@ -23,8 +23,9 @@ Do this before starting the game/EAC:
 
 1. Reboot so no old HV instance remains.
 2. Double-click `scripts\build_local_diag.bat` once after a code change.
-3. Run `scripts\start_local_diag.bat` as Administrator. This single script
-   loads the diagnostic HV and automatically opens both passive monitors.
+3. Double-click `scripts\start_local_diag.bat`. It requests Administrator
+   privileges through UAC, loads the diagnostic HV, and automatically opens
+   both passive monitors.
 
 The build creates:
 
