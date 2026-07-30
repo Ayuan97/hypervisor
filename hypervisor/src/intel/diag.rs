@@ -104,6 +104,16 @@ static PER_CPU_RING_REASON: [AtomicU64; PER_CPU_RING_LEN] = [ZERO_U64; PER_CPU_R
 static PER_CPU_RING_RIP: [AtomicU64; PER_CPU_RING_LEN] = [ZERO_U64; PER_CPU_RING_LEN];
 static PER_CPU_RING_QUAL: [AtomicU64; PER_CPU_RING_LEN] = [ZERO_U64; PER_CPU_RING_LEN];
 static PER_CPU_RING_RAX: [AtomicU64; PER_CPU_RING_LEN] = [ZERO_U64; PER_CPU_RING_LEN];
+static PER_CPU_RING_COMMIT: [AtomicU64; PER_CPU_RING_LEN] = [ZERO_U64; PER_CPU_RING_LEN];
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PerCpuRingSnapshot {
+    pub sequence: u64,
+    pub reason: u64,
+    pub rip: u64,
+    pub qualification: u64,
+    pub rax: u64,
+}
 
 pub const PHASE_VMEXIT_ENTRY: u64 = 0x10;
 pub const PHASE_FAST_CPUID: u64 = 0x40;
@@ -1666,12 +1676,15 @@ pub fn ring_record(exit_reason: u64, guest_rip: u64, exit_qual: u64, guest_rax: 
 
     // Per-CPU ring keyed by rdtscp AUX.
     let cpu = rdtscp_aux() as usize % MAX_TRACKED_CPUS;
-    let cpu_idx = PER_CPU_RING_IDX[cpu].fetch_add(1, Relaxed) as usize % PER_CPU_RING_SIZE;
+    let sequence = PER_CPU_RING_IDX[cpu].fetch_add(1, Relaxed);
+    let cpu_idx = sequence as usize % PER_CPU_RING_SIZE;
     let slot = cpu * PER_CPU_RING_SIZE + cpu_idx;
+    PER_CPU_RING_COMMIT[slot].store(0, Release);
     PER_CPU_RING_REASON[slot].store(exit_reason, Relaxed);
     PER_CPU_RING_RIP[slot].store(guest_rip, Relaxed);
     PER_CPU_RING_QUAL[slot].store(exit_qual, Relaxed);
     PER_CPU_RING_RAX[slot].store(guest_rax, Relaxed);
+    PER_CPU_RING_COMMIT[slot].store(sequence.wrapping_add(1), Release);
 }
 
 pub fn ring_entry(slot: u64, field: u64) -> u64 {
@@ -1723,6 +1736,29 @@ pub fn per_cpu_ring_idx(cpu: u64) -> u64 {
         return u64::MAX;
     }
     PER_CPU_RING_IDX[c].load(Relaxed)
+}
+
+/// Returns a coherent ring entry for an absolute per-CPU sequence number.
+/// The commit word is published after all fields and checked again after the
+/// copy so a concurrent wrap cannot produce a torn serial diagnostic record.
+pub fn per_cpu_ring_snapshot(cpu: usize, sequence: u64) -> Option<PerCpuRingSnapshot> {
+    if cpu >= MAX_TRACKED_CPUS {
+        return None;
+    }
+    let slot = cpu * PER_CPU_RING_SIZE + sequence as usize % PER_CPU_RING_SIZE;
+    let expected_commit = sequence.wrapping_add(1);
+    if PER_CPU_RING_COMMIT[slot].load(Acquire) != expected_commit {
+        return None;
+    }
+
+    let snapshot = PerCpuRingSnapshot {
+        sequence,
+        reason: PER_CPU_RING_REASON[slot].load(Relaxed),
+        rip: PER_CPU_RING_RIP[slot].load(Relaxed),
+        qualification: PER_CPU_RING_QUAL[slot].load(Relaxed),
+        rax: PER_CPU_RING_RAX[slot].load(Relaxed),
+    };
+    (PER_CPU_RING_COMMIT[slot].load(Acquire) == expected_commit).then_some(snapshot)
 }
 
 pub static CTL_PINBASED: AtomicU64 = AtomicU64::new(0);
@@ -2142,6 +2178,32 @@ mod tests {
     }
 
     #[test]
+    fn per_cpu_ring_snapshot_requires_matching_commit() {
+        reset_per_cpu_ring_for_test();
+        let cpu = 4usize;
+        let sequence = 19u64;
+        let slot = cpu * PER_CPU_RING_SIZE + sequence as usize % PER_CPU_RING_SIZE;
+        PER_CPU_RING_REASON[slot].store(0x30, Relaxed);
+        PER_CPU_RING_RIP[slot].store(0xffff_f800_1234_5678, Relaxed);
+        PER_CPU_RING_QUAL[slot].store(0x55, Relaxed);
+        PER_CPU_RING_RAX[slot].store(0x66, Relaxed);
+
+        assert_eq!(per_cpu_ring_snapshot(cpu, sequence), None);
+        PER_CPU_RING_COMMIT[slot].store(sequence + 1, Release);
+        assert_eq!(
+            per_cpu_ring_snapshot(cpu, sequence),
+            Some(PerCpuRingSnapshot {
+                sequence,
+                reason: 0x30,
+                rip: 0xffff_f800_1234_5678,
+                qualification: 0x55,
+                rax: 0x66,
+            })
+        );
+        assert_eq!(per_cpu_ring_snapshot(cpu, sequence + PER_CPU_RING_SIZE as u64), None);
+    }
+
+    #[test]
     fn observe_guest_rip_flags_calls_inside_watched_range() {
         let base = 0xFFFFF800_12340000;
         set_kebugcheckex_sentinel(base, 0xCCCC_DDDD_EEEE_FFFF);
@@ -2495,6 +2557,7 @@ pub fn reset_per_cpu_ring_for_test() {
         PER_CPU_RING_RIP[slot].store(0, Relaxed);
         PER_CPU_RING_QUAL[slot].store(0, Relaxed);
         PER_CPU_RING_RAX[slot].store(0, Relaxed);
+        PER_CPU_RING_COMMIT[slot].store(0, Relaxed);
     }
     for cpu in 0..MAX_TRACKED_CPUS {
         PER_CPU_RING_IDX[cpu].store(0, Relaxed);

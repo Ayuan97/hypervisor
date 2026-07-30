@@ -1,43 +1,34 @@
 # HV live monitor
 
-Run this after the hypervisor is loaded:
+`scripts\hv_live_monitor.bat` now starts in passive local mode. It clears
+`logs\hv_monitor_live` and records Windows System/Application events, process
+presence, uptime, and memory state. It does not call `cpuid_ping` or
+`hv_breadcrumb`, so the monitor itself does not create diagnostic CPUID
+VM-exits.
+
+Double-click `scripts\hv_live_monitor.bat`, or run:
 
 ```powershell
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts\hv_live_monitor.ps1
 ```
 
-The script clears `logs\hv_monitor_live` at startup. It then runs the per-CPU
-breadcrumb sampler and periodically captures the complete `cpuid_ping` report.
-Each sample is flushed immediately so the last data remains available after a
-freeze or forced reboot.
+Local passive files:
 
-Useful options:
+- `windows_events.jsonl`: new System and Application event records.
+- `heartbeat.csv`: OS, game-process, and event-log heartbeat.
+- `state.json`, `context.json`, and `monitor.log`: monitor state and settings.
+- `cpuid_status.log`: explicitly states that no probes ran.
+
+The old active behavior remains available only when explicitly requested:
 
 ```powershell
-# Faster sampling
-powershell -NoProfile -File scripts\hv_live_monitor.ps1 -IntervalMs 250
-
-# Run for one minute
-powershell -NoProfile -File scripts\hv_live_monitor.ps1 -DurationSeconds 60
-
-# Only collect CPUID/System/Application telemetry
-powershell -NoProfile -File scripts\hv_live_monitor.ps1 -NoBreadcrumb
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts\hv_live_monitor.ps1 -ActiveHvProbes
 ```
 
-Files in the live directory:
+Active mode calls `cpuid_ping` once per interval and starts
+`hv_breadcrumb.exe`; those queries generate additional VM-exits and affect
+timing/counters. Do not use active mode when reproducing the freeze unless the
+extra interference is intentional.
 
-- `cpuid_status.log`: timestamped full diagnostic output, including counters,
-  VMCS controls, watchdog, host faults, freeze/CMOS fields, and probe-related
-  observations exposed by the HV.
-- `hv_breadcrumb.csv`: flushed per-CPU VM-exit breadcrumb samples and counters.
-- `windows_events.jsonl`: new System and Application event records.
-- `heartbeat.csv`: compact time series for scripts/Excel analysis.
-- `state.json` and `monitor.log`: current sampler state and lifecycle events.
-
-For full counters and freeze diagnostics, the HV must be loaded with
-`HV_NO_SEAL=1`. A sealed diagnostics channel can still report limited status,
-but it cannot expose all counters and control fields.
-
-The monitor records the telemetry exposed by the current user-mode diagnostic
-protocol. It cannot reconstruct VM-exits that the driver does not retain in its
-breadcrumb/ring buffers.
+For HV state without diagnostic CPUID polling, use the second-PC COM2 receiver
+described in `docs\hv-serial-monitor.md`.

@@ -7,6 +7,7 @@ param(
     [ValidateRange(0, 2147483)]
     [int]$DurationSeconds = 0,
     [string]$GameProcess = "rust",
+    [switch]$ActiveHvProbes,
     [switch]$NoBreadcrumb
 )
 
@@ -164,7 +165,7 @@ function Capture-NewEvents {
 }
 
 function Get-GameSnapshot {
-    $pattern = "*" + $GameProcess + "*"
+    $pattern = $GameProcess + "*"
     $procs = @(Get-Process -ErrorAction SilentlyContinue | Where-Object { $_.ProcessName -like $pattern })
     return [pscustomobject]@{
         Present = ($procs.Count -gt 0)
@@ -205,20 +206,31 @@ Write-SyncText -Path $contextPath -Text (([pscustomobject]@{
     logicalProcessors = $cpuCount
     cpuidExecutable = $CpuidExe
     breadcrumbExecutable = $BreadcrumbExe
-    note = "hv_breadcrumb records sampled per-CPU breadcrumbs; cpuid_ping preserves full diagnostic text."
+    activeHvProbes = [bool]$ActiveHvProbes
+    note = if ($ActiveHvProbes) {
+        "Active mode: cpuid_ping and optional hv_breadcrumb generate diagnostic VM-exits."
+    } else {
+        "Passive local mode: no CPUID/breadcrumb HV queries; use the second-PC serial receiver for HV telemetry."
+    }
 } | ConvertTo-Json -Depth 5) + "`r`n")
 Initialize-EventWatermarks
 
 $heartbeatPath = Join-Path $RunDir "heartbeat.csv"
 $header = "time,sample,uptime_seconds,cpuid_exit,cpuid_timeout,cpuid_elapsed_ms,hv_total,cpuid,external_interrupt,exception,ept_violation,ept_misconfig,cr_access,msr,xsetbv,other,host_gp,host_nmi,host_mc,host_pf,last_exit_reason,last_handler_id,last_handler_detail,vmx_instr,preempt_timer,boot_stage,game_present,game_pids,game_names,available_mb,committed_mb,last_system_record_id`r`n"
 Write-SyncText -Path $heartbeatPath -Text $header
-Write-SyncText -Path (Join-Path $RunDir "cpuid_status.log") -Text ""
+$cpuidStatusInitial = ""
+if (-not $ActiveHvProbes) {
+    $cpuidStatusInitial = "Passive mode: no CPUID diagnostic probes were executed.`r`n"
+}
+Write-SyncText -Path (Join-Path $RunDir "cpuid_status.log") -Text $cpuidStatusInitial
 Write-SyncText -Path (Join-Path $RunDir "monitor.log") -Text ""
-Append-Line -Path (Join-Path $RunDir "monitor.log") -Text "monitor started; previous live directory was cleared"
+Append-Line -Path (Join-Path $RunDir "monitor.log") -Text (
+    "monitor started; previous live directory was cleared; active_hv_probes={0}" -f [bool]$ActiveHvProbes
+)
 
 $sampler = $null
 try {
-    if (-not $NoBreadcrumb -and (Test-Path -LiteralPath $BreadcrumbExe)) {
+    if ($ActiveHvProbes -and -not $NoBreadcrumb -and (Test-Path -LiteralPath $BreadcrumbExe)) {
         $breadcrumbPath = Join-Path $RunDir "hv_breadcrumb.csv"
         $samplerOut = Join-Path $RunDir "breadcrumb.stdout.log"
         $samplerErr = Join-Path $RunDir "breadcrumb.stderr.log"
@@ -228,7 +240,7 @@ try {
             -WindowStyle Hidden -PassThru
         Append-Line -Path (Join-Path $RunDir "monitor.log") -Text ("breadcrumb sampler started pid={0} cpus={1}" -f $sampler.Id, $cpuCount)
     }
-    elseif (-not $NoBreadcrumb) {
+    elseif ($ActiveHvProbes -and -not $NoBreadcrumb) {
         Append-Line -Path (Join-Path $RunDir "monitor.log") -Text ("breadcrumb sampler unavailable: {0}" -f $BreadcrumbExe)
     }
 
@@ -239,11 +251,16 @@ try {
         if ($DurationSeconds -gt 0 -and (($loopStart - $startedAt).TotalSeconds -ge $DurationSeconds)) { break }
         $sample++
 
-        $capture = Invoke-Capture -Exe $CpuidExe -TimeoutMs $ProbeTimeoutMs
-        Write-SyncText -Path (Join-Path $RunDir "cpuid_status.log") -Text (
-            "=== sample={0} captured={1} exit={2} timeout={3} elapsed_ms={4} ===`r`n{5}`r`n`r`n" -f
-            $sample, (Get-Date).ToString("o"), $capture.Exit, $capture.TimedOut, $capture.ElapsedMs, $capture.Text
-        ) -Append
+        if ($ActiveHvProbes) {
+            $capture = Invoke-Capture -Exe $CpuidExe -TimeoutMs $ProbeTimeoutMs
+            Write-SyncText -Path (Join-Path $RunDir "cpuid_status.log") -Text (
+                "=== sample={0} captured={1} exit={2} timeout={3} elapsed_ms={4} ===`r`n{5}`r`n`r`n" -f
+                $sample, (Get-Date).ToString("o"), $capture.Exit, $capture.TimedOut, $capture.ElapsedMs, $capture.Text
+            ) -Append
+        }
+        else {
+            $capture = [pscustomobject]@{ Exit = ""; TimedOut = ""; ElapsedMs = ""; Text = "" }
+        }
         Capture-NewEvents
 
         $os = Get-OsSnapshot
@@ -285,6 +302,7 @@ try {
             lastSampleAt = (Get-Date).ToString("o")
             sample = $sample
             sampler = $samplerState
+            activeHvProbes = [bool]$ActiveHvProbes
             cpuidExit = $capture.Exit
             cpuidTimedOut = $capture.TimedOut
             lastSystemRecord = $lastSystemRecord

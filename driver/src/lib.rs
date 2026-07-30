@@ -43,6 +43,7 @@ use {
 };
 
 pub mod expanded_stack;
+mod serial_diag;
 
 static HYPERVISOR: AtomicPtr<Hypervisor> = AtomicPtr::new(null_mut());
 const STAGE_STOP_STATUS_BASE: u32 = 0xE0F0_0000;
@@ -142,6 +143,9 @@ unsafe extern "C" fn driver_unload(_driver_object: PDRIVER_OBJECT) {
     }
     if !hypervisor::intel::client_read::stop_worker() {
         log::error!("Client-read worker cleanup did not complete successfully");
+    }
+    if !serial_diag::stop_worker() {
+        log::error!("Serial diagnostic worker cleanup did not complete successfully");
     }
     let hv = HYPERVISOR.swap(null_mut(), Ordering::AcqRel);
     if !hv.is_null() && hv != hypervisor_initializing() {
@@ -400,6 +404,28 @@ fn virtualize_system_claimed() -> NTSTATUS {
             cleanup_failed,
             callback_cleanup_succeeded,
             0xE0053600u32 as NTSTATUS,
+        );
+    }
+
+    if !serial_diag::start_worker_if_enabled() {
+        log::error!("Failed to start serial diagnostic worker");
+        let client_worker_stopped = hypervisor::intel::client_read::stop_worker();
+        let cleanup_failed = if let Err(error) = hv.devirtualize_system() {
+            log::error!(
+                "Failed to cleanup after serial diagnostic worker failure: {}",
+                error
+            );
+            let hv = Box::new(hv);
+            HYPERVISOR.store(Box::into_raw(hv), Ordering::Release);
+            true
+        } else {
+            false
+        };
+        let callback_cleanup_succeeded = deregister_bugcheck_callback();
+        return failure_status_after_cleanup(
+            cleanup_failed || !client_worker_stopped,
+            callback_cleanup_succeeded,
+            0xE0053700u32 as NTSTATUS,
         );
     }
 
