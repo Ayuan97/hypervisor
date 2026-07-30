@@ -8,7 +8,6 @@ use {
         intel::{
             descriptor::DescriptorTables,
             diag,
-            paging::PageTables,
             shared_data::SharedData,
             support,
             vcpu::Vcpu,
@@ -22,15 +21,10 @@ use {
             addresses::PhysicalAddress,
             alloc::{KernelAlloc, PhysicalAllocator},
             capture::CONTEXT,
-            nt::{IDENTITY_CR3, NTOSKRNL_CR3},
         },
     },
     alloc::boxed::Box,
-    core::{
-        cell::UnsafeCell,
-        ptr::NonNull,
-        sync::atomic::Ordering,
-    },
+    core::{cell::UnsafeCell, ptr::NonNull},
     x86::{cpuid::cpuid, msr, vmx::vmcs},
 };
 
@@ -146,10 +140,6 @@ pub struct Vmx {
     /// Allocated using `ExAllocatePool` or `ExAllocatePoolWithTag`.
     pub vmstack: Box<VmStack, KernelAlloc>,
 
-    /// Virtual address of the host's paging structures, aligned to a 4-KByte boundary.
-    /// Allocated using `MmAllocateContiguousMemorySpecifyCacheNode`.
-    pub host_paging: Box<PageTables, PhysicalAllocator>,
-
     /// Control registers captured before enabling VMX operation.
     pub control_registers: ControlRegisterSnapshot,
 
@@ -205,7 +195,6 @@ impl Vmx {
         let mut guest_descriptor_table = Box::try_new_in(DescriptorTables::new(), KernelAlloc)?;
         let mut host_descriptor_table = Box::try_new_in(DescriptorTables::new(), KernelAlloc)?;
         let vmstack = unsafe { Box::try_new_zeroed_in(KernelAlloc)?.assume_init() };
-        let mut host_paging: Box<PageTables, PhysicalAllocator> = unsafe { Box::try_new_zeroed_in(PhysicalAllocator)?.assume_init() };
         let guest_registers = GuestRegisters::default();
         let control_registers = ControlRegisterSnapshot::capture();
         diag::boot_stage(510)?;
@@ -216,16 +205,6 @@ impl Vmx {
         DescriptorTables::initialize_for_host(&mut host_descriptor_table)?;
         diag::boot_stage(520)?;
 
-        // Build hypervisor-owned paging once per CPU and keep the identity CR3 for diagnostics.
-        if unsafe { NTOSKRNL_CR3 } == 0 {
-            let _ = diag::boot_stage(521);
-            return Err(HypervisorError::InvalidCr3BaseAddress);
-        }
-
-        host_paging.init_hypervisor_paging(unsafe { NTOSKRNL_CR3 });
-        host_paging.build_identity();
-        let identity_cr3 = host_paging.get_pml4_pa()?;
-        let _ = IDENTITY_CR3.compare_exchange(0, identity_cr3, Ordering::AcqRel, Ordering::Acquire);
         diag::boot_stage(530)?;
 
         log::trace!("Creating Vmx instance");
@@ -239,7 +218,6 @@ impl Vmx {
             guest_descriptor_table,
             host_descriptor_table,
             vmstack,
-            host_paging,
             control_registers,
             guest_registers,
             // VM-exit commands may mutate shared EPT/client state; the

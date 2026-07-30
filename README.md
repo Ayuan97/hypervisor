@@ -72,6 +72,8 @@ scripts\build_stage.bat 600   # 产物 target\release\matrix_stage_600.sys
 
 ## 启动顺序
 
+HV 保持所有逻辑处理器启用。每个处理器仍有独立、固定亲和性的常驻 worker，VMX 初始化按 CPU 编号有序执行；前一个 CPU 成功进入 guest 后才允许下一个 CPU 初始化。所有 CPU 共用一份只读 identity page tables，避免为每个 VCPU 重复分配 0x202000 字节页表。
+
 1. 重启，确保没有旧 HV 实例残留。
 2. 确保 EAC/游戏未启动。
 3. 运行 `scripts\start_hv.bat`（kdmapper 映射 + 自检 + 默认 seal），或 `scripts\load.bat`（走 kernel service）。
@@ -88,7 +90,7 @@ scripts\build_stage.bat 600   # 产物 target\release\matrix_stage_600.sys
 - `HV_TRANSPARENT=1`：**构建时**，透传普通硬件 feature leaves；hypervisor、诊断和被隐藏 capability leaves 仍保持为 0，只用于隔离测试。
 - `HV_USER_CLIENT_READS=1`：允许用户态 client-read 通道；生产环境保持 0。
 - `HV_ENABLE_APERF_SHADOW=1`：拦截并按 host handler TSC 时间补偿 APERF/MPERF；默认 0。
-- `HV_LOCAL_DIAG=1`：构建时启用本地文件诊断 worker；使用 `D:\rust-cheat\scripts\build_local_diag.bat` 构建专用版本，运行时写入 `D:\rust-cheat\hv_diag_live.log`。
+- `HV_LOCAL_DIAG=1`：构建时启用本地文件诊断 worker；使用 `D:\rust-cheat\scripts\build_local_diag.bat` 构建专用版本，运行时写入 `D:\rust-cheat\hv_diag_live.log`。日志文件在 VMX 初始化前创建、覆盖并同步写入首条 `boot_stage` 记录。
 - LBR 栈保存/恢复默认开启：guest 看到的是自己的 LBR 状态，不需要构建开关。
 - `HV_DRIVER=<path>`：覆盖 `start_hv.bat` 默认的 driver 路径。
 

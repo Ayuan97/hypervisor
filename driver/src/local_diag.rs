@@ -90,6 +90,10 @@ pub fn start_worker_if_enabled() -> bool {
     };
     LOG_HANDLE.store(log_handle as u64, Ordering::Release);
     WORKER_SHUTDOWN.store(false, Ordering::Release);
+    if !write_start_record() {
+        close_log_file();
+        return false;
+    }
 
     let mut thread_handle: HANDLE = null_mut();
     let status = unsafe {
@@ -143,17 +147,6 @@ unsafe extern "C" fn worker_main(_context: PVOID) {
         *next = current.saturating_sub(1);
     }
 
-    let mut start = FixedBuffer::<512>::new();
-    let _ = writeln!(
-        start,
-        "HVL1 START seq={} path={} cpus={} ring_size={} period_ms=100",
-        next_sequence(),
-        LOG_PATH_DISPLAY,
-        diag::MAX_TRACKED_CPUS,
-        diag::PER_CPU_RING_SIZE
-    );
-    write_and_flush(start.as_bytes());
-
     let mut next_cpu = 0usize;
     let mut tick = 0u64;
     while !WORKER_SHUTDOWN.load(Ordering::Acquire) {
@@ -180,6 +173,21 @@ unsafe extern "C" fn worker_main(_context: PVOID) {
     write_and_flush(stop.as_bytes());
     WORKER_STARTED.store(false, Ordering::Release);
     let _ = PsTerminateSystemThread(STATUS_SUCCESS);
+}
+
+fn write_start_record() -> bool {
+    let mut start = FixedBuffer::<512>::new();
+    let formatted = writeln!(
+        start,
+        "HVL1 START seq={} path={} cpus={} ring_size={} period_ms=100 boot_stage={}",
+        next_sequence(),
+        LOG_PATH_DISPLAY,
+        diag::MAX_TRACKED_CPUS,
+        diag::PER_CPU_RING_SIZE,
+        diag::control(9)
+    )
+    .is_ok();
+    formatted && write_and_flush(start.as_bytes())
 }
 
 fn append_ring_updates(
@@ -235,7 +243,7 @@ fn append_counter_snapshot(batch: &mut FixedBuffer<4096>) {
         concat!(
             "HVL1 C seq={} total={} cpuid={} msr={} vmx={} eptv={} eptm={} exc={} ",
             "hostfault={} gp={} nmi={} pf={} mc={} msrgp={} efer_r={} efer_w={} ",
-            "aperf={} mperf={} dbg_r={} dbg_w={} lbr={} bughit={} bugcb={} freeze={} ",
+            "aperf={} mperf={} dbg_r={} dbg_w={} lbr={} bughit={} bugcb={} freeze={} boot_stage={} ",
             "write_failures={} dropped_records={}"
         ),
         next_sequence(),
@@ -262,6 +270,7 @@ fn append_counter_snapshot(batch: &mut FixedBuffer<4096>) {
         diag::control(52),
         diag::control(65),
         diag::control(130),
+        diag::control(9),
         WRITE_FAILURES.load(Ordering::Relaxed),
         DROPPED_RECORDS.load(Ordering::Relaxed)
     )

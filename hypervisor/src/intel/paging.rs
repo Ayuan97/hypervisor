@@ -10,7 +10,10 @@
 use {
     crate::{error::HypervisorError, utils::addresses::PhysicalAddress},
     bitfield::bitfield,
-    core::ptr::addr_of,
+    core::{
+        mem::{align_of, size_of},
+        ptr::addr_of,
+    },
     static_assertions::const_assert_eq,
     x86::current::paging::{BASE_PAGE_SHIFT, LARGE_PAGE_SIZE},
 };
@@ -38,6 +41,12 @@ pub struct PageTables {
     /// Array of Page Directory Table (PDT).
     pd: [Pd; 512],
 }
+
+// `KernelAlloc` receives this full layout in one allocation. ExAllocatePool2
+// returns page-aligned storage for page-sized-or-larger requests, and every
+// embedded paging structure remains on its own 4-KByte boundary.
+const_assert_eq!(align_of::<PageTables>(), 0x1000);
+const_assert_eq!(size_of::<PageTables>(), 0x202000);
 
 impl PageTables {
     /// Initialize the hypervisor's page tables.

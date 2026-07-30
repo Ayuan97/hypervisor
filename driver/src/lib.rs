@@ -261,7 +261,22 @@ pub unsafe extern "system" fn driver_entry(
         }
     }
 
-    with_expanded_stack(|| virtualize_system())
+    // Create and flush the local log before any per-CPU VMX allocation or
+    // launch. Startup failures must leave a boot-stage record instead of an
+    // absent log file.
+    if !local_diag::start_worker_if_enabled() {
+        log::error!("Failed to start local diagnostic worker before virtualization");
+        return 0xE0013700u32 as NTSTATUS;
+    }
+
+    let status = with_expanded_stack(|| virtualize_system());
+    if status != STATUS_SUCCESS && !local_diag::stop_worker() {
+        // The image must remain resident if its diagnostic thread cannot be
+        // joined; returning failure would let the mapper unload live code.
+        log::error!("Local diagnostic worker cleanup did not complete successfully");
+        return STATUS_SUCCESS;
+    }
+    status
 }
 
 fn virtualize_system() -> NTSTATUS {
@@ -333,6 +348,9 @@ fn virtualize_system_claimed() -> NTSTATUS {
     if let Some(status) = boot_stage(220) {
         return status;
     }
+    // The Hypervisor builder creates one shared identity page-table owner,
+    // so the system CR3 must be available before construction.
+    update_ntoskrnl_cr3();
     let hook_manager = HookManager::new(vec![]);
     let mut hv = match Hypervisor::builder()
         .primary_ept(primary_ept)
@@ -349,7 +367,6 @@ fn virtualize_system_claimed() -> NTSTATUS {
     if let Some(status) = boot_stage(230) {
         return status;
     }
-    update_ntoskrnl_cr3();
     init_kebugcheckex_sentinel();
     register_bugcheck_callback();
 
@@ -404,28 +421,6 @@ fn virtualize_system_claimed() -> NTSTATUS {
             cleanup_failed,
             callback_cleanup_succeeded,
             0xE0053600u32 as NTSTATUS,
-        );
-    }
-
-    if !local_diag::start_worker_if_enabled() {
-        log::error!("Failed to start local diagnostic worker");
-        let client_worker_stopped = hypervisor::intel::client_read::stop_worker();
-        let cleanup_failed = if let Err(error) = hv.devirtualize_system() {
-            log::error!(
-                "Failed to cleanup after local diagnostic worker failure: {}",
-                error
-            );
-            let hv = Box::new(hv);
-            HYPERVISOR.store(Box::into_raw(hv), Ordering::Release);
-            true
-        } else {
-            false
-        };
-        let callback_cleanup_succeeded = deregister_bugcheck_callback();
-        return failure_status_after_cleanup(
-            cleanup_failed || !client_worker_stopped,
-            callback_cleanup_succeeded,
-            0xE0053700u32 as NTSTATUS,
         );
     }
 

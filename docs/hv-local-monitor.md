@@ -12,6 +12,17 @@ only update the existing lock-free per-CPU ring. A kernel system thread running
 outside VM-exit context collects the latest completed slots every 100 ms,
 writes one bounded batch, and calls `ZwFlushBuffersFile` immediately.
 
+The file is opened and its `HVL1 START` record is flushed before per-CPU VMX
+initialization begins. Both the start record and periodic `HVL1 C` records
+include `boot_stage`, so an initialization failure still leaves the last
+reached startup phase on disk.
+
+All logical processors remain enabled. Their persistent, affinity-pinned SMP
+workers initialize VMX in CPU-index order, handing the launch turn to the next
+CPU only after the current CPU has entered the guest successfully. The CPUs
+share one immutable 0x202000-byte identity page-table allocation instead of
+allocating the same paging hierarchy once per VCPU.
+
 This avoids diagnostic CPUID polling, but it is not completely passive. The
 kernel worker and filesystem flushes add some I/O. A total machine freeze can
 also lose the final batch that had not run or reached stable storage. Earlier

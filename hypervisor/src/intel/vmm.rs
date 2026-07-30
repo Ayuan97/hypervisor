@@ -6,17 +6,19 @@ use {
         intel::{
             diag,
             ept::{hooks::HookManager, paging::Ept},
+            paging::PageTables,
             shared_data::SharedData,
             vcpu::Vcpu,
             vmcs::Vmcs,
             vmxon::Vmxon,
         },
         utils::{
-            alloc::PhysicalAllocator,
+            alloc::{KernelAlloc, PhysicalAllocator},
+            nt::{IDENTITY_CR3, NTOSKRNL_CR3},
             processor::{
-                clear_virtualization_failures, current_processor_index, mark_virtualization_failure,
-                is_virtualized, processor_count, virtualization_failure_count, yield_execution,
-                ProcessorExecutor,
+                clear_virtualization_failures, current_processor_index, is_virtualized,
+                mark_virtualization_failure, processor_count, virtualization_failure_count,
+                yield_execution, ProcessorExecutor,
             },
         },
     },
@@ -41,11 +43,39 @@ const SMP_WORKER_WAIT_TIMEOUT_100NS: i64 = -5_000_000; // 500 ms
 
 struct SmpLaunchState {
     ready: AtomicU32,
-    released: AtomicU32,
+    launch_turn: AtomicU32,
     active: AtomicU32,
     go: AtomicBool,
     abort: AtomicBool,
     stop: AtomicBool,
+}
+
+impl SmpLaunchState {
+    const fn new() -> Self {
+        Self {
+            ready: AtomicU32::new(0),
+            launch_turn: AtomicU32::new(0),
+            active: AtomicU32::new(0),
+            go: AtomicBool::new(false),
+            abort: AtomicBool::new(false),
+            stop: AtomicBool::new(false),
+        }
+    }
+
+    fn has_launch_turn(&self, cpu_index: u32) -> bool {
+        self.launch_turn.load(Ordering::Acquire) == cpu_index
+    }
+
+    fn advance_launch_turn(&self, cpu_index: u32) -> bool {
+        self.launch_turn
+            .compare_exchange(
+                cpu_index,
+                cpu_index + 1,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+    }
 }
 
 struct SmpLaunchContext {
@@ -82,6 +112,20 @@ impl HypervisorBuilder {
 
         Hypervisor::check_supported_cpu()?;
 
+        let system_cr3 = unsafe { NTOSKRNL_CR3 };
+        if system_cr3 == 0 {
+            return Err(HypervisorError::InvalidCr3BaseAddress);
+        }
+        // All CPUs use the same immutable identity map. The previous design
+        // allocated a 0x202000-byte physically contiguous copy per VCPU even
+        // though only the first CR3 was published, causing 24 concurrent
+        // large allocations during SMP launch.
+        let mut identity_paging: Box<PageTables, KernelAlloc> =
+            unsafe { Box::try_new_zeroed_in(KernelAlloc)?.assume_init() };
+        identity_paging.init_hypervisor_paging(system_cr3);
+        identity_paging.build_identity();
+        let identity_cr3 = identity_paging.get_pml4_pa()?;
+
         let mut processors: Vec<Vcpu> = Vec::new();
 
         for i in 0..processor_count() {
@@ -110,9 +154,11 @@ impl HypervisorBuilder {
             SharedData::new(primary_ept, secondary_ept, hook_manager)?
         };
 
+        IDENTITY_CR3.store(identity_cr3, Ordering::Release);
         Ok(Hypervisor {
             processors: ManuallyDrop::new(processors),
             shared_data: ManuallyDrop::new(shared_data),
+            identity_paging: ManuallyDrop::new(identity_paging),
             devirtualized: true,
             smp_state: None,
             smp_worker_handles: Vec::new(),
@@ -143,6 +189,9 @@ pub struct Hypervisor {
 
     /// The shared data between processors.
     shared_data: ManuallyDrop<Box<SharedData>>,
+
+    /// Single immutable identity map backing `IDENTITY_CR3` for every CPU.
+    identity_paging: ManuallyDrop<Box<PageTables, KernelAlloc>>,
 
     /// Whether all processors are known to be outside VMX non-root operation.
     devirtualized: bool,
@@ -201,7 +250,7 @@ unsafe extern "C" fn smp_launch_thread(start_context: PVOID) {
 
     state.ready.fetch_add(1, Ordering::Release);
     while !state.go.load(Ordering::Acquire) {
-        if state.abort.load(Ordering::Acquire) {
+        if state.abort.load(Ordering::Acquire) || state.stop.load(Ordering::Acquire) {
             drop(executor);
             let _ = PsTerminateSystemThread(STATUS_SUCCESS);
             return;
@@ -209,8 +258,7 @@ unsafe extern "C" fn smp_launch_thread(start_context: PVOID) {
         yield_execution();
     }
 
-    state.released.fetch_add(1, Ordering::Release);
-    if state.abort.load(Ordering::Acquire) || state.stop.load(Ordering::Acquire) {
+    if !wait_for_smp_launch_turn(state, context.cpu_index) {
         drop(executor);
         let _ = PsTerminateSystemThread(STATUS_SUCCESS);
         return;
@@ -235,6 +283,22 @@ unsafe extern "C" fn smp_launch_thread(start_context: PVOID) {
             }
         }
         mark_virtualization_failure(context.cpu_index);
+        state.abort.store(true, Ordering::Release);
+        drop(executor);
+        let _ = PsTerminateSystemThread(STATUS_SUCCESS);
+        return;
+    }
+
+    // Only hand the launch turn to the next CPU after this CPU has completed
+    // all contiguous allocations, VMX setup, and VMLAUNCH. Releasing every
+    // worker at once caused concurrent MmAllocateContiguousMemory calls and
+    // cross-CPU TLB-shootdown deadlocks during startup.
+    if !state.advance_launch_turn(context.cpu_index) {
+        if is_virtualized() {
+            let _ = (&*context.vcpu).devirtualize_cpu();
+        }
+        mark_virtualization_failure(context.cpu_index);
+        state.abort.store(true, Ordering::Release);
         drop(executor);
         let _ = PsTerminateSystemThread(STATUS_SUCCESS);
         return;
@@ -261,14 +325,19 @@ fn wait_for_smp_ready(state_ptr: *const SmpLaunchState, expected: u32) -> bool {
     false
 }
 
-fn wait_for_smp_released(state_ptr: *const SmpLaunchState, expected: u32) -> bool {
-    for _ in 0..SMP_LAUNCH_YIELD_LIMIT {
-        if unsafe { (&*state_ptr).released.load(Ordering::Acquire) } >= expected {
+fn wait_for_smp_launch_turn(state: &SmpLaunchState, cpu_index: u32) -> bool {
+    loop {
+        if state.abort.load(Ordering::Acquire)
+            || state.stop.load(Ordering::Acquire)
+            || virtualization_failure_count() != 0
+        {
+            return false;
+        }
+        if state.has_launch_turn(cpu_index) {
             return true;
         }
         yield_execution();
     }
-    false
 }
 
 fn wait_for_smp_active(state_ptr: *const SmpLaunchState, expected: u32) -> bool {
@@ -374,14 +443,7 @@ impl Hypervisor {
 
         self.devirtualized = false;
         clear_virtualization_failures();
-        let state = Box::new(SmpLaunchState {
-            ready: AtomicU32::new(0),
-            released: AtomicU32::new(0),
-            active: AtomicU32::new(0),
-            go: AtomicBool::new(false),
-            abort: AtomicBool::new(false),
-            stop: AtomicBool::new(false),
-        });
+        let state = Box::new(SmpLaunchState::new());
         let state_ptr = state.as_ref() as *const SmpLaunchState;
         let processors_ptr = self.processors.as_mut_ptr();
         let shared_data_ptr = self.shared_data.as_ref() as *const SharedData;
@@ -435,14 +497,10 @@ impl Hypervisor {
         unsafe {
             (*state_ptr).go.store(true, Ordering::Release);
         }
-        if !wait_for_smp_released(state_ptr, count) {
+        if !wait_for_smp_active(state_ptr, count) {
             unsafe {
                 (*state_ptr).abort.store(true, Ordering::Release);
             }
-            self.smp_state = Some(state);
-            return Err(HypervisorError::ProcessorSwitchFailed);
-        }
-        if !wait_for_smp_active(state_ptr, count) {
             self.smp_state = Some(state);
             return Err(HypervisorError::ProcessorSwitchFailed);
         }
@@ -676,9 +734,10 @@ impl Drop for Hypervisor {
 
         if drop_should_release_owned_resources(resources_quiesced, cleanup_succeeded) {
             unsafe {
-                crate::utils::nt::IDENTITY_CR3.store(0, Ordering::Release);
+                IDENTITY_CR3.store(0, Ordering::Release);
                 ManuallyDrop::drop(&mut self.processors);
                 ManuallyDrop::drop(&mut self.shared_data);
+                ManuallyDrop::drop(&mut self.identity_paging);
             }
         } else {
             // `Hypervisor` is about to be dropped even when cleanup failed.
@@ -715,5 +774,17 @@ mod tests {
         assert!(!cpu_virtualization_is_skipped_with_config(NO_SKIP_CPU, 8));
         assert!(cpu_virtualization_is_skipped_with_config(8, 8));
         assert!(!cpu_virtualization_is_skipped_with_config(8, 7));
+    }
+
+    #[test]
+    fn smp_launch_turn_advances_exactly_once_per_cpu() {
+        let state = SmpLaunchState::new();
+        assert!(state.has_launch_turn(0));
+        assert!(!state.has_launch_turn(1));
+        assert!(state.advance_launch_turn(0));
+        assert!(!state.advance_launch_turn(0));
+        assert!(state.has_launch_turn(1));
+        assert!(state.advance_launch_turn(1));
+        assert!(state.has_launch_turn(2));
     }
 }
