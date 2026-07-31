@@ -91,6 +91,7 @@ HV 保持所有逻辑处理器启用。每个处理器仍有独立、固定亲�
 - `HV_USER_CLIENT_READS=1`：允许用户态 client-read 通道；生产环境保持 0。
 - `HV_ENABLE_APERF_SHADOW=1`：拦截并按 host handler TSC 时间补偿 APERF/MPERF；默认 0。
 - `HV_LOCAL_DIAG=1`：构建时启用本地文件诊断 worker；使用 `D:\rust-cheat\scripts\build_local_diag.bat` 构建专用版本，运行时写入 `D:\rust-cheat\hv_diag_live.log`。日志文件在 VMX 初始化前创建、覆盖并同步写入首条 `boot_stage` 记录。
+- 本地诊断版正常运行时只双击 `D:\rust-cheat\scripts\start_local_diag.bat`；它会先清空并启动两套本地监控，再加载 HV 和打开日志查看器。
 - LBR 栈保存/恢复默认开启：guest 看到的是自己的 LBR 状态，不需要构建开关。
 - `HV_DRIVER=<path>`：覆盖 `start_hv.bat` 默认的 driver 路径。
 

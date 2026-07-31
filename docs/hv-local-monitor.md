@@ -36,13 +36,16 @@ Do this before starting the game/EAC:
 2. Double-click `D:\rust-cheat\scripts\build_local_diag.bat` once after a code
    change.
 3. Double-click `D:\rust-cheat\scripts\start_local_diag.bat`. It requests
-   Administrator privileges through UAC, loads the diagnostic HV, and
-   automatically opens both passive monitors.
+   Administrator privileges through UAC, starts both monitors, loads the
+   diagnostic HV, and opens the live kernel-log viewer.
+
+For normal testing, `start_local_diag.bat` is the only runtime entry point.
+Do not start a second monitor or load script alongside it.
 
 The build creates:
 
 ```text
-D:\rust-cheat\hypervisor\target\release\matrix_local_diag.sys
+D:\rust-cheat\output\hv\matrix_local_diag.sys
 ```
 
 It enables the normal client-read and concealment settings plus the build-time
@@ -53,15 +56,35 @@ Do not hot-load or replace the HV while the game/EAC is running.
 
 ## Watch the log
 
-`start_local_diag.bat` opens the local viewer automatically. The standalone
-`D:\rust-cheat\scripts\hv_local_log_viewer.bat` is available when the driver is
-already loaded. The viewer waits for the file to appear and then follows new
-records. Closing the viewer does not stop kernel logging.
+`start_local_diag.bat` opens the local viewer automatically. The viewer waits
+for the file to appear and then follows new records. Closing the viewer does
+not stop kernel logging.
 
-The existing `D:\rust-cheat\scripts\hv_live_monitor.bat` may run at the same
-time to capture Windows System/Application events and process/OS state in
-`D:\rust-cheat\hv_monitor_live`. Its default mode does not issue diagnostic
-CPUID requests.
+## Passive Windows event monitor
+
+The same launcher starts `D:\rust-cheat\scripts\hv_live_monitor.ps1` before HV
+loading. On every run it clears `D:\rust-cheat\hv_monitor_live`, then records
+new Windows System/Application events, process presence, uptime, and memory
+state. Default mode does not call `cpuid_ping` or `hv_breadcrumb`, so the
+companion monitor does not create diagnostic CPUID VM-exits.
+
+Files written under `hv_monitor_live`:
+
+- `windows_events.jsonl`: new System and Application event records.
+- `heartbeat.csv`: OS, game-process, and event-log heartbeat.
+- `state.json`, `context.json`, and `monitor.log`: monitor state and settings.
+- `cpuid_status.log`: explicitly states that no active probes ran.
+
+Active probing remains available only for focused diagnostics:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File D:\rust-cheat\scripts\hv_live_monitor.ps1 -ActiveHvProbes
+```
+
+Active mode calls `cpuid_ping` once per interval and starts
+`hv_breadcrumb.exe`. Those queries generate additional VM-exits and affect
+timing/counters, so do not use active mode when reproducing a freeze unless
+that interference is intentional.
 
 ## Record format
 
