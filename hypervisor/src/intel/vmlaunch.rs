@@ -87,6 +87,7 @@ core::arch::global_asm!(
 .set vmstack_host_xmm14, 0x90
 .set vmstack_host_xmm15, 0xA0
 .set vmstack_host_mxcsr, 0xB0
+.set vmstack_footer_from_host_rsp, 0x80
 .set launch_saved_r15, 0x08
 .set launch_saved_r14, 0x10
 .set launch_saved_r13, 0x18
@@ -269,9 +270,10 @@ vmexit_stub:
     movdqu  [r15 + registers_xmm14], xmm14
     movdqu  [r15 + registers_xmm15], xmm15
 
-    // Save guest MXCSR, then load the original host value for Rust/Windows.
+    // Save guest MXCSR, then load host state from the VmStack footer itself.
+    // The footer begins at rsp + 0x80; the value stored there is the Vmx pointer.
     stmxcsr [r15 + registers_mxcsr]
-    mov     rax, [rsp + 0x80]
+    lea     rax, [rsp + vmstack_footer_from_host_rsp]
     movdqu  xmm6, [rax + vmstack_host_xmm6]
     movdqu  xmm7, [rax + vmstack_host_xmm7]
     movdqu  xmm8, [rax + vmstack_host_xmm8]
@@ -287,9 +289,8 @@ vmexit_stub:
     // Set rcx to point to the saved guest registers for `vmexit_handler` (1st parameter).
     mov rcx, r15
 
-    // Set rdx to point to the saved `Vmx` pointer for `vmexit_handler` (2nd parameter).
-    // 8 (0x8) x 16 (0x10) = 128 (0x80) bytes away is `Vmx` pointer.
-    mov rdx, [rsp + 0x80]
+    // Load the `Vmx` pointer stored at the footer for `vmexit_handler` (2nd parameter).
+    mov rdx, [rsp + vmstack_footer_from_host_rsp]
 
     // Temporarily save and restore r15, keeping guest registers pointer on stack.
     mov     rax, [rsp]
@@ -363,9 +364,10 @@ vmexit_restore:
     // Attempt to resume the guest virtual machine.
     vmresume
 
-    // If VMRESUME fails, handle the failure.
-    mov     rcx, [rsp + 0x80]
-    mov     rax, rcx
+    // If VMRESUME fails, pass the stored Vmx pointer to the handler while restoring
+    // host floating-point state from the address of the VmStack footer.
+    mov     rcx, [rsp + vmstack_footer_from_host_rsp]
+    lea     rax, [rsp + vmstack_footer_from_host_rsp]
     movdqu  xmm6, [rax + vmstack_host_xmm6]
     movdqu  xmm7, [rax + vmstack_host_xmm7]
     movdqu  xmm8, [rax + vmstack_host_xmm8]

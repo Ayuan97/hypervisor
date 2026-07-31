@@ -125,12 +125,17 @@ mod tests {
 
     #[test]
     fn host_rsp_layout_matches_vmexit_stub_contract() {
-        const LAUNCH_STACK_SAVE_SIZE: usize = 0x80;
-        let host_rsp_offset = STACK_CONTENTS_SIZE - LAUNCH_STACK_SAVE_SIZE;
+        const VMSTACK_FOOTER_FROM_HOST_RSP: usize = 0x80;
+        let host_rsp_offset = STACK_CONTENTS_SIZE - VMSTACK_FOOTER_FROM_HOST_RSP;
 
         assert_eq!(host_rsp_offset % 16, 0);
-        assert_eq!(offset_of!(VmStack, vmx) - host_rsp_offset, 0x80);
+        assert_eq!(
+            offset_of!(VmStack, vmx) - host_rsp_offset,
+            VMSTACK_FOOTER_FROM_HOST_RSP
+        );
         assert_eq!(offset_of!(VmStack, original_rsp) - host_rsp_offset, 0x88);
         assert_eq!(offset_of!(VmStack, host_xmm15) - host_rsp_offset, 0x120);
+        assert_eq!(offset_of!(VmStack, host_mxcsr) - host_rsp_offset, 0x130);
+        assert_eq!(KERNEL_STACK_SIZE - host_rsp_offset, 0x140);
     }
 }
