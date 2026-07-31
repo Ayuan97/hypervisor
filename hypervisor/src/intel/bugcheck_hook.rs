@@ -28,7 +28,6 @@ use {
             ept::paging::{AccessType, Ept},
             invept::invept_all_contexts,
         },
-        utils::{addresses::PhysicalAddress, nt::get_ntoskrnl_export},
     },
     core::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed},
     x86::current::paging::BASE_PAGE_SIZE,
@@ -65,78 +64,14 @@ pub static HOOK_SPURIOUS_COUNT: AtomicU64 = AtomicU64::new(0);
 /// cloak is permanently lifted (X=1) and we no longer intercept.
 static HOOK_LATCHED: AtomicBool = AtomicBool::new(false);
 
-const WATCH_LEN: u64 = 128; // same conservative window diag.rs uses
-
-/// Default: hook installation is SKIPPED. Opt in at compile time with
-/// `HV_ENABLE_ENTRY_HOOK=1 cargo build ...` when you specifically want the
-/// KeBugCheckEx-entered diagnostic and are willing to pay for it.
+/// KeBugCheckEx EPT-execute hook is permanently disabled.
 ///
-/// Why the flip (2026-07-13): the hook cloaks the entire 4 KiB page holding
-/// KeBugCheckEx and single-steps every neighbour function that also lives on
-/// that page. Under an EAC-driven workload that scales to ~1.5M spurious
-/// step-throughs per session (measured via HOOK_SPURIOUS_COUNT), each one
-/// costing an EPT-violation exit + MTF exit + two INVEPTs. That overhead is
-/// the leading suspect for the "HV alone + EAC = freeze inside minutes"
-/// pattern we've been chasing — CPUs sink into the step-through loop and
-/// starve IPI delivery until Windows watchdog can't cope.
-///
-/// The old default matched the tooling's ergonomics — "just build, hook
-/// works" — but the ergonomics aren't worth the freezes, and the CTL id
-/// 70-76 sentinels still return their "all zero" no-hit state when disabled
-/// so cpuid_ping doesn't need to know either way.
-const HOOK_DISABLED: bool = option_env!("HV_ENABLE_ENTRY_HOOK").is_none();
-
-/// Resolve KeBugCheckEx, split the containing 2 MiB EPT entry, and cloak
-/// the 4 KiB page (READ_WRITE only — no execute). Idempotent: if the
-/// address cannot be resolved or the page split fails, the hook is simply
-/// left disabled (HOOK_PAGE_PA stays 0). Never fatal to driver init.
-pub fn install(ept: &mut Ept) {
-    if HOOK_DISABLED {
-        log::info!("bugcheck_hook: HV_ENABLE_ENTRY_HOOK not set, install skipped");
-        return;
-    }
-    let addr = get_ntoskrnl_export("KeBugCheckEx");
-    if addr.is_null() {
-        log::warn!("bugcheck_hook: KeBugCheckEx resolution failed, hook disabled");
-        return;
-    }
-    let va = addr as usize as u64;
-    let pa = PhysicalAddress::pa_from_va(va);
-    if pa == 0 {
-        log::warn!("bugcheck_hook: PA resolution failed for VA {:#x}, hook disabled", va);
-        return;
-    }
-    let page_pa = pa & PAGE_MASK;
-
-    // The identity map covers 0..512 GiB with 2 MiB pages, so the page
-    // containing KeBugCheckEx is still a large mapping — split it first.
-    if let Err(e) = ept.split_2mb_to_4kb(page_pa, AccessType::READ_WRITE_EXECUTE) {
-        log::warn!(
-            "bugcheck_hook: split 2MB @ {:#x} failed ({:?}), hook disabled",
-            page_pa & !((2u64 << 20) - 1),
-            e
-        );
-        return;
-    }
-
-    // Now cloak the single 4 KiB page containing KeBugCheckEx: READ_WRITE
-    // (no EXECUTE). Any instruction fetch on this page will EPT-violate.
-    if let Err(e) = ept.set_page_access(page_pa, AccessType::READ_WRITE) {
-        log::warn!(
-            "bugcheck_hook: set_page_access(no-X) failed ({:?}), hook disabled",
-            e
-        );
-        return;
-    }
-
-    HOOK_PAGE_PA.store(page_pa, Relaxed);
-    HOOK_FN_START_VA.store(va, Relaxed);
-    HOOK_FN_END_VA.store(va.saturating_add(WATCH_LEN), Relaxed);
-    log::info!(
-        "bugcheck_hook: installed va={:#x} page_pa={:#x}",
-        va,
-        page_pa
-    );
+/// Cloaking the whole 4 KiB page and single-stepping every neighbour under
+/// EAC scaled to ~1.5M spurious step-throughs per session and was a leading
+/// freeze suspect. Sentinels (CTL 70-76) stay zero when the hook is absent.
+/// Re-enable only by restoring this install path in source — not by a flag.
+pub fn install(_ept: &mut Ept) {
+    log::info!("bugcheck_hook: install skipped (permanently disabled)");
 }
 
 /// True iff the given guest physical address falls on the cloaked page and

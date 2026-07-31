@@ -142,6 +142,11 @@ impl VmExit {
         // POST/CMOS ports; fatal paths retain explicit persistent breadcrumbs.
         diag::port80_vmexit(basic_reason);
 
+        // Freeze is instantaneous: persist entry-time state before any handler
+        // work that might never return. Finish-path writes are not freeze-safe.
+        // HANDLER_ACTIVE is already 1 from handler_enter above.
+        diag::handler_entry_persist(exit_reason as u64);
+
         if vm_entry_failure {
             use core::sync::atomic::Ordering::Relaxed;
             diag::EXIT_OTHER.fetch_add(1, Relaxed);
@@ -154,13 +159,12 @@ impl VmExit {
                 "VM-entry failure: reason={:#x} qual={:#x} rip={:#x} — halting CPU",
                 exit_reason, exit_qual, guest_rip
             );
-            // Layer 3: force-flush CMOS right before entering fatal loop so
-            // the post-freeze reboot reads back the *moment-before-crash*
-            // snapshot rather than up to 63 exits stale. port80_last will
-            // be the basic reason (0x01..=0x7F), handler_active bitmap
-            // will include this CPU, and the CMOS slot will pin this state
-            // permanently since fatal_vmx_failure_loop_pub() never returns.
+            // Force Layer 3 + Step4 CMOS before the non-returning halt so the
+            // hard-reset reader sees this failure, not a slot up to 63 exits
+            // stale. handler_entry_persist already ran above; force again with
+            // the fatal port80 stamp and active bitmap including this CPU.
             diag::port80(basic_reason as u8);
+            diag::cmos_sync_step4_state();
             diag::layer3_force_flush();
             crate::intel::vmlaunch::fatal_vmx_failure_loop_pub();
         }

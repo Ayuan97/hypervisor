@@ -108,11 +108,13 @@ kdmapper 映射的实例**不能通过 unload.bat 卸载**，只能重启。
 
 | 变量 | 作用 |
 |---|---|
-| `HV_NO_SEAL=1` | 启动流程不 seal 诊断通道；`cpuid_ping` 保留 counters/controls 输出，`phys_test monitor` 能工作 |
-| `HV_BOOT_STOP_STAGE=N` | **构建时** 变量：让 driver 在 boot stage N 提前停下，便于隔离启动流程失败点。用 `scripts\build_stage.bat N` 重建，产物 `matrix_stage_N.sys` |
-| `HV_USER_CLIENT_READS=1` | 允许用户态 client-read 通道（普通生产环境保持 0，即禁用） |
-| `HV_DRIVER=<path>` | 覆盖 `start_hv.bat` 默认的 driver 路径 |
-| `HV_TRANSPARENT=1` | **构建时**：CPUID 完全透传（诊断模式，无 masking），只用于隔离测试 |
+| `HV_NO_SEAL=1` | 运行时：启动不 seal 诊断通道 |
+| `HV_BOOT_STOP_STAGE=N` | 调试构建：boot stage 提前停下（`build_stage.bat`） |
+| `HV_USER_CLIENT_READS=1` | 产物变体：用户态 client-read（`build_client.bat`；release 保持 0） |
+| `HV_DRIVER=<path>` | 运行时：覆盖 `start_hv.bat` driver 路径 |
+| `HV_TRANSPARENT=1` / `HV_MINIMAL=1` / `HV_NO_EPT=1` / `HV_SKIP_CPU` / `HV_LOCAL_DIAG=1` | 仅调试/隔离构建 |
+
+生产功能（NMI passthrough、PT conceal、LBR、CPUID/MSR 隐藏等）**不设开关**。
 
 ### 日志与监控
 

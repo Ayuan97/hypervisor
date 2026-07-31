@@ -281,18 +281,11 @@ impl Vmcs {
         let requested_entry_ctl = requested_entry_controls();
         let exit_ctl = required_exit_controls();
         let requested_exit_ctl = requested_exit_controls();
-        let pinbased_ctl: u64 = if minimal_mode() || nmi_passthrough_mode() {
-            // Pass NMIs directly to the guest IDT[2] instead of exiting. This
-            // matches bare-metal behaviour so an EAC self-NMI probe measuring
-            // NMI-delivery latency cannot tell an HV is in the middle, and
-            // eliminates the tight VM-exit loop that the 2026-07-09 R6 EAC
-            // session saw (19+ NMIs before freeze). VIRTUAL_NMIS is coupled
-            // to NMI_EXITING per SDM, so both are cleared together.
-            0
-        } else {
-            (vmcs::control::PinbasedControls::NMI_EXITING.bits()
-                | vmcs::control::PinbasedControls::VIRTUAL_NMIS.bits()) as u64
-        };
+        // NMI passthrough: deliver NMIs to guest IDT[2] without VM-exit.
+        // Matches bare metal for latency probes and avoids the NMI exit storm
+        // observed before the 2026-07-09 R6 freeze. No build switch — this is
+        // the production pin-based policy.
+        let pinbased_ctl: u64 = 0;
         // Do not request the VMX preemption timer. Its active freeze response
         // is disabled, while periodic exits add clock-interrupt latency.
         use crate::intel::diag_trace as dt;
@@ -494,51 +487,25 @@ impl Vmcs {
 }
 
 fn required_primary_controls() -> u64 {
-    let bits = vmcs::control::PrimaryControls::SECONDARY_CONTROLS.bits()
+    (vmcs::control::PrimaryControls::SECONDARY_CONTROLS.bits()
         | vmcs::control::PrimaryControls::USE_MSR_BITMAPS.bits()
-        | vmcs::control::PrimaryControls::USE_TSC_OFFSETTING.bits();
-    // MWAIT/MONITOR exiting: clamp guest package C-state hints to C1 in
-    // the exit handler, working around Intel Raptor Lake erratum
-    // RPL038/044 (C6/C8 entry/exit MCE hang). Skipped in minimal_mode /
-    // HV_NO_CSTATE_CLAMP so we can A/B test whether the clamp is needed.
-    // MWAIT/MONITOR/HLT clamp is dead — kept the env-var check as a
-    // compile-time knob for future re-experiments, but the branch
-    // body is intentionally empty because every enabled combination
-    // crashed the box inside a couple of minutes today.
-    let _ = option_env!("HV_NO_CSTATE_CLAMP");
-    bits as u64
+        | vmcs::control::PrimaryControls::USE_TSC_OFFSETTING.bits()) as u64
 }
 
 fn requested_pinbased_controls() -> u64 {
-    if minimal_mode() || nmi_passthrough_mode() {
-        0
-    } else {
-        (vmcs::control::PinbasedControls::NMI_EXITING.bits()
-            | vmcs::control::PinbasedControls::VIRTUAL_NMIS.bits()) as u64
-    }
+    // Always NMI passthrough; never request external-interrupt exiting or
+    // the preemption timer from this surface.
+    0
 }
 
+/// Debug-only: `HV_NO_EPT=1` or `HV_MINIMAL=1` skips EPT for isolation builds.
 fn ept_disabled() -> bool {
     minimal_mode() || option_env!("HV_NO_EPT").map_or(false, |v| v == "1")
 }
 
+/// Debug-only: minimal VMX control surface for isolation tests.
 fn minimal_mode() -> bool {
     option_env!("HV_MINIMAL").map_or(false, |v| v == "1")
-}
-
-/// P3.4 (2026-07-09): when true, don't request NMI-exiting / virtual-NMI
-/// so NMIs sent to the guest never cause a VM-exit. This defeats
-/// anti-cheat probes that measure NMI-delivery latency and stops the
-/// host-side NMI storm we observed just before the R6 EAC freeze.
-///
-/// Default enabled. Set `HV_NMI_EXIT=1` at build time to keep the
-/// legacy behaviour where every NMI causes a VM-exit and gets injected
-/// back into the guest by `check_pending_nmi()` (useful for A/B tests).
-fn nmi_passthrough_mode() -> bool {
-    match option_env!("HV_NMI_EXIT") {
-        Some(v) => v != "1",
-        None => true,
-    }
 }
 
 fn required_secondary_controls() -> u64 {
@@ -725,28 +692,9 @@ const CPUID_7_EBX_SGX: u32 = 1 << 2;
 const CPUID_7_EBX_INTEL_PT: u32 = 1 << 25;
 
 fn pt_vmx_concealment_mask() -> u8 {
-    pt_vmx_concealment_mask_from_env(
-        option_env!("HV_PT_CONCEAL_MASK"),
-        option_env!("HV_ENABLE_PT_CONCEAL"),
-    )
-}
-
-fn pt_vmx_concealment_mask_from_env(mask: Option<&str>, legacy_enable: Option<&str>) -> u8 {
-    if legacy_enable == Some("1") {
-        return PT_CONCEAL_ALL;
-    }
-
-    match mask {
-        Some("0") => 0,
-        Some("1") => PT_CONCEAL_SECONDARY,
-        Some("2") => PT_CONCEAL_EXIT,
-        Some("3") => PT_CONCEAL_SECONDARY | PT_CONCEAL_EXIT,
-        Some("4") => PT_CONCEAL_ENTRY,
-        Some("5") => PT_CONCEAL_SECONDARY | PT_CONCEAL_ENTRY,
-        Some("6") => PT_CONCEAL_EXIT | PT_CONCEAL_ENTRY,
-        Some("7") => PT_CONCEAL_ALL,
-        _ => PT_CONCEAL_ALL,
-    }
+    // Always request the full secondary/entry/exit PT concealment set when
+    // the CPU supports it. Partial masks were only useful for A/B isolation.
+    PT_CONCEAL_ALL
 }
 
 fn host_sgx_feature_bits() -> (u32, u32) {
@@ -948,24 +896,12 @@ mod tests {
     }
 
     #[test]
-    fn pt_vmx_concealment_can_be_disabled_by_env() {
+    fn requested_controls_enable_full_pt_vmx_concealment() {
         let secondary_pt = vmcs::control::SecondaryControls::CONCEAL_VMX_FROM_PT.bits() as u64;
         let entry_pt = vmcs::control::EntryControls::CONCEAL_VMX_FROM_PT.bits() as u64;
         let exit_pt = vmcs::control::ExitControls::CONCEAL_VMX_FROM_PT.bits() as u64;
 
-        assert_eq!(pt_vmx_concealment_mask_from_env(Some("0"), None), 0);
-        assert_eq!(optional_secondary_controls_for_pt_mask(0) & secondary_pt, 0);
-        assert_eq!(optional_entry_controls_for_pt_mask(0) & entry_pt, 0);
-        assert_eq!(optional_exit_controls_for_pt_mask(0) & exit_pt, 0);
-    }
-
-    #[test]
-    fn requested_controls_enable_pt_vmx_concealment_by_default() {
-        let secondary_pt = vmcs::control::SecondaryControls::CONCEAL_VMX_FROM_PT.bits() as u64;
-        let entry_pt = vmcs::control::EntryControls::CONCEAL_VMX_FROM_PT.bits() as u64;
-        let exit_pt = vmcs::control::ExitControls::CONCEAL_VMX_FROM_PT.bits() as u64;
-
-        assert_eq!(pt_vmx_concealment_mask_from_env(None, None), PT_CONCEAL_ALL);
+        assert_eq!(pt_vmx_concealment_mask(), PT_CONCEAL_ALL);
         assert_eq!(requested_secondary_controls() & secondary_pt, secondary_pt);
         assert_eq!(requested_entry_controls() & entry_pt, entry_pt);
         assert_eq!(requested_exit_controls() & exit_pt, exit_pt);
@@ -980,18 +916,10 @@ mod tests {
     }
 
     #[test]
-    fn pt_vmx_concealment_mask_can_select_individual_controls() {
+    fn pt_vmx_concealment_helpers_honor_partial_masks_for_readiness() {
         let secondary_pt = vmcs::control::SecondaryControls::CONCEAL_VMX_FROM_PT.bits() as u64;
         let entry_pt = vmcs::control::EntryControls::CONCEAL_VMX_FROM_PT.bits() as u64;
         let exit_pt = vmcs::control::ExitControls::CONCEAL_VMX_FROM_PT.bits() as u64;
-
-        assert_eq!(pt_vmx_concealment_mask_from_env(None, None), PT_CONCEAL_ALL);
-        assert_eq!(pt_vmx_concealment_mask_from_env(Some("0"), None), 0);
-        assert_eq!(pt_vmx_concealment_mask_from_env(Some("1"), None), 1);
-        assert_eq!(pt_vmx_concealment_mask_from_env(Some("2"), None), 2);
-        assert_eq!(pt_vmx_concealment_mask_from_env(Some("4"), None), 4);
-        assert_eq!(pt_vmx_concealment_mask_from_env(Some("7"), None), 7);
-        assert_eq!(pt_vmx_concealment_mask_from_env(None, Some("1")), 7);
 
         assert_eq!(
             optional_secondary_controls_for_pt_mask(1) & secondary_pt,

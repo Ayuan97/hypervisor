@@ -1128,7 +1128,7 @@ fn main() {
     let raw_e2 = hv_cmd(CMD_GET_CTL, 84);
     println!("\n=== C-state clamp (MWAIT/MONITOR/HLT + MSR 0xE2) ===");
     if mwait_exits == u64::MAX {
-        println!("  clamp NOT compiled in (HV_NO_CSTATE_CLAMP set at build)");
+        println!("  MWAIT/HLT intercept inactive (idle clamp not armed)");
     } else {
         println!("  MWAIT exits total:      {}", mwait_exits);
         println!("  MWAIT clamped to C1:    {}  ({}% of exits)",

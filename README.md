@@ -83,17 +83,22 @@ HV 保持所有逻辑处理器启用。每个处理器仍有独立、固定亲�
 
 如果 `start_hv.bat` 提示 HV 已 active，**不要**重复映射新 build，必须重启后再加载。
 
-### 环境变量
+### 环境变量（仅调试 / 产物变体）
 
-- `HV_NO_SEAL=1`：启动前设置，跳过 seal，保留完整 diag/counters/monitor 能力（用于 `phys_test monitor`、`udp_hv_monitor` 等）。
-- `HV_BOOT_STOP_STAGE=N`：**构建时**变量，driver 在 boot stage N 停下（配合 `scripts\build_stage.bat`）。
-- `HV_TRANSPARENT=1`：**构建时**，透传普通硬件 feature leaves；hypervisor、诊断和被隐藏 capability leaves 仍保持为 0，只用于隔离测试。
-- `HV_USER_CLIENT_READS=1`：允许用户态 client-read 通道；生产环境保持 0。
-- `HV_ENABLE_APERF_SHADOW=1`：拦截并按 host handler TSC 时间补偿 APERF/MPERF；默认 0。
-- `HV_LOCAL_DIAG=1`：构建时启用本地文件诊断 worker；使用 `D:\rust-cheat\scripts\build_local_diag.bat` 构建专用版本，运行时写入 `D:\rust-cheat\hv_diag_live.log`。日志文件在 VMX 初始化前创建、覆盖并同步写入首条 `boot_stage` 记录。
-- 本地诊断版正常运行时只双击 `D:\rust-cheat\scripts\start_local_diag.bat`；它会先清空并启动两套本地监控，再加载 HV 和打开日志查看器。
-- LBR 栈保存/恢复默认开启：guest 看到的是自己的 LBR 状态，不需要构建开关。
-- `HV_DRIVER=<path>`：覆盖 `start_hv.bat` 默认的 driver 路径。
+生产功能不设开关：NMI passthrough、PT conceal、LBR 快照、CPUID/MSR 隐藏一律常开或按既定策略固化。
+
+| 变量 | 类型 | 作用 |
+|---|---|---|
+| `HV_NO_SEAL=1` | 运行时 | 启动不 seal，保留完整 diag（`phys_test monitor` 等） |
+| `HV_BOOT_STOP_STAGE=N` | 构建 | boot stage 提前停下（`build_stage.bat`） |
+| `HV_TRANSPARENT=1` | 构建 | CPUID 不掩码（隔离测试） |
+| `HV_MINIMAL=1` / `HV_NO_EPT=1` | 构建 | 最小 VMX / 关 EPT（隔离） |
+| `HV_SKIP_CPU=N` | 构建 | 跳过某 CPU（调试） |
+| `HV_USER_CLIENT_READS=1` | 构建 | 用户态 client-read 产物（`build_client.bat`） |
+| `HV_LOCAL_DIAG=1` | 构建 | 本地文件诊断 worker |
+| `HV_DRIVER=<path>` | 运行时 | 覆盖 `start_hv.bat` driver 路径 |
+
+本地诊断：`D:\rust-cheat\scripts\start_local_diag.bat`。
 
 ## 自检要求
 
@@ -154,23 +159,24 @@ CMOS freeze snapshot（`CMD_READ_CMOS_FREEZE`，扩展 CMOS 0x00-0x0B + 传统 C
 | VMX 指令探针 | 用户态注入 `#UD`；CPL0 shadow VMXE=0 时 `#UD`；shadow VMXE=1 时 VMfailInvalid |
 | SGX ENCLS/ENCLV | 可用时退出并注入 `#UD`；无法安全隐藏 SGX host 时拒绝加载 |
 | Intel PT VMX 痕迹 | 支持时启用 VMX concealment；不完整则拒绝 Intel PT host |
-| RDTSC/RDTSCP | TSC_OFFSET 保持 0；RDTSCP 的 TSC_AUX 与 guest MSR shadow 默认一致。`HV_ENABLE_OPHION=1` 仍仅用于独立的实验性 trap-next-RDTSC 时序补偿 |
+| RDTSC/RDTSCP | TSC_OFFSET 保持 0；不伪装紧随 CPUID 的 RDTSC（避免与 APERF 不一致） |
 | XSETBV/INVD/WBINVD | 按 CPL 注入原生一致异常 |
 | EPT/VPID invalidation | VMXON 后、VMXOFF 前执行 |
 | 首次 VMLAUNCH 失败 | 恢复调用栈与非易失寄存器后返回错误 |
 | host IDT patch | 全表覆盖为 default handler，vector 2/8/13/14/18 单独 patch，first-fault breadcrumb 记录第一位 fault 现场 |
 | 游戏前诊断通道 | 默认 seal；用户态 PING 不返回 magic，拒绝 counters/controls，只允许重复 seal 与 CPL0 DEVIRTUALIZE |
-| **LBR 一致性** | 默认保存/恢复 guest LBR 栈；仅在 guest DEBUGCTL.LBR=1 时承担快照开销 |
-| **APERF/MPERF 补偿** | `HV_ENABLE_APERF_SHADOW=1` 时按 host handler TSC 时间比例扣除；默认关闭高频拦截 |
+| **LBR 一致性** | guest DEBUGCTL.LBR=1 时保存/恢复 LBR 栈（非构建开关） |
+| **APERF/MPERF** | 原生透传，不拦截 |
+| **NMI** | 固定 passthrough（不 exit） |
 | **IA32_EFER SCE 虚拟化** | **未防**（清单第 13 项，延迟检测） |
-| **devirtualize 路径** | 完整 teardown（invept+invvpid+vmxoff+恢复 FS/GS/GDT/IDT/CR3）；已注册 `KeRegisterBugCheckCallback`，仅用于记录 bugcheck 证据，不在 callback 内执行 VMX teardown |
+| **devirtualize 路径** | 完整 teardown；不注册 `KeRegisterBugCheckCallback`（隐蔽） |
 
 ## 仍需实机重启验证
 
 - 新 build 加载后 `tools\probe_test.exe` 必须通过，特别是用户态 token `VMCALL` 应为 `#UD`。
 - `tools\cpuid_ping.exe` 必须显示 masking OK、TSC offsetting enabled。
 - 启动游戏前建议先跑 `tools\phys_test.exe monitor` 观察最后 VM-exit 计数。
-- 冻结场景后，用 `HV_NO_SEAL=1` 重启加载，读上表 CTL id 30-56 判断根因。
+- **冻结是瞬间的，冻后无法再写任何诊断。** 协议与判决表见 `docs/freeze-postmortem.md`（死前 entry 落稳 → 硬复位 → 读 CMOS / local_diag）。
 
 ## 文档索引
 

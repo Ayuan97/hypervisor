@@ -5,17 +5,12 @@
 use {
     crate::error::HypervisorError,
     alloc::vec::Vec,
-    core::{
-        cell::UnsafeCell,
-        sync::atomic::{AtomicBool, AtomicU64, Ordering},
-    },
+    core::sync::atomic::AtomicU64,
     wdk_sys::{
         ntddk::{
-            KeDeregisterBugCheckCallback, KeLowerIrql, KeRegisterBugCheckCallback,
-            KeStackAttachProcess, KeUnstackDetachProcess, MmGetSystemRoutineAddress,
+            KeLowerIrql, KeStackAttachProcess, KeUnstackDetachProcess, MmGetSystemRoutineAddress,
         },
-        _KAPC_STATE, _KBUGCHECK_CALLBACK_RECORD, _LIST_ENTRY, KIRQL, PEPROCESS, PKBUGCHECK_CALLBACK_RECORD,
-        PRKPROCESS, PUCHAR, PVOID, UNICODE_STRING, ULONG,
+        _KAPC_STATE, KIRQL, PEPROCESS, PRKPROCESS, PVOID, UNICODE_STRING,
     },
 };
 
@@ -136,125 +131,16 @@ pub fn init_kebugcheckex_sentinel() {
     );
 }
 
-/// Non-paged storage for the bug-check callback record. `KeRegisterBugCheckCallback`
-/// requires this to live in resident memory, so a static is the correct fit —
-/// the driver's data section is never paged out. Access is single-threaded
-/// (only from DriverEntry / driver_unload) so `UnsafeCell` is enough.
-#[repr(C)]
-struct BugCheckCallbackCell(UnsafeCell<_KBUGCHECK_CALLBACK_RECORD>);
-unsafe impl Sync for BugCheckCallbackCell {}
-
-static BUGCHECK_CALLBACK_RECORD: BugCheckCallbackCell = BugCheckCallbackCell(UnsafeCell::new(
-    _KBUGCHECK_CALLBACK_RECORD {
-        Entry: _LIST_ENTRY {
-            Flink: core::ptr::null_mut(),
-            Blink: core::ptr::null_mut(),
-        },
-        CallbackRoutine: None,
-        Buffer: core::ptr::null_mut(),
-        Length: 0,
-        Component: core::ptr::null_mut(),
-        Checksum: 0,
-        State: 0,
-    },
-));
-
-static BUGCHECK_CALLBACK_REGISTERED: AtomicBool = AtomicBool::new(false);
-
-/// Component name shown by the `!bugdump` debugger extension. Static byte slice
-/// with a trailing NUL so the pointer is stable and null-terminated as required
-/// by Windows.
-const BUGCHECK_COMPONENT: &[u8] = b"matrix\0";
-
-/// Called by Windows when the system enters bug-check processing. IRQL is
-/// HIGH_LEVEL, other CPUs are already suspended, so we cannot devirtualise the
-/// whole system from here. The value is diagnostic: mark that a bug check
-/// actually reached callback dispatch and stash a CMOS breadcrumb that
-/// survives the hard reboot users typically do after a freeze.
-///
-/// Per Task 3 subagent analysis: this callback fires too late to save the
-/// system — the "止血带" (bandaid) role is all we get. If future EAC variants
-/// re-trigger bug checks it at least tells us the path executed.
-unsafe extern "C" fn bugcheck_callback(_buffer: PVOID, _length: ULONG) {
-    crate::intel::diag::note_bugcheck_callback_fired();
-}
-
-/// Register the bug-check callback. **Stealth-gated no-op.**
-///
-/// The original implementation called `KeRegisterBugCheckCallback` and left
-/// a record in `nt!KeBugCheckCallbackListHead` bearing a `Component =
-/// "matrix"` string. Any anti-cheat that walks that list (trivial: scan
-/// non-paged pool, follow LIST_ENTRY.Flink) has an instant HV signature.
-/// The callback also fires strictly after crash-dump write, so it only
-/// tells us bug check reached its tail — the EPT-execute hook we
-/// installed on `nt!KeBugCheckEx` (see `intel::bugcheck_hook`) covers the
-/// same signal at bug-check ENTRY, before we register any visible state.
-///
-/// Setting `HV_ENABLE_BUGCHECK_CALLBACK=1` at build time restores the old
-/// registration for developers who need callback dispatch to fire.
-const REGISTRATION_ENABLED: bool = build_flag_enabled(option_env!("HV_ENABLE_BUGCHECK_CALLBACK"));
-
-const fn build_flag_enabled(value: Option<&str>) -> bool {
-    matches!(value, Some(v) if v.as_bytes().len() == 1 && v.as_bytes()[0] == b'1')
-}
-
+/// Never register `KeRegisterBugCheckCallback` — a list entry with component
+/// string is an instant HV signature. Bugcheck evidence uses the RIP sentinel.
 pub fn register_bugcheck_callback() {
-    if !REGISTRATION_ENABLED {
-        log::info!("KeRegisterBugCheckCallback skipped for stealth (set HV_ENABLE_BUGCHECK_CALLBACK=1 to enable)");
-        return;
-    }
-    if BUGCHECK_CALLBACK_REGISTERED.load(Ordering::Acquire) {
-        return;
-    }
-    let record = BUGCHECK_CALLBACK_RECORD.0.get();
-    unsafe {
-        (*record).CallbackRoutine = Some(bugcheck_callback);
-        (*record).Buffer = core::ptr::null_mut();
-        (*record).Length = 0;
-        (*record).Component = BUGCHECK_COMPONENT.as_ptr() as PUCHAR;
-        (*record).State = 0;
-    }
-    let ok = unsafe {
-        KeRegisterBugCheckCallback(
-            record as PKBUGCHECK_CALLBACK_RECORD,
-            Some(bugcheck_callback),
-            core::ptr::null_mut(),
-            0,
-            BUGCHECK_COMPONENT.as_ptr() as PUCHAR,
-        )
-    };
-    if ok != 0 {
-        BUGCHECK_CALLBACK_REGISTERED.store(true, Ordering::Release);
-        log::info!("KeRegisterBugCheckCallback OK");
-    } else {
-        log::error!("KeRegisterBugCheckCallback failed");
-    }
+    log::info!("KeRegisterBugCheckCallback skipped (permanently disabled for stealth)");
 }
 
-/// Deregister the bug-check callback. Must run before driver unload —
-/// leaving a stale callback in the kernel list would fire into freed memory.
-///
-/// Returns true iff the callback was successfully deregistered (or was not
-/// registered in the first place). A false return means the kernel refused
-/// deregistration and the callback record is still linked in — proceeding
-/// with driver unload in that state is dangerous.
+/// Always succeeds: we never register a callback, so there is nothing to
+/// unlink on unload.
 pub fn deregister_bugcheck_callback() -> bool {
-    if !BUGCHECK_CALLBACK_REGISTERED.load(Ordering::Acquire) {
-        return true;
-    }
-    let record = BUGCHECK_CALLBACK_RECORD.0.get();
-    let ok = unsafe { KeDeregisterBugCheckCallback(record as PKBUGCHECK_CALLBACK_RECORD) };
-    if ok != 0 {
-        BUGCHECK_CALLBACK_REGISTERED.store(false, Ordering::Release);
-        true
-    } else {
-        // Keep REGISTERED=true so any subsequent unload attempts try again
-        // rather than assuming the record is safely unlinked.
-        log::error!(
-            "KeDeregisterBugCheckCallback failed; bug-check record still linked into kernel list"
-        );
-        false
-    }
+    true
 }
 
 #[link(name = "ntoskrnl")]
@@ -271,15 +157,4 @@ extern "system" {
     pub fn RtlCopyMemory(destination: *mut u64, source: *mut u64, length: usize);
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
 
-    #[test]
-    fn bugcheck_callback_flag_requires_explicit_one() {
-        assert!(build_flag_enabled(Some("1")));
-        assert!(!build_flag_enabled(None));
-        assert!(!build_flag_enabled(Some("0")));
-        assert!(!build_flag_enabled(Some("true")));
-    }
-}

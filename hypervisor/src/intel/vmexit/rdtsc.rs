@@ -32,11 +32,13 @@ pub fn handle_rdtsc(
     guest_registers: &mut GuestRegisters,
     vmx: &mut crate::intel::vmx::Vmx,
 ) -> ExitType {
+    // RDTSC exiting is not armed in production. Keep a defensive clear so a
+    // stale per-VCPU trap flag cannot spoof TSC after a partial experiment.
     if vmx.cpuid_entry_tsc != 0 {
-        handle_rdtsc_spoofed(guest_registers, vmx)
-    } else {
-        handle_rdtsc_with_offset(guest_registers, || unsafe { rdtsc() }, vmx.tsc_offset)
+        vmx.cpuid_entry_tsc = 0;
+        super::cpuid::disable_rdtsc_exiting();
     }
+    handle_rdtsc_with_offset(guest_registers, || unsafe { rdtsc() }, vmx.tsc_offset)
 }
 
 pub fn handle_rdtscp(
@@ -44,49 +46,18 @@ pub fn handle_rdtscp(
     vmx: &mut crate::intel::vmx::Vmx,
 ) -> ExitType {
     if vmx.cpuid_entry_tsc != 0 {
-        guest_registers.rcx = vmx.guest_tsc_aux() as u64;
-        handle_rdtsc_spoofed(guest_registers, vmx)
-    } else {
-        let guest_aux = vmx.guest_tsc_aux();
-        handle_rdtscp_with_offset(
-            guest_registers,
-            || {
-                let (tsc, _) = unsafe { rdtscp() };
-                (tsc, guest_aux)
-            },
-            vmx.tsc_offset,
-        )
+        vmx.cpuid_entry_tsc = 0;
+        super::cpuid::disable_rdtsc_exiting();
     }
-}
-
-pub const SPOOF_WINDOW: u64 = 10_000;
-
-fn handle_rdtsc_spoofed(
-    guest_registers: &mut GuestRegisters,
-    vmx: &mut crate::intel::vmx::Vmx,
-) -> ExitType {
-    use super::cpuid::{cpuid_bare_metal_cost, VMEXIT_ENTRY_OVERHEAD};
-    let now = unsafe { x86::time::rdtsc() };
-    let elapsed = now.wrapping_sub(vmx.cpuid_entry_tsc);
-    vmx.cpuid_entry_tsc = 0;
-    super::cpuid::disable_rdtsc_exiting();
-    if elapsed > SPOOF_WINDOW {
-        write_tsc(guest_registers, now.wrapping_add(vmx.tsc_offset));
-        return ExitType::IncrementRIP;
-    }
-    let vmcs_tsc_offset =
-        crate::intel::support::vmread_checked(x86::vmx::vmcs::control::TSC_OFFSET_FULL)
-            .unwrap_or(0);
-    // cpuid_entry_tsc was captured AFTER VM-exit transition (~600 cycles).
-    // Subtract VMEXIT_ENTRY_OVERHEAD to approximate guest-side TSC at CPUID time,
-    // then add bare-metal CPUID cost so guest sees: rdtsc_after - rdtsc_before ≈ 120.
-    let spoofed = now
-        .wrapping_sub(elapsed)
-        .wrapping_sub(VMEXIT_ENTRY_OVERHEAD)
-        .wrapping_add(cpuid_bare_metal_cost())
-        .wrapping_add(vmcs_tsc_offset);
-    write_tsc(guest_registers, spoofed);
-    ExitType::IncrementRIP
+    let guest_aux = vmx.guest_tsc_aux();
+    handle_rdtscp_with_offset(
+        guest_registers,
+        || {
+            let (tsc, _) = unsafe { rdtscp() };
+            (tsc, guest_aux)
+        },
+        vmx.tsc_offset,
+    )
 }
 
 fn handle_rdtsc_with_offset<F>(

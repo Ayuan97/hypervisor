@@ -439,6 +439,11 @@ pub fn port80_host_fault(vector: u8) {
 // Answers observation rule #3 in hypervisor/CLAUDE.md: distinguish
 // "HV stuck" from "guest stuck" without needing a working IDT or COM logger.
 //
+// Freeze-safe: bit is set at entry and only cleared on Drop (normal return).
+// If the machine freezes mid-handler, the bit stays 1 and Layer 3 mirrors it
+// on the next entry_persist of *other* CPUs — or, if this CPU dies after its
+// own entry_persist already flushed, the dual-buffer slot already has bit=1.
+//
 // Read via CTL id 102 (bitmap for CPU 0-63) and 103 (popcount).
 // ---------------------------------------------------------------------------
 pub static HANDLER_ACTIVE: [AtomicU8; MAX_TRACKED_CPUS] =
@@ -456,6 +461,7 @@ impl Drop for HandlerGuard {
 }
 
 /// Mark the current CPU as inside handle_vmexit. Drop clears the flag.
+/// Pair with `handler_entry_persist` once `exit_reason` is known.
 #[inline(always)]
 pub fn handler_enter() -> HandlerGuard {
     let cpu = super::host_idt::current_cpu_index();
@@ -745,10 +751,12 @@ pub fn cmos_load_step4_baseline() {
     }
 }
 
-/// Snapshot the freeze-critical Step 1-4 fields into extended CMOS. Called
-/// on every VM-exit return path via `watchdog_handler_finish`; writes only
-/// when a value actually changed, so the port-I/O cost is negligible during
-/// normal runtime and only kicks in when something interesting fires.
+/// Snapshot the freeze-critical Step 1-4 fields into extended CMOS.
+///
+/// **Must run on handler entry (and on event paths), never only on finish.**
+/// Freeze is instantaneous: if the CPU dies mid-handler, finish never runs
+/// and a finish-only sync loses the last state. Writes only when a value
+/// actually changed, so normal port-I/O cost stays negligible.
 #[inline]
 pub fn cmos_sync_step4_state() {
     // Ensure the CMOS_LAST_* shadows reflect the actual on-disk CMOS bytes
@@ -866,6 +874,9 @@ pub fn observe_guest_rip_for_bugcheck(guest_rip: u64, guest_rcx: u64) {
         KEBUGCHECKEX_HIT_RIP.store(guest_rip, Relaxed);
         KEBUGCHECKEX_HIT_TSC.store(rdtsc_now(), Relaxed);
         KEBUGCHECKEX_HIT_ARG0.store(guest_rcx, Relaxed);
+        // Persist immediately: freeze after this point never reaches the next
+        // VM-exit entry, so a deferred entry-only sync would lose the hit.
+        cmos_sync_step4_state();
     }
 }
 static HANDLER_START_TSC: [AtomicU64; MAX_TRACKED_CPUS] = [ZERO_U64; MAX_TRACKED_CPUS];
@@ -876,7 +887,6 @@ static HANDLER_SLOW_COUNT: [AtomicU64; MAX_TRACKED_CPUS] = [ZERO_U64; MAX_TRACKE
 static HANDLER_LAST_SLOW_REASON: [AtomicU64; MAX_TRACKED_CPUS] = [ZERO_U64; MAX_TRACKED_CPUS];
 static HANDLER_LAST_SLOW_RIP: [AtomicU64; MAX_TRACKED_CPUS] = [ZERO_U64; MAX_TRACKED_CPUS];
 static HANDLER_LAST_SLOW_DELTA: [AtomicU64; MAX_TRACKED_CPUS] = [ZERO_U64; MAX_TRACKED_CPUS];
-static HOST_TSC_ACCUM: [AtomicU64; MAX_TRACKED_CPUS] = [ZERO_U64; MAX_TRACKED_CPUS];
 
 /// Record VM-exit handler start. Called from `handle_vmexit` prologue with
 /// the TSC snapshot and current exit reason (from VMCS). Same CPU can call
@@ -888,9 +898,36 @@ pub fn watchdog_handler_start(tsc: u64, exit_reason: u64) {
     HANDLER_LAST_EXIT_REASON[cpu].store(exit_reason, Relaxed);
 }
 
+/// Freeze-survivable breadcrumbs that must run at **handler entry**, after
+/// `handler_enter` (so Layer 4 `HANDLER_ACTIVE` is already 1) and after
+/// `exit_reason` is known.
+///
+/// Freeze is instantaneous: nothing runs after the machine dies. Anything
+/// written only on finish is lost if the CPU stalls mid-handler. This path
+/// therefore:
+/// 1. Publishes `LAST_EXIT_REASON` for Layer 3 / tools
+/// 2. Syncs Step 4 CMOS on change (bugcheck hits / first-fault / totals)
+/// 3. Periodically dual-buffers Layer 3 (active bitmap + last exit)
+/// 4. Periodically / on rare exits flushes Layer 6 per-CPU last reason
+///
+/// Call once per VM-exit as early as possible; safe to call only from
+/// VMX-root on the current CPU.
+#[inline]
+pub fn handler_entry_persist(exit_reason: u64) {
+    LAST_EXIT_REASON.store(exit_reason, Relaxed);
+    // Change-detect CMOS I/O — cheap when nothing new has fired.
+    cmos_sync_step4_state();
+    // Dual-buffer Ext CMOS every N exits (internal interval gate).
+    layer3_maybe_flush();
+    // Per-CPU last reason + rare-exit ring (internal interval / rare gate).
+    snap_flush(exit_reason);
+}
+
 /// Compute handler duration and update per-CPU watchdog counters. Called
-/// right before VMRESUME (e.g. from `check_pending_nmi`) so the delta
-/// captures the entire time in host mode for this VM-exit.
+/// right before VMRESUME so the delta captures host time for this exit.
+///
+/// **Does not write CMOS.** Persistence is entry-only (`handler_entry_persist`)
+/// plus event-time paths (`observe_guest_rip_for_bugcheck` first hit).
 #[inline]
 pub fn watchdog_handler_finish(guest_rip: u64) {
     let cpu = rdtscp_aux() as usize % MAX_TRACKED_CPUS;
@@ -900,9 +937,6 @@ pub fn watchdog_handler_finish(guest_rip: u64) {
     }
     let now = rdtsc_now();
     let delta = now.wrapping_sub(start);
-    if option_env!("HV_ENABLE_APERF_SHADOW").map_or(false, |v| v == "1") {
-        HOST_TSC_ACCUM[cpu].fetch_add(delta, Relaxed);
-    }
     let reason = HANDLER_LAST_EXIT_REASON[cpu].load(Relaxed);
     // Update per-CPU max (best-effort; racy across nested exits).
     if delta > HANDLER_MAX_DELTA[cpu].load(Relaxed) {
@@ -916,21 +950,9 @@ pub fn watchdog_handler_finish(guest_rip: u64) {
         HANDLER_LAST_SLOW_DELTA[cpu].store(delta, Relaxed);
     }
     // Clear start so nested/spurious calls do not double-count.
+    // HANDLER_ACTIVE is cleared by HandlerGuard::drop on return — if freeze
+    // happens mid-handler, the bit stays 1 (correct "died in HV" signal).
     HANDLER_START_TSC[cpu].store(0, Relaxed);
-
-    // Persist freeze-critical Step 1-4 state to CMOS so a hard reboot can
-    // still recover the "who died first" answer we lost on 2026-07-09.
-    cmos_sync_step4_state();
-}
-
-/// TSC cycles spent in the VM-exit handler on a logical CPU. Used by the
-/// optional APERF/MPERF shadow to remove host handler time from guest reads.
-#[inline]
-pub(super) fn host_tsc_accum(cpu: usize) -> u64 {
-    if cpu >= MAX_TRACKED_CPUS {
-        return 0;
-    }
-    HOST_TSC_ACCUM[cpu].load(Relaxed)
 }
 
 /// Read one field of watchdog state for a given CPU.
@@ -1321,8 +1343,8 @@ pub fn snap_capture_prev_boot() {
     snap_capture_prev_rare();
 }
 
-/// Optional persistent snapshot helper. It is intentionally not called from
-/// the common VM-exit prologue; callers must explicitly opt into CMOS I/O.
+/// Layer 6: periodic / rare-exit CMOS snapshot. Invoked from
+/// `handler_entry_persist` so pre-freeze state survives hard reset.
 #[inline]
 pub fn snap_flush(exit_reason: u64) {
     let cpu = super::host_idt::current_cpu_index();

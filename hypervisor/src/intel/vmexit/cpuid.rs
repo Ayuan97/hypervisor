@@ -10,25 +10,11 @@ use {
         utils::capture::GuestRegisters,
     },
     bitfield::BitMut,
-    core::sync::atomic::{AtomicU64, Ordering},
     x86::{
         cpuid::{cpuid, CpuIdResult},
-        time::rdtsc,
         vmx::vmcs,
     },
 };
-
-fn minimal_cpuid() -> bool {
-    option_env!("HV_MINIMAL").map_or(false, |v| v == "1")
-}
-
-pub const CPUID_BARE_METAL_COST_DEFAULT: u64 = 120;
-// VM-exit transition: guest CPUID → CPU saves state → loads host → our handler rdtsc().
-// Subtract this from cpuid_entry_tsc to approximate the guest-side TSC at CPUID time.
-// Kept conservative and only used by the explicitly gated timing path.
-pub const VMEXIT_ENTRY_OVERHEAD: u64 = 600;
-
-static CPUID_BARE_METAL_COST: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 /// Enum representing the various CPUID leaves for feature and interface discovery.
@@ -108,7 +94,7 @@ enum FeatureBits {
 ///
 /// Reference: Intel® 64 and IA-32 Architectures Software Developer's Manual, Table C-1. Basic Exit Reasons 10.
 #[rustfmt::skip]
-pub fn handle_cpuid(guest_registers: &mut GuestRegisters, vmx: &mut Vmx, exit_tsc_start: u64) -> ExitType {
+pub fn handle_cpuid(guest_registers: &mut GuestRegisters, vmx: &mut Vmx, _exit_tsc_start: u64) -> ExitType {
     let leaf = guest_registers.rax as u32;
 
     if leaf == CPUID_COMM_LEAF {
@@ -126,72 +112,13 @@ pub fn handle_cpuid(guest_registers: &mut GuestRegisters, vmx: &mut Vmx, exit_ts
     let r = guest_cpuid_result(leaf, sub_leaf, |l, s| cpuid!(l, s));
     write_cpuid_result(guest_registers, r);
 
-    // Ophion CPUID→RDTSC spoofing (2026-07-16 EXPERIMENT: disabled).
-    //
-    // Ophion spoofs the NEXT RDTSC after a CPUID to make (rdtsc_after -
-    // rdtsc_before) look like bare-metal CPUID cost (~120 cycles). Problem:
-    // APERF/MPERF are NOT spoofed and cannot be cheaply intercepted (~1M
-    // reads/s per CPU crashes the box). Anti-cheat measuring APERF/TSC ratio
-    // over a CPUID sees: TSC-delta ≈ 120 (spoofed), APERF-delta ≈ 700 (raw
-    // includes ~600-cycle VM-exit overhead) → ratio ~6x, way above normal
-    // turbo (~1.5x). This inconsistency IS a detection vector.
-    //
-    // Trade-off: with Ophion OFF, CPUID looks "slow" (bare-metal ~120 →
-    // observed ~2000). But TSC/APERF/MPERF all agree (all include the
-    // stolen cycles equally). A single, honest leak beats two mutually-
-    // inconsistent leaks. VMEXIT_ENTRY_OVERHEAD remains conservative; the
-    // bare-metal CPUID cost is calibrated once on the current host instead of
-    // using the old fixed 120-cycle value.
-    //
-    // Set HV_ENABLE_OPHION=1 at build time to re-arm the trap for A/B tests.
-    if !minimal_cpuid() && ophion_enabled() {
-        let _ = cpuid_bare_metal_cost();
-        vmx.cpuid_entry_tsc = exit_tsc_start;
-        enable_rdtsc_exiting();
-    }
-
+    // Honest CPUID timing: do not spoof the following RDTSC. Spoofing TSC
+    // while leaving APERF/MPERF raw creates a stronger detection signal
+    // than a uniformly "slow" CPUID that all three counters agree on.
     ExitType::IncrementRIP
 }
 
-pub fn cpuid_bare_metal_cost() -> u64 {
-    let cached = CPUID_BARE_METAL_COST.load(Ordering::Acquire);
-    if cached != 0 {
-        return cached;
-    }
-
-    let mut best = u64::MAX;
-    let mut i = 0;
-    while i < 16 {
-        let start = unsafe { rdtsc() };
-        let _ = cpuid!(0, 0);
-        let elapsed = unsafe { rdtsc() }.wrapping_sub(start);
-        if elapsed < best {
-            best = elapsed;
-        }
-        i += 1;
-    }
-    let measured = if best == u64::MAX {
-        CPUID_BARE_METAL_COST_DEFAULT
-    } else {
-        best.clamp(50, 300)
-    };
-    let _ = CPUID_BARE_METAL_COST.compare_exchange(0, measured, Ordering::Release, Ordering::Relaxed);
-    CPUID_BARE_METAL_COST.load(Ordering::Acquire)
-}
-
-fn ophion_enabled() -> bool {
-    option_env!("HV_ENABLE_OPHION").map_or(false, |v| v == "1")
-}
-
-fn enable_rdtsc_exiting() {
-    if let Ok(val) =
-        crate::intel::support::vmread_checked(vmcs::control::PRIMARY_PROCBASED_EXEC_CONTROLS)
-    {
-        let new_val = val | (1 << 12); // bit 12 = RDTSC exiting
-        let _ = vmwrite_checked(vmcs::control::PRIMARY_PROCBASED_EXEC_CONTROLS, new_val);
-    }
-}
-
+/// Clear RDTSC exiting if a prior experimental path left it armed.
 pub fn disable_rdtsc_exiting() {
     if let Ok(val) =
         crate::intel::support::vmread_checked(vmcs::control::PRIMARY_PROCBASED_EXEC_CONTROLS)
@@ -489,11 +416,6 @@ mod tests {
 
         regs.r11 = VMCALL_MAGIC;
         assert!(cpuid_comm_authorized(&regs));
-    }
-
-    #[test]
-    fn cpuid_bare_metal_cost_is_reasonable() {
-        assert!(cpuid_bare_metal_cost() >= 50 && cpuid_bare_metal_cost() <= 300);
     }
 
     #[test]

@@ -24,8 +24,6 @@ const IA32_RTIT_STATUS_MSR: u32 = 0x571;
 const IA32_RTIT_CR3_MATCH_MSR: u32 = 0x572;
 const IA32_RTIT_ADDR_MSR_START: u32 = 0x580;
 const IA32_RTIT_ADDR_MSR_END: u32 = 0x58f;
-const IA32_MPERF: u32 = 0xE7;
-const IA32_APERF: u32 = 0xE8;
 // Intel SDM Vol 4: LASTBRANCH_FROM_i = 0x680 + i (32 entries), LASTBRANCH_TO_i = 0x6C0 + i (32 entries).
 // The gap 0x6A0-0x6BF holds LASTBRANCH_INFO_i / reserved — NOT the TO stack. Older code assumed
 // the two ranges were contiguous; correct intercept is two disjoint blocks.
@@ -133,48 +131,8 @@ impl MsrBitmap {
         // IA32_TSC_AUX is intentionally not intercepted. VM-entry/VM-exit
         // MSR lists swap the guest value around root transitions, so RDTSCP
         // remains native in the guest without exposing the host's CPU index.
-        // EFER, DEBUGCTL, and LBR MSRs likewise remain native.
-
-        // APERF / MPERF — optional shadow with proportional host-time
-        // compensation. Disabled by default because Windows polls both MSRs
-        // frequently; enabling it adds one extra RDMSR per read.
-        if option_env!("HV_ENABLE_APERF_SHADOW").map_or(false, |v| v == "1") {
-            set_msr_bitmap_bit(&mut self.read_low_msrs, IA32_MPERF);
-            set_msr_bitmap_bit(&mut self.read_low_msrs, IA32_APERF);
-            set_msr_bitmap_bit(&mut self.write_low_msrs, IA32_MPERF);
-            set_msr_bitmap_bit(&mut self.write_low_msrs, IA32_APERF);
-        }
-
-        // APERF / MPERF default behavior remains pass-through.
-        //
-        // The old comment claimed "reads pass through so ratio stays close
-        // to bare metal (our VM-exit rate is very low anyway)". Empirically
-        // false: Windows scheduler reads both on every tick × 24 logical
-        // processors × 250 Hz ≈ 6 000 baseline exits/sec, and under a real
-        // workload (Rust + EAC) that scaled to millions/sec with the
-        // handler adding ~200 ns each — a big chunk of the exit-rate
-        // storm that repeatedly crashed the box after the C-state clamps
-        // pushed idle exits on top. KVM ran into the same problem and
-        // fixed it by leaving these MSRs passthrough (LWN 998994). We do
-        // the same. Diagnostic APERF_READ_COUNT / MPERF_READ_COUNT stop
-        // incrementing but the freeze-relevant signal (Rust/EAC caused
-        // us to hit ratios wildly outside bare metal) can be recovered
-        // by turning the intercept back on for a single measurement run
-        // if we ever need it again.
-
-        // MSR_PKG_CST_CONFIG_CONTROL (0xE2) — NOT intercepted.
-        //
-        // Was added 2026-07-12 (5668ac1) to shadow a "limit = C1" read back
-        // to the guest, alongside a swallowed write. In practice the write
-        // path is unreachable because BIOS locks the MSR (CFG_LOCK bit 15)
-        // long before we boot, so the intercept only ever changed READS —
-        // and lying to the Windows power-management driver about the deepest
-        // supported C-state turned out to correlate with the regression from
-        // "5-hour stable HV+EAC session" to "freezes inside 2 minutes" on
-        // the same day. Removing the intercept restores what the driver
-        // actually sees on bare metal, without giving up any real
-        // stealth (0xE2's value on this box is 0-limit either way).
-        //
+        // EFER, DEBUGCTL, LBR, APERF/MPERF, and package C-state MSRs likewise
+        // remain native (high-frequency intercepts have crashed the box).
     }
 }
 
@@ -269,29 +227,13 @@ mod tests {
     }
 
     #[test]
-    fn aperf_and_mperf_follow_shadow_build_gate() {
-        // Windows scheduler polls both MSRs on every tick per logical CPU;
-        // the shadow is therefore opt-in and must be absent in the default build.
+    fn aperf_and_mperf_are_not_intercepted() {
         let mut bitmap = empty_bitmap();
         bitmap.intercept_vmx_msrs();
-        let enabled = option_env!("HV_ENABLE_APERF_SHADOW").map_or(false, |v| v == "1");
-
-        assert_eq!(
-            msr_bitmap_bit_is_set(&bitmap.read_low_msrs, IA32_MPERF),
-            enabled
-        );
-        assert_eq!(
-            msr_bitmap_bit_is_set(&bitmap.read_low_msrs, IA32_APERF),
-            enabled
-        );
-        assert_eq!(
-            msr_bitmap_bit_is_set(&bitmap.write_low_msrs, IA32_MPERF),
-            enabled
-        );
-        assert_eq!(
-            msr_bitmap_bit_is_set(&bitmap.write_low_msrs, IA32_APERF),
-            enabled
-        );
+        for msr in [0xE7u32, 0xE8] {
+            assert!(!msr_bitmap_bit_is_set(&bitmap.read_low_msrs, msr));
+            assert!(!msr_bitmap_bit_is_set(&bitmap.write_low_msrs, msr));
+        }
     }
 
     #[test]

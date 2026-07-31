@@ -24,8 +24,8 @@
 //! external interrupts still route to the guest via the normal pin-based
 //! control path (external-interrupt-exiting=0).
 //!
-//! The clamp is bypassed by `minimal_mode()` or `HV_NO_CSTATE_CLAMP=1` at
-//! build time, so the effect can be A/B tested without a code revert.
+//! Production builds leave MWAIT/HLT exiting off; these handlers only run if
+//! a debug build re-enables the primary controls.
 
 use {
     crate::{
