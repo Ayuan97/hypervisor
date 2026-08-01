@@ -9,3 +9,7 @@ logs/
 .claude/
 .mcp.json
 .idea/
+
+# 运行产物勿放在本仓根（svcmon 日志在 D:\rust-cheat\output\）
+/esP.lom.trt*
+/exports/

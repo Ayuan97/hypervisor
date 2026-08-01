@@ -1,5 +1,5 @@
 # UDP HV Monitor - continuously reads counters via CPUID and streams to Mac
-# Run: powershell -NoProfile -File D:\hello\code\hypervisor\tools\udp_hv_monitor.ps1
+# Run: powershell -NoProfile -File D:\rust-cheat\hypervisor\tools\udp_hv_monitor.ps1
 # High-freq: powershell -NoProfile -File ... -IntervalMs 50
 param(
     [string]$RemoteIP = "100.91.62.12",
@@ -16,7 +16,7 @@ function Send-Msg($msg) {
     [void]$udp.Send($bytes, $bytes.Length, $endpoint)
 }
 
-$pingExe = "D:\hello\code\hypervisor\tools\cpuid_ping.exe"
+$pingExe = "D:\rust-cheat\hypervisor\tools\cpuid_ping.exe"
 
 Send-Msg "=== HV UDP Monitor START $(Get-Date -Format 'HH:mm:ss.fff') ==="
 

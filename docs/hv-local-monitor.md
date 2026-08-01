@@ -1,5 +1,7 @@
 # Local-file HV monitor
 
+Workflow: `D:\rust-cheat\DEV.md` §5-B. Project layout: `../CLAUDE.md`. This file is **log format** only.
+
 The local diagnostic build writes HV telemetry directly to:
 
 ```text

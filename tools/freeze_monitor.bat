@@ -1,6 +1,6 @@
 @echo off
-set LOG=D:\hello\code\hypervisor\logs\freeze_monitor.log
-set PING=D:\hello\code\hypervisor\tools\cpuid_ping.exe
+set LOG=D:\rust-cheat\hypervisor\logs\freeze_monitor.log
+set PING=D:\rust-cheat\hypervisor\tools\cpuid_ping.exe
 set N=0
 
 echo [%date% %time%] freeze_monitor started > %LOG%
