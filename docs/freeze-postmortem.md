@@ -33,7 +33,7 @@
 ```text
 1. 干净重启
 2. local_diag 构建并加载（见 docs/hv-local-monitor.md）
-   确认 D:\rust-cheat\hv_diag_live.log 有 HVL1 START
+   确认 D:\cheat\hv_diag_live.log 有 HVL1 START
 3. 启动游戏/EAC，玩到冻
 4. 硬复位（RST）—— 不要指望冻后还能操作
 5. 启动后读：
