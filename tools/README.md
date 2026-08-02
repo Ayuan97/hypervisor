@@ -9,4 +9,4 @@
 | 专项 | `*_bench` `eac_sim` `*_monitor` `test_*` | 非默认路径 |
 
 构建示例：`rustc tools\cpuid_ping.rs -o tools\cpuid_ping.exe`  
-工作流见上级 `CLAUDE.md` 与 `D:\rust-cheat\DEV.md`。
+工作流见上级 `CLAUDE.md` 与 `D:\cheat\DEV.md`。

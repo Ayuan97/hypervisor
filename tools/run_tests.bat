@@ -4,7 +4,7 @@ echo  Manual CPUID Test
 echo ========================================
 echo.
 
-cd /d D:\rust-cheat\hypervisor\tools
+cd /d D:\cheat\backends\hypervisor\tools
 
 echo [1/4] Check HV Status
 ping_test.exe

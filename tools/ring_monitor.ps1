@@ -1,5 +1,5 @@
-$ping = "D:\rust-cheat\hypervisor\tools\cpuid_ping.exe"
-$log  = "D:\rust-cheat\hypervisor\logs\ring_monitor.log"
+$ping = "D:\cheat\backends\hypervisor\tools\cpuid_ping.exe"
+$log  = "D:\cheat\backends\hypervisor\logs\ring_monitor.log"
 
 "[$(Get-Date -f 'HH:mm:ss.fff')] ring_monitor started" | Out-File $log -Encoding utf8
 

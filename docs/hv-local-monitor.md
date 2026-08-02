@@ -1,11 +1,11 @@
 # Local-file HV monitor
 
-Workflow: `D:\rust-cheat\DEV.md` §5-B. Project layout: `../CLAUDE.md`. This file is **log format** only.
+Workflow: `D:\cheat\DEV.md` §5-B. Project layout: `../CLAUDE.md`. This file is **log format** only.
 
 The local diagnostic build writes HV telemetry directly to:
 
 ```text
-D:\rust-cheat\hv_diag_live.log
+D:\cheat\hv_diag_live.log
 ```
 
 The file is overwritten whenever the diagnostic driver is loaded, so every
@@ -35,9 +35,9 @@ flushed records remain available after reboot.
 Do this before starting the game/EAC:
 
 1. Reboot so no old HV instance remains.
-2. Double-click `D:\rust-cheat\scripts\build_local_diag.bat` once after a code
+2. Double-click `D:\cheat\scripts\build_local_diag.bat` once after a code
    change.
-3. Double-click `D:\rust-cheat\scripts\start_local_diag.bat`. It requests
+3. Double-click `D:\cheat\scripts\start_local_diag.bat`. It requests
    Administrator privileges through UAC, starts both monitors, loads the
    diagnostic HV, and opens the live kernel-log viewer.
 
@@ -47,7 +47,7 @@ Do not start a second monitor or load script alongside it.
 The build creates:
 
 ```text
-D:\rust-cheat\output\hv\matrix_local_diag.sys
+D:\cheat\output\hv\matrix_local_diag.sys
 ```
 
 It enables the normal client-read and concealment settings plus the build-time
@@ -64,8 +64,8 @@ not stop kernel logging.
 
 ## Passive Windows event monitor
 
-The same launcher starts `D:\rust-cheat\scripts\hv_live_monitor.ps1` before HV
-loading. On every run it clears `D:\rust-cheat\hv_monitor_live`, then records
+The same launcher starts `D:\cheat\scripts\hv_live_monitor.ps1` before HV
+loading. On every run it clears `D:\cheat\hv_monitor_live`, then records
 new Windows System/Application events, process presence, uptime, and memory
 state. Default mode does not call `cpuid_ping` or `hv_breadcrumb`, so the
 companion monitor does not create diagnostic CPUID VM-exits.
@@ -80,7 +80,7 @@ Files written under `hv_monitor_live`:
 Active probing remains available only for focused diagnostics:
 
 ```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File D:\rust-cheat\scripts\hv_live_monitor.ps1 -ActiveHvProbes
+powershell -NoProfile -ExecutionPolicy Bypass -File D:\cheat\scripts\hv_live_monitor.ps1 -ActiveHvProbes
 ```
 
 Active mode calls `cpuid_ping` once per interval and starts

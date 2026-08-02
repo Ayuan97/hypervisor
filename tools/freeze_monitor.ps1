@@ -1,5 +1,5 @@
-$ping = "D:\rust-cheat\hypervisor\tools\cpuid_ping.exe"
-$log  = "D:\rust-cheat\hypervisor\logs\freeze_monitor.log"
+$ping = "D:\cheat\backends\hypervisor\tools\cpuid_ping.exe"
+$log  = "D:\cheat\backends\hypervisor\logs\freeze_monitor.log"
 
 "======== freeze_monitor started $(Get-Date -f 'yyyy-MM-dd HH:mm:ss') ========" | Out-File $log -Encoding utf8
 

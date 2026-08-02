@@ -1,29 +1,29 @@
 # matrix (hypervisor)
 
-Windows x64 Intel VT-x type-2πÇéσ╖ÑΣ╜£σî║µ╡üτ¿ï∩╝Ü**`D:\cheat\DEV.md`**πÇé  
-µ£¼Σ╗ôΦ»┤µÿÄ∩╝Ü**`CLAUDE.md`**πÇé
+Windows x64 Intel VT-x type-2。工作区流程：**`D:\cheat\DEV.md`**。  
+本仓说明：**`CLAUDE.md`**。
 
-## τ¢«σ╜ò
+## 目录
 
 ```
 hypervisor/
-Γö£ΓöÇΓöÇ hypervisor/     VT-x µá╕σ┐â∩╝êEPT / VM-exit / VMCALL ΓÇª∩╝ë
-Γö£ΓöÇΓöÇ driver/         WDK σàÑσÅú ΓåÆ matrix.sys
-Γö£ΓöÇΓöÇ scripts/        µ₧äσ╗║ / σèáΦ╜╜ / µö╢σ░╛
-Γö£ΓöÇΓöÇ tools/          τö¿µê╖µÇüµÄóΘÆê∩╝ê.rs µ║É∩╝¢.exe µ£¼σ£░τöƒµêÉπÇügitignore∩╝ë
-Γö£ΓöÇΓöÇ docs/hv-local-monitor.md  Γÿà µ£¼σ£░Φ»èµû¡µùÑσ┐ùµá╝σ╝Å
-Γö£ΓöÇΓöÇ CLAUDE.md       Γÿà µ£¼Σ╗ôσö»Σ╕ÇΘí╣τ¢«Φ»┤µÿÄ
-ΓööΓöÇΓöÇ AGENTS.md       µîçσÉæ CLAUDE.md
+├── hypervisor/     VT-x 核心（EPT / VM-exit / VMCALL …）
+├── driver/         WDK 入口 → matrix.sys
+├── scripts/        构建 / 加载 / 收尾
+├── tools/          用户态探针（.rs 源；.exe 本地生成、gitignore）
+├── docs/hv-local-monitor.md  ★ 本地诊断日志格式
+├── CLAUDE.md       ★ 本仓唯一项目说明
+└── AGENTS.md       指向 CLAUDE.md
 ```
 
-## σ╕╕τö¿
+## 常用
 
-| τ¢«τÜä | σæ╜Σ╗ñ |
+| 目的 | 命令 |
 |---|---|
-| τ╝û client∩╝êτ╗Ö svcmon∩╝ë | `scripts\build_client.bat` |
-| σèáΦ╜╜ client | ΘçìσÉ»σÉÄ `scripts\start_hv_client.bat` |
-| µ£¼σ£░Φ»èµû¡ | σ╖ÑΣ╜£σî║ `scripts\build_local_diag.bat` ΓåÆ ΘçìσÉ» ΓåÆ `start_local_diag.bat` |
-| τöƒΣ║º matrix | `cargo build -p matrix --release` + `scripts\finalize_driver.ps1` |
-| σèáΦ╜╜ | `scripts\start_hv.bat`∩╝êΘí╗ΘçìσÉ»σÉÄπÇüµ╕╕µêÅσëì∩╝ë |
+| 编 client（给 svcmon） | `scripts\build_client.bat` |
+| 加载 client | 重启后 `scripts\start_hv_client.bat` |
+| 本地诊断 | 工作区 `scripts\build_local_diag.bat` → 重启 → `start_local_diag.bat` |
+| 生产 matrix | `cargo build -p matrix --release` + `scripts\finalize_driver.ps1` |
+| 加载 | `scripts\start_hv.bat`（须重启后、游戏前） |
 
-µùÑσ┐ù∩╝Ü`D:\cheat\hv_diag_live.log`∩╝êΣ╗à local_diag µ₧äσ╗║∩╝ëπÇé
+日志：`D:\cheat\hv_diag_live.log`（仅 local_diag 构建）。
