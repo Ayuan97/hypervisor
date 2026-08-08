@@ -48,28 +48,15 @@ impl Mtrr {
         let default_type = Self::from_raw(rdmsr(IA32_MTRR_DEF_TYPE) as u8);
         log::trace!("MTRR default type: {:?}", default_type);
 
-        let mut descriptors = Vec::new();
+        let descriptors = Self::descriptors_from_items(Self::indexes().map(Self::get));
 
-        for index in Self::indexes() {
-            let item = Self::get(index);
-
-            if item.is_enabled && item.mem_type != default_type {
-                let end_address = Self::calculate_end_address(item.base.pa(), item.mask);
-
-                let descriptor = MtrrRangeDescriptor {
-                    base_address: item.base.pa(),
-                    end_address,
-                    memory_type: item.mem_type,
-                };
-
-                descriptors.push(descriptor);
-                log::trace!(
-                    "MTRR Range: Base=0x{:x} End=0x{:x} Type={:?}",
-                    descriptor.base_address,
-                    descriptor.end_address,
-                    descriptor.memory_type
-                );
-            }
+        for descriptor in descriptors.iter() {
+            log::trace!(
+                "MTRR Range: Base=0x{:x} End=0x{:x} Type={:?}",
+                descriptor.base_address,
+                descriptor.end_address,
+                descriptor.memory_type
+            );
         }
 
         log::trace!("Total MTRR Ranges Committed: {}", descriptors.len());
@@ -110,6 +97,16 @@ impl Mtrr {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn for_test_with_items(
+        default_type: MemoryType,
+        items: &[MtrrItem],
+        ram_ranges: &[PhysicalMemoryRange],
+    ) -> Self {
+        let descriptors = Self::descriptors_from_items(items.iter().copied());
+        Self::for_test_with_ram_ranges(default_type, &descriptors, ram_ranges)
+    }
+
     /// Finds the memory type for a given physical address range based on the MTRR map.
     ///
     /// This method examines the MTRR map to find the appropriate memory type for the
@@ -124,6 +121,9 @@ impl Mtrr {
     /// # Returns
     /// The memory type for the given address range, or the default MTRR type if no MTRR range matches.
     pub fn find(&self, range: core::ops::Range<u64>) -> Option<MemoryType> {
+        if range.start >= range.end {
+            return None;
+        }
         if !self.range_is_backed_by_ram(range.clone()) {
             return Some(MemoryType::Uncacheable);
         }
@@ -133,12 +133,12 @@ impl Mtrr {
 
         for descriptor in self.descriptors.iter() {
             if range.start <= descriptor.end_address && range_last >= descriptor.base_address {
-                match descriptor.memory_type {
-                    MemoryType::Uncacheable => return Some(MemoryType::Uncacheable),
-                    MemoryType::WriteCombining => memory_type = Some(MemoryType::WriteCombining),
-                    MemoryType::WriteThrough => memory_type = Some(MemoryType::WriteThrough),
-                    MemoryType::WriteProtected => memory_type = Some(MemoryType::WriteProtected),
-                    MemoryType::WriteBack => memory_type = Some(MemoryType::WriteBack),
+                memory_type = Some(match memory_type {
+                    Some(current) => Self::merge_memory_types(current, descriptor.memory_type),
+                    None => descriptor.memory_type,
+                });
+                if memory_type == Some(MemoryType::Uncacheable) {
+                    return memory_type;
                 }
             }
         }
@@ -146,9 +146,78 @@ impl Mtrr {
         memory_type.or(Some(self.default_type))
     }
 
-    fn range_is_backed_by_ram(&self, range: core::ops::Range<u64>) -> bool {
+    /// Returns the effective type when it is identical throughout `range`.
+    /// MTRR types can only change at descriptor starts and inclusive ends, so
+    /// checking those transition points avoids scanning every 4KB page.
+    pub fn uniform_memory_type(&self, range: core::ops::Range<u64>) -> Option<MemoryType> {
+        if range.start >= range.end || !self.range_is_backed_by_ram(range.clone()) {
+            return None;
+        }
+
+        let first_end = range.start.checked_add(1)?;
+        let expected = self.find(range.start..first_end)?;
+        for descriptor in self.descriptors.iter() {
+            let start = descriptor.base_address;
+            if start > range.start
+                && start < range.end
+                && self.find(start..start.checked_add(1)?)? != expected
+            {
+                return None;
+            }
+
+            let after_end = descriptor.end_address.saturating_add(1);
+            if after_end > range.start
+                && after_end < range.end
+                && self.find(after_end..after_end.checked_add(1)?)? != expected
+            {
+                return None;
+            }
+        }
+
+        Some(expected)
+    }
+
+    fn descriptors_from_items(
+        items: impl IntoIterator<Item = MtrrItem>,
+    ) -> Vec<MtrrRangeDescriptor> {
+        let mut descriptors = Vec::new();
+        for item in items {
+            if !item.is_enabled {
+                continue;
+            }
+            descriptors.push(MtrrRangeDescriptor {
+                base_address: item.base.pa(),
+                end_address: Self::calculate_end_address(item.base.pa(), item.mask),
+                memory_type: item.mem_type,
+            });
+        }
+        descriptors
+    }
+
+    fn merge_memory_types(left: MemoryType, right: MemoryType) -> MemoryType {
+        use MemoryType::{Uncacheable, WriteBack, WriteThrough};
+
+        if left == right {
+            return left;
+        }
+        match (left, right) {
+            (Uncacheable, _) | (_, Uncacheable) => Uncacheable,
+            (WriteBack, WriteThrough) | (WriteThrough, WriteBack) => WriteThrough,
+            _ => Uncacheable,
+        }
+    }
+
+    /// Whether `MmGetPhysicalMemoryRanges` returned at least one range.
+    pub fn ram_ranges_known(&self) -> bool {
+        self.ram_ranges_known
+    }
+
+    /// True when every byte of `range` falls inside known physical RAM.
+    /// If RAM ranges could not be queried, returns false (caller must use a
+    /// conservative fallback — do NOT treat unknown as "all RAM/RWX").
+    pub fn range_is_backed_by_ram(&self, range: core::ops::Range<u64>) -> bool {
         if !self.ram_ranges_known {
-            return true;
+            return false;
         }
         if range.start >= range.end {
             return false;
@@ -167,6 +236,22 @@ impl Mtrr {
             }
         }
 
+        false
+    }
+
+    /// True when any byte of `range` overlaps known physical RAM.
+    pub fn range_overlaps_ram(&self, range: core::ops::Range<u64>) -> bool {
+        if !self.ram_ranges_known {
+            return false;
+        }
+        if range.start >= range.end {
+            return false;
+        }
+        for ram_range in self.ram_ranges.iter() {
+            if range.start < ram_range.end_address && range.end > ram_range.base_address {
+                return true;
+            }
+        }
         false
     }
 
@@ -377,12 +462,16 @@ mod tests {
 
     #[test]
     fn find_uses_uncacheable_for_partial_overlap() {
-        let mtrr = Mtrr::for_test(
+        let mtrr = Mtrr::for_test_with_ram_ranges(
             MemoryType::WriteBack,
             &[MtrrRangeDescriptor {
                 base_address: 0x180000,
                 end_address: 0x1fffff,
                 memory_type: MemoryType::Uncacheable,
+            }],
+            &[PhysicalMemoryRange {
+                base_address: 0,
+                end_address: 0x200000,
             }],
         );
 
@@ -421,5 +510,100 @@ mod tests {
             mtrr.find(0x1000_0000..0x1020_0000),
             Some(MemoryType::WriteBack)
         );
+    }
+
+    #[test]
+    fn default_uc_carve_out_is_retained_over_overlapping_wb() {
+        let ram = [PhysicalMemoryRange {
+            base_address: 0,
+            end_address: 0x20_0000,
+        }];
+        let mtrr = Mtrr::for_test_with_items(
+            MemoryType::Uncacheable,
+            &[
+                MtrrItem {
+                    base: PhysicalAddress::from_pa(0),
+                    mask: !0x1f_ffff,
+                    mem_type: MemoryType::WriteBack,
+                    is_enabled: true,
+                },
+                MtrrItem {
+                    base: PhysicalAddress::from_pa(0x10_0000),
+                    mask: !0xfff,
+                    mem_type: MemoryType::Uncacheable,
+                    is_enabled: true,
+                },
+            ],
+            &ram,
+        );
+
+        assert_eq!(mtrr.descriptors.len(), 2);
+        assert_eq!(mtrr.find(0..0x1000), Some(MemoryType::WriteBack));
+        assert_eq!(
+            mtrr.find(0x10_0000..0x10_1000),
+            Some(MemoryType::Uncacheable)
+        );
+    }
+
+    #[test]
+    fn wb_wt_overlap_is_order_independent() {
+        let wb = MtrrRangeDescriptor {
+            base_address: 0,
+            end_address: 0x1fff,
+            memory_type: MemoryType::WriteBack,
+        };
+        let wt = MtrrRangeDescriptor {
+            base_address: 0,
+            end_address: 0x1fff,
+            memory_type: MemoryType::WriteThrough,
+        };
+        let ram = [PhysicalMemoryRange {
+            base_address: 0,
+            end_address: 0x2000,
+        }];
+
+        for descriptors in [[wb, wt], [wt, wb]] {
+            let mtrr = Mtrr::for_test_with_ram_ranges(MemoryType::Uncacheable, &descriptors, &ram);
+            assert_eq!(mtrr.find(0..0x1000), Some(MemoryType::WriteThrough));
+        }
+    }
+
+    #[test]
+    fn unsupported_overlap_is_order_independent_and_conservative() {
+        let wb = MtrrRangeDescriptor {
+            base_address: 0,
+            end_address: 0x1fff,
+            memory_type: MemoryType::WriteBack,
+        };
+        let wc = MtrrRangeDescriptor {
+            base_address: 0,
+            end_address: 0x1fff,
+            memory_type: MemoryType::WriteCombining,
+        };
+        let ram = [PhysicalMemoryRange {
+            base_address: 0,
+            end_address: 0x2000,
+        }];
+
+        for descriptors in [[wb, wc], [wc, wb]] {
+            let mtrr = Mtrr::for_test_with_ram_ranges(MemoryType::WriteBack, &descriptors, &ram);
+            assert_eq!(mtrr.find(0..0x1000), Some(MemoryType::Uncacheable));
+        }
+    }
+
+    #[test]
+    fn ram_overlap_uses_half_open_boundaries() {
+        let mtrr = Mtrr::for_test_with_ram_ranges(
+            MemoryType::WriteBack,
+            &[],
+            &[PhysicalMemoryRange {
+                base_address: 0x2000,
+                end_address: 0x4000,
+            }],
+        );
+
+        assert!(!mtrr.range_overlaps_ram(0x0000..0x2000));
+        assert!(mtrr.range_overlaps_ram(0x1000..0x3000));
+        assert!(!mtrr.range_overlaps_ram(0x4000..0x6000));
     }
 }

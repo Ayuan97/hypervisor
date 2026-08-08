@@ -47,6 +47,18 @@ bitfield! {
 const VALID: u32 = 1;
 const INVALID: u32 = 0;
 
+// VM-exit interruption-info and VM-entry interruption-info use the same
+// low-level layout only for bits 0..11 and bit 31.  In particular, bit 12 is
+// the VM-exit-only "NMI unblocking due to IRET" flag and bits 13..30 are
+// reserved in the VM-entry field.  Passing the exit field through unchanged
+// can therefore make the next VMRESUME fail with reason 0x21.
+const VM_ENTRY_INTERRUPTION_INFO_MASK: u32 = (1 << 31) | 0x0fff;
+
+#[inline]
+fn sanitize_reinjected_info(interruption_info: u32) -> u32 {
+    interruption_info & VM_ENTRY_INTERRUPTION_INFO_MASK
+}
+
 fn write_vm_entry_field<T>(field: u32, value: T)
 where
     T: Into<u64>,
@@ -195,6 +207,7 @@ impl EventInjection {
 
     /// Re-injects an event using the raw VM-exit interruption info and error code.
     pub fn vmentry_reinject(interruption_info: u32, error_code: u32) {
+        let interruption_info = sanitize_reinjected_info(interruption_info);
         if (interruption_info & (1 << 11)) != 0 {
             write_vm_entry_field(vmcs::control::VMENTRY_EXCEPTION_ERR_CODE, error_code);
         }
@@ -208,6 +221,17 @@ impl EventInjection {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reinjection_drops_vmexit_only_and_reserved_bits() {
+        let raw = (1 << 31) | (1 << 12) | (0x3ffff << 13) | (1 << 11) | 14;
+        let sanitized = sanitize_reinjected_info(raw);
+
+        assert_eq!(sanitized & (1 << 31), 1 << 31);
+        assert_eq!(sanitized & 0xff, 14);
+        assert_ne!(sanitized & (1 << 11), 0);
+        assert_eq!(sanitized & !VM_ENTRY_INTERRUPTION_INFO_MASK, 0);
+    }
 
     #[test]
     fn breakpoint_injection_uses_software_exception_type() {

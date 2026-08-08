@@ -16,7 +16,14 @@ fn latest_windows_kit_version(root: &str) -> Option<PathBuf> {
 }
 
 fn main() -> Result<(), wdk_build::ConfigError> {
+    let terminal = std::env::var("HV_TERMINAL_CAPTURE").ok().as_deref() == Some("1");
+    let cmos_only = std::env::var("HV_CMOS_CAPTURE_ONLY").ok().as_deref() == Some("1");
+    if terminal && cmos_only {
+        panic!("HV_TERMINAL_CAPTURE and HV_CMOS_CAPTURE_ONLY are mutually exclusive");
+    }
     println!("cargo:rerun-if-env-changed=HV_BOOT_STOP_STAGE");
+    println!("cargo:rerun-if-env-changed=HV_TERMINAL_CAPTURE");
+    println!("cargo:rerun-if-env-changed=HV_CMOS_CAPTURE_ONLY");
     println!("cargo:rerun-if-changed=src/seh.c");
 
     let mut config = wdk_build::Config::from_env_auto()?;

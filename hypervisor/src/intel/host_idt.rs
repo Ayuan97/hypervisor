@@ -325,6 +325,10 @@ core::arch::global_asm!(
     "pop rcx",
     "pop rax",
     "add rsp, 8",
+    "and rsp, -16",
+    "sub rsp, 0x20",
+    "mov ecx, 13",
+    "call {host_fault_capture}",
     "3:",
     "hlt",
     "jmp 3b",
@@ -344,6 +348,10 @@ core::arch::global_asm!(
     "pop rcx",
     "pop rax",
     // VMXOFF + STI + HLT: leave VMX, let NMI watchdog BSOD
+    "and rsp, -16",
+    "sub rsp, 0x20",
+    "mov ecx, 13",
+    "call {host_fault_capture}",
     "vmxoff",
     "sti",
     "4:",
@@ -361,6 +369,7 @@ core::arch::global_asm!(
     first_rsp = sym HOST_FIRST_FAULT_RSP,
     first_err = sym HOST_FIRST_FAULT_ERR,
     first_cpu = sym HOST_FIRST_FAULT_CPU,
+    host_fault_capture = sym terminal_capture_host_fault,
 );
 
 // ---------------------------------------------------------------------------
@@ -467,6 +476,10 @@ core::arch::global_asm!(
     "pop rcx",
     "pop rax",
     "add rsp, 8",
+    "and rsp, -16",
+    "sub rsp, 0x20",
+    "mov ecx, 14",
+    "call {host_fault_capture}",
     "3:",
     "hlt",
     "jmp 3b",
@@ -485,6 +498,10 @@ core::arch::global_asm!(
     "pop rcx",
     "pop rax",
     // VMXOFF + STI + HLT: leave VMX, let NMI watchdog BSOD
+    "and rsp, -16",
+    "sub rsp, 0x20",
+    "mov ecx, 14",
+    "call {host_fault_capture}",
     "vmxoff",
     "sti",
     "5:",
@@ -503,6 +520,7 @@ core::arch::global_asm!(
     first_rsp = sym HOST_FIRST_FAULT_RSP,
     first_err = sym HOST_FIRST_FAULT_ERR,
     first_cpu = sym HOST_FIRST_FAULT_CPU,
+    host_fault_capture = sym terminal_capture_host_fault,
 );
 
 // ---------------------------------------------------------------------------
@@ -552,6 +570,10 @@ core::arch::global_asm!(
     "mov [rdx], rcx",
     "7:",
     // ---- halt: #DF cannot be resumed ----
+    "and rsp, -16",
+    "sub rsp, 0x20",
+    "mov ecx, 8",
+    "call {host_fault_capture}",
     "vmxoff",
     "sti",
     "8:",
@@ -566,6 +588,7 @@ core::arch::global_asm!(
     first_rsp = sym HOST_FIRST_FAULT_RSP,
     first_err = sym HOST_FIRST_FAULT_ERR,
     first_cpu = sym HOST_FIRST_FAULT_CPU,
+    host_fault_capture = sym terminal_capture_host_fault,
 );
 
 // ---------------------------------------------------------------------------
@@ -609,6 +632,10 @@ core::arch::global_asm!(
     // ---- halt ----
     "pop rcx",
     "pop rax",
+    "and rsp, -16",
+    "sub rsp, 0x20",
+    "mov ecx, 0xFF",
+    "call {host_fault_capture}",
     "vmxoff",
     "sti",
     "1:",
@@ -618,6 +645,7 @@ core::arch::global_asm!(
     default_rip = sym HOST_DEFAULT_RIP,
     default_rsp = sym HOST_DEFAULT_RSP,
     fault_total = sym HOST_FAULT_TOTAL,
+    host_fault_capture = sym terminal_capture_host_fault,
 );
 
 // ---------------------------------------------------------------------------
@@ -713,10 +741,55 @@ fn rdtscp_aux() -> u32 {
     aux
 }
 
+/// Primary-procbased bit for NMI-window exiting (Intel SDM Table 24-6 bit 22).
+#[inline]
+fn nmi_window_exiting_bit() -> u64 {
+    x86::vmx::vmcs::control::PrimaryControls::NMI_WINDOW_EXITING.bits() as u64
+}
+
+/// Pure helper: enable or clear NMI-window exiting in a primary-controls value.
+#[inline]
+pub fn with_nmi_window_exiting(primary_ctl: u64, enable: bool) -> u64 {
+    let bit = nmi_window_exiting_bit();
+    if enable {
+        primary_ctl | bit
+    } else {
+        primary_ctl & !bit
+    }
+}
+
+fn set_nmi_window_exiting(enable: bool) {
+    use x86::vmx::vmcs::control::PRIMARY_PROCBASED_EXEC_CONTROLS;
+    let ctl = match crate::intel::support::vmread_checked(PRIMARY_PROCBASED_EXEC_CONTROLS) {
+        Ok(v) => v,
+        Err(error) => {
+            log::error!("Failed to read primary controls for NMI window: {:?}", error);
+            return;
+        }
+    };
+    let next = with_nmi_window_exiting(ctl, enable);
+    if next == ctl {
+        return;
+    }
+    if let Err(error) =
+        crate::intel::support::vmwrite_checked(PRIMARY_PROCBASED_EXEC_CONTROLS, next)
+    {
+        log::error!(
+            "Failed to {} NMI-window exiting: {:?}",
+            if enable { "arm" } else { "disarm" },
+            error
+        );
+    }
+}
+
 /// Check for a pending NMI on this CPU and inject it to the guest.
 /// Called at the end of every VM exit handler, before VMRESUME.
-/// If another event is already queued for injection or the guest is blocking
-/// NMIs, the NMI stays pending and will be injected on the next VM exit.
+///
+/// Policy (aligned with UC/bombobombone lessons — **not** permanent NmiWindowExiting):
+/// - Inject immediately when the guest is not NMI/MOV-SS blocked.
+/// - If blocked, keep the pending flag and **temporarily** arm NMI-window exiting
+///   so the next open window delivers an exit instead of waiting for an unrelated exit.
+/// - Always disarm the window bit when we inject (or when no NMI remains pending).
 pub fn check_pending_nmi() {
     let cpu = rdtscp_aux() as usize & 0xFF;
     if NMI_FLAGS[cpu].load(Ordering::Relaxed) != 0 || MC_FLAGS[cpu].load(Ordering::Relaxed) != 0 {
@@ -733,10 +806,16 @@ pub fn check_pending_nmi() {
             }
         };
         if info & (1 << 31) != 0 {
+            // Another event already queued for this entry; keep pending.
+            // Arm NMI-window so we retry as soon as the guest can accept NMIs.
+            if NMI_FLAGS[cpu].load(Ordering::Relaxed) != 0 {
+                set_nmi_window_exiting(true);
+            }
             return;
         }
         if MC_FLAGS[cpu].load(Ordering::Relaxed) != 0 {
             MC_FLAGS[cpu].store(0, Ordering::Relaxed);
+            set_nmi_window_exiting(false);
             crate::intel::events::EventInjection::vmentry_inject_machine_check();
         } else {
             let interruptibility = crate::intel::support::vmread_checked(
@@ -746,9 +825,12 @@ pub fn check_pending_nmi() {
             // Bit 3: blocking by NMI; bit 1: blocking by MOV-SS.
             // Intel SDM 26.3.1.5: NMI injection requires both to be 0.
             if interruptibility & ((1 << 3) | (1 << 1)) != 0 {
+                // Stay pending; exit again when the NMI window opens.
+                set_nmi_window_exiting(true);
                 return;
             }
             NMI_FLAGS[cpu].store(0, Ordering::Relaxed);
+            set_nmi_window_exiting(false);
             crate::intel::events::EventInjection::vmentry_inject_nmi();
         }
     }
@@ -817,6 +899,63 @@ pub fn record_host_idt_descriptor(idt: &[u64], base: u64, limit: u64) {
 
 pub fn current_cpu_index() -> usize {
     rdtscp_aux() as usize & 0xFF
+}
+
+/// Commit a fatal host-fault capsule from the IDT recovery stubs. The assembly
+/// handlers cannot safely perform the Rust/CMOS protocol themselves, so they
+/// call this wrapper immediately before VMXOFF+HLT. It intentionally uses the
+/// per-vector breadcrumbs already written by the handler rather than issuing
+/// VMREADs on a possibly corrupted VMCS.
+#[export_name = "terminal_capture_host_fault"]
+pub extern "C" fn terminal_capture_host_fault(vector: u64) {
+    if !super::terminal_capture::enabled() {
+        return;
+    }
+
+    let vector8 = vector as u8;
+    let (rip, error) = match vector8 {
+        2 => (
+            NMI_FAULT_RIP.load(Ordering::Relaxed),
+            0,
+        ),
+        8 => (
+            DF_FAULT_RIP.load(Ordering::Relaxed),
+            0,
+        ),
+        13 => (
+            GP_FAULT_RIP.load(Ordering::Relaxed),
+            GP_FAULT_ERR.load(Ordering::Relaxed),
+        ),
+        14 => (
+            PF_FAULT_RIP.load(Ordering::Relaxed),
+            PF_FAULT_ERR.load(Ordering::Relaxed),
+        ),
+        18 => (
+            MC_FAULT_RIP.load(Ordering::Relaxed),
+            0,
+        ),
+        0xff => (
+            HOST_DEFAULT_RIP.load(Ordering::Relaxed),
+            0,
+        ),
+        _ => (
+            HOST_FIRST_FAULT_RIP.load(Ordering::Relaxed),
+            HOST_FIRST_FAULT_ERR.load(Ordering::Relaxed),
+        ),
+    };
+    let cpu = current_cpu_index();
+    super::diag::cpu_enter_phase(super::diag::PHASE_HOST_FAULT);
+    let _ = super::terminal_capture::record_host_fault(
+        cpu as u8,
+        vector8,
+        rip,
+        error,
+    );
+    let _ = super::terminal_capture::force_current(
+        super::terminal_capture::KIND_HOST_FAULT,
+        super::terminal_capture::INVALID_VM_ERROR,
+        vector8,
+    );
 }
 
 pub fn current_patch_mask() -> u64 {
@@ -1061,5 +1200,18 @@ mod tests {
             host_idt_patch_mask(&idt, 0x1000, 0) & HOST_IDT_PATCH_LIMIT_COVERS_MC,
             0
         );
+    }
+
+    #[test]
+    fn with_nmi_window_exiting_toggles_only_bit_22() {
+        let bit = x86::vmx::vmcs::control::PrimaryControls::NMI_WINDOW_EXITING.bits() as u64;
+        assert_eq!(bit, 1u64 << 22);
+
+        let base = 0x8000_0000u64; // SECONDARY_CONTROLS-ish placeholder
+        let armed = with_nmi_window_exiting(base, true);
+        assert_eq!(armed, base | bit);
+        assert_eq!(with_nmi_window_exiting(armed, false), base);
+        assert_eq!(with_nmi_window_exiting(armed, true), armed);
+        assert_eq!(with_nmi_window_exiting(base, false), base);
     }
 }

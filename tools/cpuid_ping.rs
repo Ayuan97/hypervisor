@@ -640,7 +640,7 @@ fn main() {
     }
 
     // === Layer 3: CMOS mirror of Layer 1 + Layer 4 ===
-    // CTL 110 first (refreshes cache from CMOS), then 111-117 read the cache.
+    // CTL 110 first (refreshes cache from CMOS), then 111-120 read the cache.
     // After a freeze + hard reset, this is the ONLY layer whose state
     // survives (Layer 1 + 4 live in RAM). Two slots (A/B) are alternately
     // written every 64 VM-exits; reader picks newer valid via checksum.
@@ -663,6 +663,9 @@ fn main() {
             let l3_bitmap = hv_cmd(CMD_GET_CTL, 113);
             let l3_last_exit = hv_cmd(CMD_GET_CTL, 114) as u8;
             let l3_count = hv_cmd(CMD_GET_CTL, 115);
+            let l3_phase = hv_cmd(CMD_GET_CTL, 118) as u8;
+            let l3_command = hv_cmd(CMD_GET_CTL, 119) as u8;
+            let l3_client_read_phase = hv_cmd(CMD_GET_CTL, 121) as u8;
             // Distinguish prev-boot data (seq > this-boot flush count) from
             // this-boot live data (seq within [1, this-boot flushes]).
             let origin = if l3_seq > 0 && l3_seq <= l3_actual_flush {
@@ -674,6 +677,9 @@ fn main() {
             println!("  port80_last       = 0x{:02x}  ({})", l3_port80, port80_decode(l3_port80));
             println!("  last_exit_reason  = 0x{:02x}  ({})", l3_last_exit,
                 if l3_last_exit == 0 { "none captured" } else { "basic vmexit reason" });
+            println!("  handler_phase     = 0x{:02x}", l3_phase);
+            println!("  cpuid_command     = 0x{:02x}", l3_command);
+            println!("  client_read_phase = 0x{:02x}", l3_client_read_phase);
             println!("  handler_active    = {:#018x}  count={}", l3_bitmap, l3_count);
             if l3_count > 0 {
                 let mut cpus = Vec::new();

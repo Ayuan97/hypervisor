@@ -13,7 +13,11 @@ if %errorlevel% neq 0 (
 
 sc stop %SERVICE_NAME% >nul 2>&1
 if %errorlevel% neq 0 (
-    echo [-] Failed to stop service ^(may not be running^).
+    echo [-] Failed to stop service.
+    echo     A live HV intentionally disables standard DriverUnload.
+    echo     Reboot before removing or replacing this service.
+    echo     Service was not deleted.
+    exit /b 1
 )
 
 powershell -NoProfile -Command "Start-Sleep -Seconds 1" >nul 2>&1

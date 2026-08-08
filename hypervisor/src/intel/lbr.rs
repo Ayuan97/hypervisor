@@ -10,10 +10,10 @@
 //! session eventually froze even though the P1 CPUID/MSR consistency was
 //! clean.
 //!
-//! The shadow is enabled by default because a full snapshot is required for
-//! the guest to observe its own branch history rather than VM-exit handler
-//! activity. The cost is paid only while guest DEBUGCTL.LBR is set. When
-//! active:
+//! The raw legacy-MSR shadow is disabled by default and requires the explicit
+//! build flag `HV_LBR_SHADOW=1`. Hybrid processors can expose different LBR
+//! capabilities on different core types, and an unsupported RDMSR/WRMSR in
+//! VMX root cannot be recovered like a guest #GP. When explicitly enabled:
 //! 1. Read guest `IA32_DEBUGCTL` from the VMCS. If LBR bit (0) is clear, skip.
 //! 2. Snapshot all 32 pairs of LBR stack MSRs plus TOS to a per-CPU buffer.
 //!    VM-exit already clears host `IA32_DEBUGCTL`, so host handler branches do
@@ -57,11 +57,11 @@ const LBR_NR_ENTRIES: usize = 32;
 const LBR_CAPABILITY_UNKNOWN: u8 = 0;
 const LBR_CAPABILITY_SUPPORTED: u8 = 1;
 const LBR_CAPABILITY_UNSUPPORTED: u8 = 2;
-static LBR_32_CAPABILITY: AtomicU8 = AtomicU8::new(LBR_CAPABILITY_UNKNOWN);
-
 /// Match `diag::MAX_TRACKED_CPUS`. Kept as a separate const so this module
 /// does not depend on `diag`'s public re-export.
 const MAX_LBR_CPUS: usize = 64;
+static LBR_32_CAPABILITY: [AtomicU8; MAX_LBR_CPUS] =
+    [const { AtomicU8::new(LBR_CAPABILITY_UNKNOWN) }; MAX_LBR_CPUS];
 
 #[repr(C, align(64))]
 struct LbrSlot {
@@ -108,8 +108,21 @@ fn depth_mask_supports_32(mask: u32) -> bool {
     mask & (1 << 3) != 0
 }
 
+const fn lbr_shadow_enabled(value: Option<&str>) -> bool {
+    let Some(value) = value else {
+        return false;
+    };
+    let bytes = value.as_bytes();
+    bytes.len() == 1 && bytes[0] == b'1'
+}
+
 fn host_lbr_32_supported() -> bool {
-    match LBR_32_CAPABILITY.load(Relaxed) {
+    let cpu = host_idt::current_cpu_index();
+    if cpu >= MAX_LBR_CPUS {
+        return false;
+    }
+    let capability = &LBR_32_CAPABILITY[cpu];
+    match capability.load(Relaxed) {
         LBR_CAPABILITY_SUPPORTED => return true,
         LBR_CAPABILITY_UNSUPPORTED => return false,
         _ => {}
@@ -122,7 +135,7 @@ fn host_lbr_32_supported() -> bool {
     } else {
         LBR_CAPABILITY_UNSUPPORTED
     };
-    let _ = LBR_32_CAPABILITY.compare_exchange(
+    let _ = capability.compare_exchange(
         LBR_CAPABILITY_UNKNOWN,
         state,
         core::sync::atomic::Ordering::Release,
@@ -139,6 +152,10 @@ fn host_lbr_32_supported() -> bool {
 /// before VMRESUME to reverse this).
 #[inline]
 pub fn save_and_disable_lbr() -> bool {
+    if !lbr_shadow_enabled(option_env!("HV_LBR_SHADOW")) {
+        return false;
+    }
+
     // VM-exit clears host IA32_DEBUGCTL. Read the guest value from the VMCS
     // so we only snapshot when guest LBR recording was actually enabled.
     let debugctl = vmread_checked(vmcs_guest::IA32_DEBUGCTL_FULL).unwrap_or(0);
@@ -206,12 +223,20 @@ pub fn restore_lbr() {
 
 #[cfg(test)]
 mod tests {
-    use super::depth_mask_supports_32;
+    use super::{depth_mask_supports_32, lbr_shadow_enabled};
 
     #[test]
     fn architectural_lbr_depth_mask_requires_32_entry_bit() {
         assert!(!depth_mask_supports_32(0));
         assert!(!depth_mask_supports_32(1 << 2));
         assert!(depth_mask_supports_32(1 << 3));
+    }
+
+    #[test]
+    fn raw_lbr_shadow_requires_explicit_build_opt_in() {
+        assert!(!lbr_shadow_enabled(None));
+        assert!(!lbr_shadow_enabled(Some("0")));
+        assert!(!lbr_shadow_enabled(Some("true")));
+        assert!(lbr_shadow_enabled(Some("1")));
     }
 }

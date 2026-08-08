@@ -9,6 +9,8 @@ set "DLL_PATH=%~dp0..\target\release\matrix.dll"
 echo [*] Building client-read driver...
 echo [*] Build flags: HV_USER_CLIENT_READS=%HV_USER_CLIENT_READS%
 cd /d "%~dp0.."
+:: Ensure a failed remap experiment does not poison this shell.
+set "RUSTFLAGS="
 cargo clean -p matrix -p hypervisor >nul 2>&1
 cargo build -p matrix --release
 if %errorlevel% neq 0 (
@@ -30,4 +32,13 @@ if %errorlevel% neq 0 (
     exit /b 1
 )
 
+set "OUT_HV=D:\cheat\output\hv\matrix_client.sys"
+echo [*] Copying to workspace deploy path: %OUT_HV%
+copy /Y "%DRIVER_PATH%" "%OUT_HV%" >nul
+if %errorlevel% neq 0 (
+    echo [-] Copy to output\hv failed.
+    exit /b 1
+)
+
 echo [+] Client-read driver ready: %DRIVER_PATH%
+echo [+] Deploy copy: %OUT_HV%

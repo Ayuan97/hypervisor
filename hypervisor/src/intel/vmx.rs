@@ -24,7 +24,7 @@ use {
         },
     },
     alloc::boxed::Box,
-    core::{cell::UnsafeCell, ptr::NonNull},
+    core::{cell::UnsafeCell, mem::MaybeUninit, ptr::NonNull},
     x86::{cpuid::cpuid, msr, vmx::vmcs},
 };
 
@@ -163,53 +163,62 @@ pub struct Vmx {
     /// TSC value captured at CPUID VM-exit entry; when non-zero the next
     /// RDTSC/RDTSCP exit returns a spoofed value and clears this field.
     pub cpuid_entry_tsc: u64,
+
 }
 
-impl Vmx {
-    /// Creates a new instance of the `Vmx` struct.
-    ///
-    /// This function allocates and initializes the necessary structures for VMX virtualization.
-    /// It ensures that the memory allocations required for VMX are performed safely and efficiently.
-    ///
-    /// Returns a `Result` with a boxed `Vmx` instance or an `HypervisorError`.
-    #[rustfmt::skip]
-    pub fn new(shared_data: &SharedData, context: &CONTEXT) -> Result<Box<Self>, HypervisorError> {
-        log::debug!("Setting up VMX");
-        diag::boot_stage(500)?;
+/// Complete per-CPU launch storage allocated on the BSP before any LP is
+/// non-root. It remains owned by the VCPU across launch failures, so the
+/// partially virtualized window contains neither allocations nor frees.
+pub struct VmxContigPrealloc {
+    vmxon_region: Box<Vmxon, PhysicalAllocator>,
+    vmcs_region: Box<Vmcs, PhysicalAllocator>,
+    guest_msr_state: Box<VmxMsrList, PhysicalAllocator>,
+    host_msr_state: Box<VmxMsrList, PhysicalAllocator>,
+    guest_descriptor_table: Box<DescriptorTables, KernelAlloc>,
+    host_descriptor_table: Box<DescriptorTables, KernelAlloc>,
+    vmstack: Box<VmStack, KernelAlloc>,
+    instance_storage: Box<MaybeUninit<Vmx>, KernelAlloc>,
+}
 
-        // Allocate memory for the hypervisor's needs
-        let vmxon_region = unsafe { Box::try_new_zeroed_in(PhysicalAllocator)?.assume_init() };
-        let vmcs_region = unsafe { Box::try_new_zeroed_in(PhysicalAllocator)?.assume_init() };
+impl VmxContigPrealloc {
+    pub fn allocate() -> Result<Self, HypervisorError> {
+        Ok(Self {
+            vmxon_region: unsafe { Box::try_new_zeroed_in(PhysicalAllocator)?.assume_init() },
+            vmcs_region: unsafe { Box::try_new_zeroed_in(PhysicalAllocator)?.assume_init() },
+            // Placeholder values; filled on the target LP in `into_vmx`.
+            guest_msr_state: Box::try_new_in(VmxMsrList::guest(0, None), PhysicalAllocator)?,
+            host_msr_state: Box::try_new_in(VmxMsrList::host(0, false), PhysicalAllocator)?,
+            guest_descriptor_table: Box::try_new_in(DescriptorTables::new(), KernelAlloc)?,
+            host_descriptor_table: Box::try_new_in(
+                DescriptorTables::new_preallocated_for_host()?,
+                KernelAlloc,
+            )?,
+            vmstack: unsafe { Box::try_new_zeroed_in(KernelAlloc)?.assume_init() },
+            instance_storage: Box::try_new_in(MaybeUninit::uninit(), KernelAlloc)?,
+        })
+    }
+
+    fn into_vmx(self, shared_data: &SharedData) -> Box<Vmx, KernelAlloc> {
         let initial_tsc_aux = unsafe { msr::rdmsr(IA32_TSC_AUX) };
         let pmu_present = (cpuid!(0xA).eax & 0xff) != 0;
         let initial_perf_global_ctrl =
             pmu_present.then(|| unsafe { msr::rdmsr(IA32_PERF_GLOBAL_CTRL) });
-        let guest_msr_state = Box::try_new_in(
-            VmxMsrList::guest(initial_tsc_aux, initial_perf_global_ctrl),
-            PhysicalAllocator,
-        )?;
-        let host_msr_state = Box::try_new_in(
-            VmxMsrList::host(initial_tsc_aux, pmu_present),
-            PhysicalAllocator,
-        )?;
-        let mut guest_descriptor_table = Box::try_new_in(DescriptorTables::new(), KernelAlloc)?;
-        let mut host_descriptor_table = Box::try_new_in(DescriptorTables::new(), KernelAlloc)?;
-        let vmstack = unsafe { Box::try_new_zeroed_in(KernelAlloc)?.assume_init() };
-        let guest_registers = GuestRegisters::default();
-        let control_registers = ControlRegisterSnapshot::capture();
-        diag::boot_stage(510)?;
 
-        // To capture the current GDT and IDT for the guest the order is important so we can setup up a new GDT and IDT for the host.
-        // This is done here instead of `setup_virtualization` because it uses a vec to allocate memory for the new GDT
-        DescriptorTables::initialize_for_guest(&mut guest_descriptor_table)?;
-        DescriptorTables::initialize_for_host(&mut host_descriptor_table)?;
-        diag::boot_stage(520)?;
+        let Self {
+            vmxon_region,
+            vmcs_region,
+            mut guest_msr_state,
+            mut host_msr_state,
+            guest_descriptor_table,
+            host_descriptor_table,
+            vmstack,
+            mut instance_storage,
+        } = self;
 
-        diag::boot_stage(530)?;
+        *guest_msr_state = VmxMsrList::guest(initial_tsc_aux, initial_perf_global_ctrl);
+        *host_msr_state = VmxMsrList::host(initial_tsc_aux, pmu_present);
 
-        log::trace!("Creating Vmx instance");
-
-        let instance = Self {
+        instance_storage.write(Vmx {
             vmxon_region,
             vmcs_region,
             guest_msr_state,
@@ -218,11 +227,8 @@ impl Vmx {
             guest_descriptor_table,
             host_descriptor_table,
             vmstack,
-            control_registers,
-            guest_registers,
-            // VM-exit commands may mutate shared EPT/client state; the
-            // launch path only borrows it immutably while constructing each
-            // VCPU, then the VMX owner serializes mutable commands.
+            control_registers: ControlRegisterSnapshot::capture(),
+            guest_registers: GuestRegisters::default(),
             shared_data: unsafe {
                 NonNull::new_unchecked(shared_data as *const _ as *mut _)
             },
@@ -230,22 +236,79 @@ impl Vmx {
             bugcheck_hook_mtf_recloak: false,
             tsc_offset: 0,
             cpuid_entry_tsc: 0,
-        };
+        });
 
-        let mut instance = Box::new(instance);
-
+        let mut instance = unsafe { instance_storage.assume_init() };
         instance.vmstack.vmx = &mut *instance as *mut _ as _;
+        instance
+    }
+}
+
+impl Vmx {
+    /// Creates a new instance of the `Vmx` struct.
+    #[rustfmt::skip]
+    pub fn new(
+        shared_data: &SharedData,
+        context: &CONTEXT,
+    ) -> Result<Box<Self, KernelAlloc>, HypervisorError> {
+        let prealloc = VmxContigPrealloc::allocate()?;
+        let mut instance = prealloc.into_vmx(shared_data);
+        if let Err(error) = instance.initialize(shared_data, context) {
+            if matches!(&error, HypervisorError::VMXOFFFailed) {
+                core::mem::forget(instance);
+            }
+            return Err(error);
+        }
+        Ok(instance)
+    }
+
+    /// Moves complete BSP-preallocated launch storage into its final stable
+    /// allocation. This operation performs no allocation and cannot fail.
+    pub(crate) fn from_prealloc(
+        shared_data: &SharedData,
+        prealloc: VmxContigPrealloc,
+    ) -> Box<Self, KernelAlloc> {
+        prealloc.into_vmx(shared_data)
+    }
+
+    /// Captures target-CPU tables and enters VMX using already-owned storage.
+    /// The caller must retain `self` on every error until all CPUs are native.
+    pub(crate) fn initialize(
+        &mut self,
+        shared_data: &SharedData,
+        context: &CONTEXT,
+    ) -> Result<(), HypervisorError> {
+        log::debug!("Setting up VMX");
+        diag::boot_stage(500)?;
+
+        diag::boot_stage(510)?;
+
+        // Capture the guest pointers before replacing the host copies. Both
+        // descriptor boxes and all Vec capacity were reserved before launch.
+        DescriptorTables::initialize_for_guest(&mut self.guest_descriptor_table)?;
+        DescriptorTables::initialize_for_host(&mut self.host_descriptor_table)?;
+        diag::boot_stage(520)?;
+
+        diag::boot_stage(530)?;
 
         diag::boot_stage(540)?;
-        instance.setup_virtualization(shared_data, context)?;
-        diag::boot_stage(550)?;
+        if let Err(error) = self.setup_virtualization(shared_data, context) {
+            return Err(error);
+        }
+        if let Err(error) = diag::boot_stage(550) {
+            let error = match self.teardown_vmx_operation("boot-stage stop after setup") {
+                Ok(()) => error,
+                Err(teardown_error) => teardown_error,
+            };
+            return Err(error);
+        }
 
-        log::debug!("Dumping VMCS: {:#x?}", instance.vmcs_region);
+        log::debug!("Dumping VMCS: {:#x?}", self.vmcs_region);
         log::debug!("Dumping CONTEXT: {:#x?}", &context);
 
         log::debug!("VMX setup successfully!");
 
-        Ok(instance)
+        Ok(())
     }
 
     pub fn teardown_vmx_operation(&self, context: &str) -> Result<(), HypervisorError> {
@@ -260,13 +323,24 @@ impl Vmx {
         }
         if let Err(error) = support::vmxoff() {
             log::error!("Failed to cleanup VMXON during {}: {:?}", context, error);
-            if first_error.is_none() {
-                first_error = Some(error);
-            }
+            // CR4.VMXE cannot be cleared while the CPU may still be in VMX
+            // operation. Keep both control state and all backing storage.
+            return Err(error);
         }
         self.restore_control_registers();
 
         first_error.map_or(Ok(()), Err)
+    }
+
+    /// Rewrite guest VMCS + soft GPRs from a context captured *immediately*
+    /// before VMLAUNCH (after `Vmx::new` has returned). See
+    /// `Vcpu::virtualize_cpu_prealloc` late-capture notes.
+    pub fn reapply_guest_context(&mut self, context: &CONTEXT) -> Result<(), HypervisorError> {
+        Vmcs::setup_guest_registers_state(
+            context,
+            &self.guest_descriptor_table,
+            &mut self.guest_registers,
+        )
     }
 
     /// Sets up the virtualization environment using the VMX capabilities.
@@ -371,9 +445,9 @@ impl Vmx {
         }
         if let Err(error) = support::vmxoff() {
             log::error!("Failed to cleanup VMXON after {}: {:?}", context, error);
-            if cleanup_error.is_none() {
-                cleanup_error = Some(error);
-            }
+            // Fail closed: restoring the pre-VMX CR4 could clear VMXE while
+            // VMXOFF has not been confirmed.
+            return error;
         }
         self.restore_control_registers();
         cleanup_error.unwrap_or(original_error)
@@ -394,7 +468,9 @@ impl Vmx {
 
         log::info!("Launching VM for processor {}", cpu_index);
         crate::intel::diag_trace::trace("vmlaunch: entering guest");
-        if let Err(error) = diag::boot_stage(700 + cpu_index as u64) {
+        // Monotonic per-CPU VMLAUNCH band (700 + 3*cpu); see diag::launch_stage_band.
+        if let Err(error) = diag::boot_stage(diag::launch_stage_band(cpu_index, diag::LAUNCH_PHASE_VMLAUNCH))
+        {
             if let Err(teardown_error) = self.teardown_vmx_operation("boot-stage stop") {
                 log::error!(
                     "VMX teardown failed after boot-stage stop: {:?}",
@@ -404,7 +480,12 @@ impl Vmx {
             }
             return Err(error);
         }
-        unsafe { launch_vm(&mut self.guest_registers, vmcs_host_rsp as *mut u64) };
+        let launch_status =
+            unsafe { launch_vm(&mut self.guest_registers, vmcs_host_rsp as *mut u64) };
+        if launch_status == 0 {
+            crate::intel::diag_trace::trace("vmlaunch: guest continuation returned");
+            return Ok(());
+        }
         crate::intel::diag_trace::trace("vmlaunch: returned (FAILED)");
 
         // `vmlaunch_failed` executes VMXOFF before returning to this frame.

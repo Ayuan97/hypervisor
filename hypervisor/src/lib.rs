@@ -3,7 +3,6 @@
 #![no_std]
 #![feature(allocator_api)]
 #![feature(const_trait_impl)]
-#![feature(once_cell_try)]
 
 extern crate alloc;
 extern crate static_assertions;

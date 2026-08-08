@@ -61,39 +61,81 @@ pub enum ExitType {
     Continue,
 }
 
+const VM_ENTRY_EVENT_VALID: u64 = 1 << 31;
+const VM_ENTRY_EVENT_ALLOWED_MASK: u64 = VM_ENTRY_EVENT_VALID | 0x0fff;
+
+fn sanitized_vectoring_info(vectoring_info: u64) -> u64 {
+    // IDT-vectoring bit 12 reports NMI-unblocking caused by IRET. The matching
+    // bit is reserved in VM-entry interruption info, as are bits 13..30.
+    vectoring_info & VM_ENTRY_EVENT_ALLOWED_MASK
+}
+
+fn event_type_needs_instruction_len(event_type: u64) -> bool {
+    matches!(event_type, 4 | 5 | 6)
+}
+
 /// Re-inject any event that was being delivered through the guest IDT when this
-/// VM-exit occurred.  If the valid bit in IDT_VECTORING_INFO is set, the CPU
-/// was mid-delivery of an interrupt/exception and that event was lost.  We copy
-/// it into VMENTRY_INTERRUPTION_INFO so the CPU re-delivers it on vmresume.
-/// Without this, timer interrupts (and others) can be silently dropped during
-/// heavy VM-exit traffic, stalling the guest scheduler → system freeze.
+/// VM-exit occurred. If the valid bit in IDT_VECTORING_INFO is set, the CPU was
+/// mid-delivery of an interrupt/exception and that event must be re-delivered.
 #[inline]
-fn reinject_idt_vectoring_event() {
-    let vectoring_info = vmread_checked(ro::IDT_VECTORING_INFO).unwrap_or(0);
-    if vectoring_info & (1 << 31) != 0 {
-        let _ = vmwrite_checked(
-            x86::vmx::vmcs::control::VMENTRY_INTERRUPTION_INFO_FIELD,
-            vectoring_info,
-        );
-        let event_type = (vectoring_info >> 8) & 0x7;
-        let has_error_code = (vectoring_info >> 11) & 1 != 0;
-        if has_error_code {
-            let error_code = vmread_checked(ro::IDT_VECTORING_ERR_CODE).unwrap_or(0);
-            let _ = vmwrite_checked(
-                x86::vmx::vmcs::control::VMENTRY_EXCEPTION_ERR_CODE,
-                error_code,
-            );
-        }
-        if event_type == 4 || event_type == 6 {
-            let instr_len = vmread_checked(ro::VMEXIT_INSTRUCTION_LEN).unwrap_or(0);
-            if instr_len != 0 {
-                let _ = vmwrite_checked(
-                    x86::vmx::vmcs::control::VMENTRY_INSTRUCTION_LEN,
-                    instr_len,
-                );
+fn reinject_idt_vectoring_event() -> Result<(), HypervisorError> {
+    diag::cpu_enter_phase(diag::PHASE_REINJECT_VECTORING);
+    let raw_vectoring_info = vmread_checked(ro::IDT_VECTORING_INFO)?;
+    if raw_vectoring_info & VM_ENTRY_EVENT_VALID == 0 {
+        return Ok(());
+    }
+
+    let vectoring_info = sanitized_vectoring_info(raw_vectoring_info);
+    let event_type = (vectoring_info >> 8) & 0x7;
+    let error_code = if (vectoring_info >> 11) & 1 != 0 {
+        match vmread_checked(ro::IDT_VECTORING_ERR_CODE) {
+            Ok(error_code) => error_code,
+            Err(error) => {
+                diag::note_idt_vectoring_event(raw_vectoring_info, u64::MAX, None);
+                return Err(error);
             }
         }
+    } else {
+        0
+    };
+    if (vectoring_info >> 11) & 1 != 0 {
+        vmwrite_checked(
+            x86::vmx::vmcs::control::VMENTRY_EXCEPTION_ERR_CODE,
+            error_code,
+        )?;
     }
+    if event_type_needs_instruction_len(event_type) {
+        let instruction_len = vmread_checked(ro::VMEXIT_INSTRUCTION_LEN)?;
+        if !(1..=15).contains(&instruction_len) {
+            diag::note_idt_vectoring_event(raw_vectoring_info, error_code, None);
+            log::warn!(
+                "Dropping invalid software-event reinjection length {}",
+                instruction_len
+            );
+            return Ok(());
+        }
+        vmwrite_checked(
+            x86::vmx::vmcs::control::VMENTRY_INSTRUCTION_LEN,
+            instruction_len,
+        )?;
+    }
+
+    let existing_entry_info =
+        vmread_checked(x86::vmx::vmcs::control::VMENTRY_INTERRUPTION_INFO_FIELD)?;
+    let entry_conflict = if existing_entry_info & VM_ENTRY_EVENT_VALID != 0 {
+        // Preserve the established reinjection behavior for this diagnostic
+        // build, but retain evidence that a handler event was overwritten.
+        Some(existing_entry_info)
+    } else {
+        None
+    };
+    diag::note_idt_vectoring_event(raw_vectoring_info, error_code, entry_conflict);
+
+    // Publish the valid bit last, after every dependent field is ready.
+    vmwrite_checked(
+        x86::vmx::vmcs::control::VMENTRY_INTERRUPTION_INFO_FIELD,
+        vectoring_info,
+    )
 }
 
 pub struct VmExit;
@@ -129,15 +171,37 @@ impl VmExit {
         // on every Ok/Err return; fatal_vmx_failure_loop_pub() is `-> !` and
         // never drops, so the flag stays 1 to record "died in HV". See diag.rs.
         let _handler_guard = diag::handler_enter();
-
-        // Snapshot the LBR stack only when the explicit shadow build gate and
-        // guest DEBUGCTL.LBR are both enabled. See intel/lbr.rs.
-        let lbr_saved = crate::intel::lbr::save_and_disable_lbr();
+        diag::cpu_enter_phase(diag::PHASE_VMEXIT_ENTRY);
 
         let exit_reason = vmread_checked(ro::EXIT_REASON)? as u32;
-        diag::watchdog_handler_start(exit_tsc_start, exit_reason as u64);
         let vm_entry_failure = (exit_reason & 0x8000_0000) != 0;
         let basic_reason = exit_reason & 0xFFFF;
+
+        // Capture the architectural context before LBR handling or dispatch.
+        // A VMREAD or later helper can fault or stall; the terminal recorder
+        // must still retain the reason and the last guest RIP in that case.
+        let guest_rip_result = vmread_checked(guest::RIP);
+        let guest_rip = guest_rip_result.as_ref().copied().unwrap_or(0);
+        let qualification = if vm_entry_failure
+            || !matches!(basic_reason, 10 | 16 | 51)
+        {
+            vmread_checked(ro::EXIT_QUALIFICATION).ok()
+        } else {
+            None
+        };
+        crate::intel::terminal_capture::handler_entry(
+            exit_reason as u64,
+            guest_rip_result.as_ref().ok().copied(),
+            qualification,
+            exit_tsc_start,
+        );
+
+        // Snapshot the LBR stack only when the explicit shadow build gate and
+        // guest DEBUGCTL.LBR are both enabled. See intel/lbr.rs. This is after
+        // terminal entry publication so LBR itself cannot erase the evidence.
+        let lbr_saved = crate::intel::lbr::save_and_disable_lbr();
+
+        diag::watchdog_handler_start(exit_tsc_start, exit_reason as u64);
         // Keep the RAM breadcrumb current. Ordinary VM-exits must not touch
         // POST/CMOS ports; fatal paths retain explicit persistent breadcrumbs.
         diag::port80_vmexit(basic_reason);
@@ -152,22 +216,63 @@ impl VmExit {
             diag::EXIT_OTHER.fetch_add(1, Relaxed);
             diag::LAST_HANDLER_ID.store(200, Relaxed);
             diag::LAST_HANDLER_DETAIL.store(exit_reason as u64, Relaxed);
-            let guest_rip = vmread_checked(guest::RIP).unwrap_or(0);
-            let exit_qual = vmread_checked(ro::EXIT_QUALIFICATION).unwrap_or(0);
+            diag::LAST_VM_INSTRUCTION_KIND.store(3, Relaxed);
+            let instruction_error = vmread_checked(ro::VM_INSTRUCTION_ERROR)
+                .unwrap_or(u64::MAX);
+            diag::LAST_VM_INSTRUCTION_ERROR.store(instruction_error, Relaxed);
+            let _ = crate::intel::terminal_capture::force_current(
+                crate::intel::terminal_capture::KIND_VM_ENTRY_FAILURE,
+                instruction_error as u8,
+                (exit_reason & 0xff) as u8,
+            );
+            diag::capture_vmcs_guest_state();
+            diag::LAST_VMENTRY_INTERRUPTION_INFO.store(
+                vmread_checked(x86::vmx::vmcs::control::VMENTRY_INTERRUPTION_INFO_FIELD)
+                    .unwrap_or(u64::MAX),
+                Relaxed,
+            );
+            diag::LAST_GUEST_INTERRUPTIBILITY.store(
+                vmread_checked(guest::INTERRUPTIBILITY_STATE).unwrap_or(u64::MAX),
+                Relaxed,
+            );
+            diag::LAST_GUEST_ACTIVITY_STATE.store(
+                vmread_checked(guest::ACTIVITY_STATE).unwrap_or(u64::MAX),
+                Relaxed,
+            );
+            diag::LAST_GUEST_PENDING_DEBUG.store(
+                vmread_checked(guest::PENDING_DBG_EXCEPTIONS).unwrap_or(u64::MAX),
+                Relaxed,
+            );
+            let exit_qual = qualification.unwrap_or(0);
             diag::ring_record(exit_reason as u64, guest_rip, exit_qual, 0xDEAD_E0);
             log::error!(
-                "VM-entry failure: reason={:#x} qual={:#x} rip={:#x} — halting CPU",
+                "VM-entry failure: reason={:#x} qual={:#x} rip={:#x}; leaving VMX",
                 exit_reason, exit_qual, guest_rip
             );
-            // Force Layer 3 + Step4 CMOS before the non-returning halt so the
+            // Force Layer 3 + Step4 CMOS before returning the error so the
             // hard-reset reader sees this failure, not a slot up to 63 exits
-            // stale. handler_entry_persist already ran above; force again with
-            // the fatal port80 stamp and active bitmap including this CPU.
+            // stale. vmexit_handler will use recover_from_handler_error to
+            // VMXOFF and restore the interrupted guest context.
             diag::port80(basic_reason as u8);
             diag::cmos_sync_step4_state();
             diag::layer3_force_flush();
-            crate::intel::vmlaunch::fatal_vmx_failure_loop_pub();
+            if let Err(error) = guest_rip_result {
+                return Err(error);
+            }
+            return Err(HypervisorError::VMRESUMEFailed);
         }
+
+        if let Err(error) = guest_rip_result {
+            return Err(error);
+        }
+
+        // VM-entry controls persist in the VMCS. Clear an event consumed by
+        // the previous successful entry before this exit's handlers queue a
+        // new event; otherwise one injection can repeat until entry fails.
+        vmwrite_checked(
+            x86::vmx::vmcs::control::VMENTRY_INTERRUPTION_INFO_FIELD,
+            0u64,
+        )?;
 
         // ── Fast path: CPUID / RDTSC / RDTSCP ──
         // The slow path bumps EXIT_TOTAL / per-reason counters after
@@ -182,10 +287,11 @@ impl VmExit {
             diag::EXIT_CPUID.fetch_add(1, Relaxed);
             diag::LAST_EXIT_REASON.store(exit_reason as u64, Relaxed);
             diag::cpu_enter_phase(diag::PHASE_FAST_CPUID);
-            guest_registers.rip = vmread_checked(guest::RIP)?;
+            guest_registers.rip = guest_rip;
             diag::observe_guest_rip_for_bugcheck(guest_registers.rip, guest_registers.rcx);
-            diag::cpu_enter_phase(diag::PHASE_FAST_CPUID_DONE);
+            diag::cpu_set_cpuid_context(guest_registers.rax, guest_registers.rcx);
             let exit_type = handle_cpuid(guest_registers, vmx, exit_tsc_start);
+            diag::cpu_enter_phase(diag::PHASE_FAST_CPUID_DONE);
             diag::cpu_enter_phase(diag::PHASE_FAST_RIP_ADV);
             if exit_type_advances_rip(exit_type) {
                 self.advance_guest_rip(guest_registers)?;
@@ -211,7 +317,8 @@ impl VmExit {
                 self.leave_vmx_root(vmx)?;
                 return Ok(exit_type);
             }
-            reinject_idt_vectoring_event();
+            reinject_idt_vectoring_event()?;
+            diag::cpu_enter_phase(diag::PHASE_CHECK_NMI);
             super::host_idt::check_pending_nmi();
             diag::cpu_enter_phase(diag::PHASE_PRE_VMRESUME);
             diag::watchdog_handler_finish(guest_registers.rip);
@@ -226,14 +333,16 @@ impl VmExit {
             diag::EXIT_TOTAL.fetch_add(1, Relaxed);
             diag::EXIT_RDTSC.fetch_add(1, Relaxed);
             diag::LAST_EXIT_REASON.store(exit_reason as u64, Relaxed);
-            guest_registers.rip = vmread_checked(guest::RIP)?;
+            guest_registers.rip = guest_rip;
             diag::observe_guest_rip_for_bugcheck(guest_registers.rip, guest_registers.rcx);
             let exit_type = handle_rdtsc(guest_registers, vmx);
             if exit_type_advances_rip(exit_type) {
                 self.advance_guest_rip(guest_registers)?;
             }
-            reinject_idt_vectoring_event();
+            reinject_idt_vectoring_event()?;
+            diag::cpu_enter_phase(diag::PHASE_CHECK_NMI);
             super::host_idt::check_pending_nmi();
+            diag::cpu_enter_phase(diag::PHASE_PRE_VMRESUME);
             diag::watchdog_handler_finish(guest_registers.rip);
             if lbr_saved {
                 crate::intel::lbr::restore_lbr();
@@ -246,14 +355,16 @@ impl VmExit {
             diag::EXIT_TOTAL.fetch_add(1, Relaxed);
             diag::EXIT_RDTSC.fetch_add(1, Relaxed);
             diag::LAST_EXIT_REASON.store(exit_reason as u64, Relaxed);
-            guest_registers.rip = vmread_checked(guest::RIP)?;
+            guest_registers.rip = guest_rip;
             diag::observe_guest_rip_for_bugcheck(guest_registers.rip, guest_registers.rcx);
             let exit_type = handle_rdtscp(guest_registers, vmx);
             if exit_type_advances_rip(exit_type) {
                 self.advance_guest_rip(guest_registers)?;
             }
-            reinject_idt_vectoring_event();
+            reinject_idt_vectoring_event()?;
+            diag::cpu_enter_phase(diag::PHASE_CHECK_NMI);
             super::host_idt::check_pending_nmi();
+            diag::cpu_enter_phase(diag::PHASE_PRE_VMRESUME);
             diag::watchdog_handler_finish(guest_registers.rip);
             if lbr_saved {
                 crate::intel::lbr::restore_lbr();
@@ -270,12 +381,12 @@ impl VmExit {
             cpuid::disable_rdtsc_exiting();
         }
 
-        guest_registers.rip = vmread_checked(guest::RIP)?;
+        guest_registers.rip = guest_rip;
         guest_registers.rsp = vmread_checked(guest::RSP)?;
         guest_registers.rflags = vmread_checked(guest::RFLAGS)?;
         diag::observe_guest_rip_for_bugcheck(guest_registers.rip, guest_registers.rcx);
 
-        let exit_qualification = vmread_checked(ro::EXIT_QUALIFICATION).unwrap_or(0);
+        let exit_qualification = qualification.unwrap_or(0);
 
         diag::ring_record(
             exit_reason as u64,
@@ -322,6 +433,14 @@ impl VmExit {
             }
             VmxBasicExitReason::ExternalInterrupt => {
                 diag::EXIT_EXT_INT.fetch_add(1, Relaxed);
+                ExitType::Continue
+            }
+            // NMI-window: guest can accept NMI. Do not advance RIP; end-of-handler
+            // `check_pending_nmi` injects and disarms the temporary window bit.
+            // Must not fall into the unhandled path (that injects #UD).
+            VmxBasicExitReason::NmiWindow => {
+                diag::EXIT_OTHER.fetch_add(1, Relaxed);
+                diag::LAST_HANDLER_ID.store(25, Relaxed);
                 ExitType::Continue
             }
             VmxBasicExitReason::Cpuid => {
@@ -420,38 +539,32 @@ impl VmExit {
                 diag::LAST_HANDLER_ID.store(18, Relaxed);
                 handle_xsetbv(guest_registers)
             }
-            // Basic reason 3. Intel SDM 25.2: "INIT signals are blocked in
-            // VMX non-root operation and cause VM-exit reason 3 instead of
-            // resetting the logical processor." The correct HV response is
-            // to DISCARD the INIT — guest continues unaffected. Previously
-            // this fell through to `handle_undefined_opcode_exception()`
-            // which injected #UD into guest, which is architecturally wrong
-            // (INIT is not an instruction) and observed 2026-07-16 as the
-            // root cause of an EAC-triggered freeze (Layer 6 caught CPU 11
-            // last exit reason = 3 at freeze moment).
-            //
-            // Guest missing an INIT signal is exactly what we want: whoever
-            // sent it (EAC probing, per known secret.club anti-VM technique)
-            // expected the CPU to reset. Silently swallowing the INIT means
-            // guest keeps running normally and the sender can't distinguish
-            // "INIT swallowed" from "target was busy". This is the standard
-            // stealth response.
+            // Runtime INIT/SIPI exits are observed but deliberately discarded.
+            // Rebuilding reset state or parking an already-running Windows AP
+            // can strand that processor when no matching SIPI follows.
             VmxBasicExitReason::InitSignal => {
                 diag::EXIT_OTHER.fetch_add(1, Relaxed);
                 diag::LAST_HANDLER_ID.store(21, Relaxed);
-                log::info!("INIT signal discarded (VMX non-root)");
+                diag::note_init_discarded();
                 ExitType::Continue
             }
 
-            // Basic reason 4. SIPI is the second half of INIT-SIPI-SIPI
-            // multiprocessor startup. In VMX non-root on a running CPU,
-            // SIPI is only meaningful right after INIT (which we swallow).
-            // Discarding preserves the "no reset happened" story to any
-            // observer.
             VmxBasicExitReason::StartupIpi => {
                 diag::EXIT_OTHER.fetch_add(1, Relaxed);
                 diag::LAST_HANDLER_ID.store(22, Relaxed);
-                log::info!("SIPI discarded (VMX non-root)");
+                let vector = (exit_qualification & 0xff) as u8;
+                diag::note_sipi_discarded(vector);
+                ExitType::Continue
+            }
+
+            // SMI exits are asynchronous platform events, not guest
+            // instructions. Injecting #UD at the current guest RIP corrupts
+            // unrelated Windows code and can cascade into a VM-entry failure.
+            VmxBasicExitReason::IoSystemManagementInterrupt | VmxBasicExitReason::OtherSmi => {
+                diag::EXIT_OTHER.fetch_add(1, Relaxed);
+                diag::LAST_HANDLER_ID.store(24, Relaxed);
+                diag::LAST_HANDLER_DETAIL
+                    .store(basic_exit_reason as u64, Relaxed);
                 ExitType::Continue
             }
 
@@ -495,7 +608,7 @@ impl VmExit {
             return Ok(exit_type);
         }
 
-        reinject_idt_vectoring_event();
+        reinject_idt_vectoring_event()?;
         diag::cpu_enter_phase(diag::PHASE_CHECK_NMI);
         super::host_idt::check_pending_nmi();
 
@@ -515,6 +628,16 @@ impl VmExit {
             guest_registers
         );
         log::debug!("VMEXIT handled successfully.");
+
+        match basic_exit_reason {
+            VmxBasicExitReason::InitSignal => {
+                diag::note_discard_complete(diag::INIT_DISCARD_COMPLETE_STAGE)
+            }
+            VmxBasicExitReason::StartupIpi => {
+                diag::note_discard_complete(diag::SIPI_DISCARD_COMPLETE_STAGE)
+            }
+            _ => {}
+        }
 
         Ok(exit_type)
     }
@@ -787,6 +910,27 @@ fn vmexit_breadcrumb_detail(exit_reason: u32, guest_registers: &GuestRegisters) 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn vectoring_reinjection_clears_nmi_unblocking_and_reserved_bits() {
+        let raw = VM_ENTRY_EVENT_VALID | (1 << 12) | (0x3ffff << 13) | (6 << 8) | (1 << 11) | 14;
+        let sanitized = sanitized_vectoring_info(raw);
+
+        assert_eq!(sanitized & VM_ENTRY_EVENT_VALID, VM_ENTRY_EVENT_VALID);
+        assert_eq!(sanitized & 0xff, 14);
+        assert_eq!((sanitized >> 8) & 0x7, 6);
+        assert_ne!(sanitized & (1 << 11), 0);
+        assert_eq!(sanitized & !VM_ENTRY_EVENT_ALLOWED_MASK, 0);
+    }
+
+    #[test]
+    fn all_software_event_types_require_an_instruction_length() {
+        assert!(event_type_needs_instruction_len(4));
+        assert!(event_type_needs_instruction_len(5));
+        assert!(event_type_needs_instruction_len(6));
+        assert!(!event_type_needs_instruction_len(0));
+        assert!(!event_type_needs_instruction_len(2));
+    }
 
     #[test]
     fn guest_vmx_probe_instructions_inject_ud() {

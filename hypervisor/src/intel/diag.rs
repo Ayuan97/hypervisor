@@ -2,9 +2,10 @@ use {
     crate::error::HypervisorError,
     core::sync::atomic::{
         AtomicBool,
+        AtomicU32,
         AtomicU64,
         AtomicU8,
-        Ordering::{Acquire, Relaxed, Release},
+        Ordering::{AcqRel, Acquire, Relaxed, Release},
     },
 };
 
@@ -40,6 +41,49 @@ pub static EXIT_VMX_INSTR: AtomicU64 = AtomicU64::new(0);
 pub static EXIT_PREEMPT: AtomicU64 = AtomicU64::new(0);
 pub static LAST_EXIT_REASON: AtomicU64 = AtomicU64::new(u64::MAX);
 
+// INIT/SIPI telemetry. Runtime INIT/SIPI exits are deliberately discarded;
+// these counters prove that the matching handler reached its return path.
+pub const INIT_DISCARD_SELECTED_STAGE: u64 = 6;
+pub const INIT_DISCARD_COMPLETE_STAGE: u64 = 7;
+pub const SIPI_DISCARD_SELECTED_STAGE: u64 = 14;
+pub const SIPI_DISCARD_COMPLETE_STAGE: u64 = 15;
+pub static INIT_COUNT: AtomicU64 = AtomicU64::new(0);
+pub static SIPI_COUNT: AtomicU64 = AtomicU64::new(0);
+pub static INIT_AWAITING_BITMAP: AtomicU64 = AtomicU64::new(0);
+pub static INIT_STAGE: AtomicU64 = AtomicU64::new(0);
+pub static INIT_STAGE_COUNT: AtomicU64 = AtomicU64::new(0);
+pub static INIT_LAST_CPU: AtomicU64 = AtomicU64::new(u64::MAX);
+pub static INIT_LAST_SIPI_VECTOR: AtomicU64 = AtomicU64::new(u64::MAX);
+
+#[inline]
+pub fn note_init_discarded() {
+    INIT_COUNT.fetch_add(1, Relaxed);
+    note_discard_stage(INIT_DISCARD_SELECTED_STAGE);
+}
+
+#[inline]
+pub fn note_sipi_discarded(vector: u8) {
+    SIPI_COUNT.fetch_add(1, Relaxed);
+    INIT_LAST_SIPI_VECTOR.store(vector as u64, Relaxed);
+    note_discard_stage(SIPI_DISCARD_SELECTED_STAGE);
+}
+
+#[inline]
+pub fn note_discard_complete(stage: u64) {
+    debug_assert!(matches!(stage, INIT_DISCARD_COMPLETE_STAGE | SIPI_DISCARD_COMPLETE_STAGE));
+    note_discard_stage(stage);
+}
+
+#[inline]
+fn note_discard_stage(stage: u64) {
+    let cpu = (rdtscp_aux() as usize) & (MAX_TRACKED_CPUS - 1);
+    let bit = 1u64 << cpu;
+    INIT_AWAITING_BITMAP.fetch_and(!bit, Relaxed);
+    INIT_LAST_CPU.store(cpu as u64, Relaxed);
+    INIT_STAGE.store(stage, Relaxed);
+    INIT_STAGE_COUNT.fetch_add(1, Relaxed);
+}
+
 pub static LAST_MSR_ADDR: AtomicU64 = AtomicU64::new(0);
 pub static LAST_MSR_ACTION: AtomicU64 = AtomicU64::new(0);
 pub static MSR_READ_COUNT: AtomicU64 = AtomicU64::new(0);
@@ -72,6 +116,241 @@ pub static LBR_DEBUGCTL_SHADOW: AtomicU64 = AtomicU64::new(0);
 pub static LAST_HANDLER_ID: AtomicU64 = AtomicU64::new(0);
 pub static LAST_HANDLER_DETAIL: AtomicU64 = AtomicU64::new(0);
 
+// Last guest event context. These are RAM-only, passive breadcrumbs consumed
+// by the local-file worker. The compact rare-exit CMOS record below carries
+// the subset needed to disambiguate a hard-reset postmortem.
+pub static LAST_EXCEPTION_CPU: AtomicU64 = AtomicU64::new(u64::MAX);
+pub static LAST_EXIT_INTERRUPTION_INFO: AtomicU64 = AtomicU64::new(0);
+pub static LAST_EXIT_INTERRUPTION_ERROR: AtomicU64 = AtomicU64::new(0);
+pub static LAST_IDT_VECTORING_INFO: AtomicU64 = AtomicU64::new(0);
+pub static LAST_IDT_VECTORING_ERROR: AtomicU64 = AtomicU64::new(0);
+pub static LAST_ENTRY_INTERRUPTION_INFO: AtomicU64 = AtomicU64::new(0);
+pub static IDT_VECTORING_EVENT_COUNT: AtomicU64 = AtomicU64::new(0);
+pub static ENTRY_EVENT_CONFLICT_COUNT: AtomicU64 = AtomicU64::new(0);
+pub static EVENT_CONTEXT_DROPPED_COUNT: AtomicU64 = AtomicU64::new(0);
+
+#[derive(Clone, Copy)]
+pub struct EventContextSnapshot {
+    pub exception_cpu: u64,
+    pub exit_interruption_info: u64,
+    pub exit_interruption_error: u64,
+    pub idt_vectoring_info: u64,
+    pub idt_vectoring_error: u64,
+    pub entry_interruption_info: u64,
+    pub idt_vectoring_event_count: u64,
+    pub entry_event_conflict_count: u64,
+    pub dropped_updates: u64,
+}
+
+struct EventContextSlot {
+    exception_cpu: AtomicU64,
+    exit_interruption_info: AtomicU64,
+    exit_interruption_error: AtomicU64,
+    idt_vectoring_info: AtomicU64,
+    idt_vectoring_error: AtomicU64,
+    entry_interruption_info: AtomicU64,
+    idt_vectoring_event_count: AtomicU64,
+    entry_event_conflict_count: AtomicU64,
+}
+
+impl EventContextSlot {
+    const fn new() -> Self {
+        Self {
+            exception_cpu: AtomicU64::new(u64::MAX),
+            exit_interruption_info: AtomicU64::new(0),
+            exit_interruption_error: AtomicU64::new(0),
+            idt_vectoring_info: AtomicU64::new(0),
+            idt_vectoring_error: AtomicU64::new(0),
+            entry_interruption_info: AtomicU64::new(0),
+            idt_vectoring_event_count: AtomicU64::new(0),
+            entry_event_conflict_count: AtomicU64::new(0),
+        }
+    }
+
+    fn copy_from(&self, source: &Self) {
+        self.exception_cpu
+            .store(source.exception_cpu.load(Relaxed), Relaxed);
+        self.exit_interruption_info
+            .store(source.exit_interruption_info.load(Relaxed), Relaxed);
+        self.exit_interruption_error
+            .store(source.exit_interruption_error.load(Relaxed), Relaxed);
+        self.idt_vectoring_info
+            .store(source.idt_vectoring_info.load(Relaxed), Relaxed);
+        self.idt_vectoring_error
+            .store(source.idt_vectoring_error.load(Relaxed), Relaxed);
+        self.entry_interruption_info
+            .store(source.entry_interruption_info.load(Relaxed), Relaxed);
+        self.idt_vectoring_event_count
+            .store(source.idt_vectoring_event_count.load(Relaxed), Relaxed);
+        self.entry_event_conflict_count
+            .store(source.entry_event_conflict_count.load(Relaxed), Relaxed);
+    }
+
+    fn snapshot(&self) -> EventContextSnapshot {
+        EventContextSnapshot {
+            exception_cpu: self.exception_cpu.load(Relaxed),
+            exit_interruption_info: self.exit_interruption_info.load(Relaxed),
+            exit_interruption_error: self.exit_interruption_error.load(Relaxed),
+            idt_vectoring_info: self.idt_vectoring_info.load(Relaxed),
+            idt_vectoring_error: self.idt_vectoring_error.load(Relaxed),
+            entry_interruption_info: self.entry_interruption_info.load(Relaxed),
+            idt_vectoring_event_count: self.idt_vectoring_event_count.load(Relaxed),
+            entry_event_conflict_count: self.entry_event_conflict_count.load(Relaxed),
+            dropped_updates: EVENT_CONTEXT_DROPPED_COUNT.load(Relaxed),
+        }
+    }
+}
+
+static EVENT_CONTEXT_SLOTS: [EventContextSlot; 2] =
+    [const { EventContextSlot::new() }; 2];
+static EVENT_CONTEXT_PUBLISHED: AtomicU64 = AtomicU64::new(0);
+static EVENT_CONTEXT_WRITE_LOCK: AtomicBool = AtomicBool::new(false);
+
+fn update_event_context(update: impl FnOnce(&EventContextSlot)) {
+    if EVENT_CONTEXT_WRITE_LOCK
+        .compare_exchange(false, true, Acquire, Relaxed)
+        .is_err()
+    {
+        EVENT_CONTEXT_DROPPED_COUNT.fetch_add(1, Relaxed);
+        return;
+    }
+
+    let published = EVENT_CONTEXT_PUBLISHED.load(Relaxed);
+    let source = &EVENT_CONTEXT_SLOTS[published as usize & 1];
+    let target = &EVENT_CONTEXT_SLOTS[(published as usize & 1) ^ 1];
+    target.copy_from(source);
+    update(target);
+    EVENT_CONTEXT_PUBLISHED.store(published.wrapping_add(1), Release);
+    EVENT_CONTEXT_WRITE_LOCK.store(false, Release);
+}
+
+pub fn event_context_snapshot() -> EventContextSnapshot {
+    loop {
+        let before = EVENT_CONTEXT_PUBLISHED.load(Acquire);
+        let snapshot = EVENT_CONTEXT_SLOTS[before as usize & 1].snapshot();
+        let after = EVENT_CONTEXT_PUBLISHED.load(Acquire);
+        if before == after {
+            return snapshot;
+        }
+        core::hint::spin_loop();
+    }
+}
+
+#[inline]
+pub fn note_exception_exit(interruption_info: u64, error_code: u64) {
+    let cpu = rdtscp_aux() as u64;
+    update_event_context(|slot| {
+        slot.exception_cpu.store(cpu, Relaxed);
+        slot.exit_interruption_info
+            .store(interruption_info, Relaxed);
+        slot.exit_interruption_error.store(error_code, Relaxed);
+        LAST_EXCEPTION_CPU.store(cpu, Relaxed);
+        LAST_EXIT_INTERRUPTION_INFO.store(interruption_info, Relaxed);
+        LAST_EXIT_INTERRUPTION_ERROR.store(error_code, Relaxed);
+    });
+}
+
+#[inline]
+pub fn note_idt_vectoring_event(
+    interruption_info: u64,
+    error_code: u64,
+    entry_conflict: Option<u64>,
+) {
+    update_event_context(|slot| {
+        let count = slot
+            .idt_vectoring_event_count
+            .load(Relaxed)
+            .wrapping_add(1);
+        slot.idt_vectoring_info.store(interruption_info, Relaxed);
+        slot.idt_vectoring_error.store(error_code, Relaxed);
+        slot.idt_vectoring_event_count.store(count, Relaxed);
+        LAST_IDT_VECTORING_INFO.store(interruption_info, Relaxed);
+        LAST_IDT_VECTORING_ERROR.store(error_code, Relaxed);
+        IDT_VECTORING_EVENT_COUNT.store(count, Relaxed);
+        if let Some(interruption_info) = entry_conflict {
+            let conflict_count = slot
+                .entry_event_conflict_count
+                .load(Relaxed)
+                .wrapping_add(1);
+            slot.entry_interruption_info
+                .store(interruption_info, Relaxed);
+            slot.entry_event_conflict_count
+                .store(conflict_count, Relaxed);
+            LAST_ENTRY_INTERRUPTION_INFO.store(interruption_info, Relaxed);
+            ENTRY_EVENT_CONFLICT_COUNT.store(conflict_count, Relaxed);
+        }
+    });
+}
+
+// Captured immediately when VMLAUNCH/VMRESUME reports an instruction failure.
+// Local diagnostic builds flush these only after VMX teardown has completed.
+pub static LAST_VM_INSTRUCTION_KIND: AtomicU64 = AtomicU64::new(0);
+pub static LAST_VM_INSTRUCTION_ERROR: AtomicU64 = AtomicU64::new(u64::MAX);
+pub static LAST_VMENTRY_INTERRUPTION_INFO: AtomicU64 = AtomicU64::new(u64::MAX);
+pub static LAST_GUEST_INTERRUPTIBILITY: AtomicU64 = AtomicU64::new(u64::MAX);
+pub static LAST_GUEST_ACTIVITY_STATE: AtomicU64 = AtomicU64::new(u64::MAX);
+pub static LAST_GUEST_PENDING_DEBUG: AtomicU64 = AtomicU64::new(u64::MAX);
+
+pub const VMCS_GUEST_STATE_FIELD_COUNT: usize = 32;
+pub static LAST_VMCS_GUEST_STATE: [AtomicU64; VMCS_GUEST_STATE_FIELD_COUNT] =
+    [ZERO_U64; VMCS_GUEST_STATE_FIELD_COUNT];
+
+/// Snapshot every guest-state field relevant to Intel VM-entry validation.
+/// This is called only on a failure path, after the hardware has transferred
+/// control to VMX root, so it does not add work to the normal exit path.
+pub fn capture_vmcs_guest_state() {
+    use x86::vmx::vmcs::guest;
+
+    let fields = [
+        guest::CR0,
+        guest::CR3,
+        guest::CR4,
+        guest::DR7,
+        guest::RIP,
+        guest::RSP,
+        guest::RFLAGS,
+        guest::CS_SELECTOR,
+        guest::SS_SELECTOR,
+        guest::DS_SELECTOR,
+        guest::ES_SELECTOR,
+        guest::FS_SELECTOR,
+        guest::GS_SELECTOR,
+        guest::LDTR_SELECTOR,
+        guest::TR_SELECTOR,
+        guest::CS_ACCESS_RIGHTS,
+        guest::SS_ACCESS_RIGHTS,
+        guest::DS_ACCESS_RIGHTS,
+        guest::ES_ACCESS_RIGHTS,
+        guest::FS_ACCESS_RIGHTS,
+        guest::GS_ACCESS_RIGHTS,
+        guest::LDTR_ACCESS_RIGHTS,
+        guest::TR_ACCESS_RIGHTS,
+        guest::GDTR_BASE,
+        guest::GDTR_LIMIT,
+        guest::IDTR_BASE,
+        guest::IDTR_LIMIT,
+        guest::IA32_EFER_FULL,
+        guest::IA32_DEBUGCTL_FULL,
+        guest::IA32_SYSENTER_CS,
+        guest::IA32_SYSENTER_ESP,
+        guest::IA32_SYSENTER_EIP,
+    ];
+
+    for (index, field) in fields.into_iter().enumerate() {
+        LAST_VMCS_GUEST_STATE[index].store(
+            super::support::vmread_checked(field).unwrap_or(u64::MAX),
+            Relaxed,
+        );
+    }
+}
+
+pub fn vmcs_guest_state_field(index: usize) -> u64 {
+    LAST_VMCS_GUEST_STATE
+        .get(index)
+        .map(|value| value.load(Relaxed))
+        .unwrap_or(u64::MAX)
+}
+
 pub const RING_SIZE: usize = 32;
 static RING_IDX: AtomicU64 = AtomicU64::new(0);
 static RING_REASON: [AtomicU64; RING_SIZE] = [ZERO_U64; RING_SIZE];
@@ -83,6 +362,7 @@ pub const MAX_TRACKED_CPUS: usize = 64;
 static CPU_HEARTBEAT: [AtomicU64; MAX_TRACKED_CPUS] = [ZERO_U64; MAX_TRACKED_CPUS];
 static CPU_PHASE: [AtomicU64; MAX_TRACKED_CPUS] = [ZERO_U64; MAX_TRACKED_CPUS];
 static CPU_LAST_CPUID_LEAF: [AtomicU64; MAX_TRACKED_CPUS] = [ZERO_U64; MAX_TRACKED_CPUS];
+static CPU_LAST_CPUID_COMMAND: [AtomicU64; MAX_TRACKED_CPUS] = [ZERO_U64; MAX_TRACKED_CPUS];
 static CPU_TIMER_RIP: [AtomicU64; MAX_TRACKED_CPUS] = [ZERO_U64; MAX_TRACKED_CPUS];
 static CPU_TIMER_RIP_COUNT: [AtomicU64; MAX_TRACKED_CPUS] = [ZERO_U64; MAX_TRACKED_CPUS];
 
@@ -116,14 +396,20 @@ pub struct PerCpuRingSnapshot {
 }
 
 pub const PHASE_VMEXIT_ENTRY: u64 = 0x10;
+pub const PHASE_VMEXIT_CAPTURED: u64 = 0x18;
 pub const PHASE_FAST_CPUID: u64 = 0x40;
 pub const PHASE_FAST_CPUID_DONE: u64 = 0x50;
 pub const PHASE_FAST_RIP_ADV: u64 = 0x60;
+pub const PHASE_REINJECT_VECTORING: u64 = 0x68;
 pub const PHASE_CHECK_NMI: u64 = 0x70;
 pub const PHASE_PRE_VMRESUME: u64 = 0x80;
+pub const PHASE_VMRESUME_STUB: u64 = 0x90;
+pub const PHASE_VMRESUME_FAILED: u64 = 0xA0;
+pub const PHASE_VM_ENTRY_FAILED: u64 = 0xB0;
 pub const PHASE_SLOW_PATH: u64 = 0x20;
 pub const PHASE_SLOW_HANDLER: u64 = 0x30;
 pub const PHASE_ERROR_HANDLER: u64 = 0xE0;
+pub const PHASE_HOST_FAULT: u64 = 0xF0;
 
 // ---------------------------------------------------------------------------
 // Handler-duration watchdog (2026-07-09).
@@ -181,6 +467,15 @@ const CMOS_MAGIC_BUGCHECK_CB: u8 = 0xB1;
 /// stamp a CMOS byte. Both survive the ensuing hard reboot.
 pub fn note_bugcheck_callback_fired() {
     BUGCHECK_CALLBACK_FIRED.fetch_add(1, Relaxed);
+    if super::terminal_capture::enabled() {
+        let detail = KEBUGCHECKEX_HIT_ARG0.load(Relaxed) as u8;
+        let _ = super::terminal_capture::force_current(
+            super::terminal_capture::KIND_BUGCHECK,
+            super::terminal_capture::INVALID_VM_ERROR,
+            detail,
+        );
+        return;
+    }
     ext_cmos_write(CMOS_OFF_BUGCHECK_CB_FLAG, CMOS_MAGIC_BUGCHECK_CB);
 }
 
@@ -201,6 +496,15 @@ pub static BUGCHECK_ENTRY_HOOK_FIRED: AtomicU64 = AtomicU64::new(0);
 /// started" from "bugcheck started but hung before finishing".
 pub fn note_bugcheck_entry_hook_fired() {
     BUGCHECK_ENTRY_HOOK_FIRED.fetch_add(1, Relaxed);
+    if super::terminal_capture::enabled() {
+        let detail = KEBUGCHECKEX_HIT_ARG0.load(Relaxed) as u8;
+        let _ = super::terminal_capture::force_current(
+            super::terminal_capture::KIND_BUGCHECK,
+            super::terminal_capture::INVALID_VM_ERROR,
+            detail,
+        );
+        return;
+    }
     ext_cmos_write(CMOS_OFF_BUGCHECK_ENTRY_HOOK, CMOS_MAGIC_BUGCHECK_ENTRY_HOOK);
 }
 
@@ -454,6 +758,7 @@ pub struct HandlerGuard(usize);
 impl Drop for HandlerGuard {
     #[inline(always)]
     fn drop(&mut self) {
+        super::terminal_capture::handler_exit();
         if self.0 < MAX_TRACKED_CPUS {
             HANDLER_ACTIVE[self.0].store(0, Relaxed);
         }
@@ -465,6 +770,10 @@ impl Drop for HandlerGuard {
 #[inline(always)]
 pub fn handler_enter() -> HandlerGuard {
     let cpu = super::host_idt::current_cpu_index();
+    // This is the first Rust-side breadcrumb after the VM-exit assembly has
+    // transferred control. It intentionally runs before LBR/VMCS dispatch so
+    // a fault or stall in those helpers still leaves an active marker.
+    super::terminal_capture::handler_begin(unsafe { x86::time::rdtsc() });
     if cpu < MAX_TRACKED_CPUS {
         HANDLER_ACTIVE[cpu].store(1, Relaxed);
     }
@@ -495,56 +804,64 @@ pub fn handler_active_count() -> u64 {
 // ---------------------------------------------------------------------------
 // Layer 3: CMOS mirror of Layer 1 (Port 0x80) + Layer 4 (HV/Guest classifier).
 //
-// Phase 0 (2026-07-15) confirmed Ext CMOS 0x20-0x2C survives both warm reset
-// and cold boot. Layer 3 mirrors the freeze-critical Layer 1 + 4 state to
-// Ext CMOS 0x30-0x4E so a hard-reset after freeze can read back
-// "who died in HV" + "last VM-exit reason on that CPU".
+// The stable diagnostic profile keeps the original 15-byte Layer 3 write
+// format on the VM-exit path. The reader accepts both that format and the
+// newer 16-byte context format so the previous-boot archive remains useful.
+// Set LAYER3_EXTENDED_CONTEXT to true only for a deliberately instrumented
+// run; it adds handler/client-read context and one extra CMOS write.
 //
-// Layout (double-buffered, 2 slots × 15 bytes, 0x30-0x4E):
-//   Slot A: 0x30-0x3E    (written when sequence is odd)
-//   Slot B: 0x40-0x4E    (written when sequence is even)
+// Layout v1 (double-buffered, 2 slots x 15 bytes, 0x30-0x4E):
+//   +0 magic 0x4C, +1..+2 sequence, +3 port80, +4..+11 active bitmap,
+//   +12 last exit, +13 active count, +14 XOR checksum.
 //
-//   Per-slot:
-//     +0:      magic 0x4C ('L')
-//     +1..+2:  sequence u16 LE
-//     +3:      PORT80_LAST snapshot
-//     +4..+11: HANDLER_ACTIVE bitmap (u64 LE)
-//     +12:     LAST_EXIT_REASON low 8 bits
-//     +13:     popcount(bitmap)
-//     +14:     XOR checksum of +0..+13
+// Layout v2 (double-buffered, 2 slots x 16 bytes, 0x30-0x4F):
+//   +0 magic 0x4D, +1..+2 sequence, +3 port80, +4..+11 active bitmap,
+//   +12 last exit, +13 packed handler/client phase, +14 command,
+//   +15 XOR checksum.
 //
-// Torn-write protection: writes always target only one slot per flush;
-// the other slot stays intact. Reader validates each slot's checksum and
-// picks the newer valid one. Freeze mid-write only invalidates that slot.
-//
-// Flush cadence: every LAYER3_FLUSH_INTERVAL VM-exits (64 by default). At
-// ~100k exits/s the CMOS overhead is ~5% (2 outs × 15 bytes × ~1us / 64 exits).
+// Torn-write protection: writes always target only one slot per flush; the
+// other slot stays intact. The reader validates each slot's checksum.
 // ---------------------------------------------------------------------------
-const CMOS_L3_MAGIC: u8 = 0x4C;
+const CMOS_L3_MAGIC_V1: u8 = 0x4C;
+const CMOS_L3_MAGIC_V2: u8 = 0x4D;
+const LOCAL_DIAG_BUILD: bool = build_flag_enabled(option_env!("HV_LOCAL_DIAG"));
+const fn build_flag_enabled(value: Option<&str>) -> bool {
+    let Some(value) = value else {
+        return false;
+    };
+    let bytes = value.as_bytes();
+    bytes.len() == 1 && bytes[0] == b'1'
+}
+const LAYER3_EXTENDED_CONTEXT: bool = false;
 const CMOS_L3_SLOT_A_BASE: u8 = 0x30;
 const CMOS_L3_SLOT_B_BASE: u8 = 0x40;
-const LAYER3_FLUSH_INTERVAL: u64 = 64;
+// Local diagnostics still retain the rare-exit ring and one-second disk
+// snapshots, but avoid making every CPUID storm pay frequent CMOS I/O.
+const LAYER3_FLUSH_INTERVAL: u64 = if LOCAL_DIAG_BUILD { 1024 } else { 64 };
 
 static LAYER3_FLUSH_COUNT: AtomicU64 = AtomicU64::new(0);
 static LAYER3_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 // Serialize concurrent flushers. Two CPUs both hitting the 64-exit boundary
-// would otherwise interleave `ext_cmos_write` calls to the same slot,
-// producing torn bytes even though the double-buffer scheme protects
-// against freeze-in-write. If we can't acquire, we skip this cycle —
-// another CPU is already writing, and the next 64-exit boundary catches up.
+// would otherwise interleave ext_cmos_write calls to the same slot.
 static LAYER3_FLUSH_LOCK: AtomicBool = AtomicBool::new(false);
 
 fn layer3_bitmap_byte(bitmap: u64, i: usize) -> u8 {
     (bitmap >> (i * 8)) as u8
 }
 
+fn layer3_phase_byte(handler_phase: u64, client_read_phase: u64) -> u8 {
+    (handler_phase as u8 & 0xF0) | (client_read_phase as u8 & 0x0F)
+}
+
 #[inline(always)]
 pub fn layer3_maybe_flush() {
+    if super::terminal_capture::enabled() {
+        return;
+    }
     let n = LAYER3_FLUSH_COUNT.fetch_add(1, Relaxed).wrapping_add(1);
     if n % LAYER3_FLUSH_INTERVAL != 0 {
         return;
     }
-    // Try-acquire; skip if another CPU is already mid-flush.
     if LAYER3_FLUSH_LOCK
         .compare_exchange(false, true, core::sync::atomic::Ordering::Acquire, Relaxed)
         .is_err()
@@ -555,14 +872,12 @@ pub fn layer3_maybe_flush() {
     LAYER3_FLUSH_LOCK.store(false, core::sync::atomic::Ordering::Release);
 }
 
-/// Force a Layer 3 flush right now, bypassing the 64-exit interval.
-/// Use at Rust-reachable fatal paths (VM entry failure, pre-fatal-loop) so
-/// the CMOS snapshot reflects the moment-before-crash rather than up to
-/// 63 exits ago. Uses try-acquire — if another CPU is already flushing,
-/// their in-progress write is fresh enough; we skip to avoid deadlock if
-/// that CPU is itself frozen.
+/// Force a Layer 3 flush right now on a Rust-reachable fatal path.
 #[inline(always)]
 pub fn layer3_force_flush() {
+    if super::terminal_capture::enabled() {
+        return;
+    }
     if LAYER3_FLUSH_LOCK
         .compare_exchange(false, true, core::sync::atomic::Ordering::Acquire, Relaxed)
         .is_err()
@@ -576,36 +891,71 @@ pub fn layer3_force_flush() {
 fn layer3_flush() {
     let seq = LAYER3_SEQUENCE.fetch_add(1, Relaxed).wrapping_add(1) as u16;
     let base = if seq & 1 == 1 { CMOS_L3_SLOT_A_BASE } else { CMOS_L3_SLOT_B_BASE };
-
     let port80 = PORT80_LAST.load(Relaxed);
     let bitmap = handler_active_bitmap_lo();
     let last_exit = (LAST_EXIT_REASON.load(Relaxed) & 0xFF) as u8;
-    let count = handler_active_count() as u8;
 
-    let seq_lo = seq as u8;
-    let seq_hi = (seq >> 8) as u8;
+    if !LAYER3_EXTENDED_CONTEXT {
+        let count = handler_active_count() as u8;
+        let mut cksum = CMOS_L3_MAGIC_V1;
+        cksum ^= seq as u8;
+        cksum ^= (seq >> 8) as u8;
+        cksum ^= port80;
+        for i in 0..8 {
+            cksum ^= layer3_bitmap_byte(bitmap, i);
+        }
+        cksum ^= last_exit;
+        cksum ^= count;
 
-    let mut cksum = CMOS_L3_MAGIC;
-    cksum ^= seq_lo;
-    cksum ^= seq_hi;
+        ext_cmos_write(base, CMOS_L3_MAGIC_V1);
+        ext_cmos_write(base + 1, seq as u8);
+        ext_cmos_write(base + 2, (seq >> 8) as u8);
+        ext_cmos_write(base + 3, port80);
+        for i in 0..8 {
+            ext_cmos_write(base + 4 + i as u8, layer3_bitmap_byte(bitmap, i));
+        }
+        ext_cmos_write(base + 12, last_exit);
+        ext_cmos_write(base + 13, count);
+        ext_cmos_write(base + 14, cksum);
+        return;
+    }
+
+    let active_cpu = bitmap.trailing_zeros() as usize;
+    let handler_phase = if active_cpu < MAX_TRACKED_CPUS {
+        CPU_PHASE[active_cpu].load(Relaxed)
+    } else {
+        0
+    };
+    let client_read_phase = super::client_read::debug_state(17);
+    let phase = layer3_phase_byte(handler_phase, client_read_phase);
+    let command = if active_cpu < MAX_TRACKED_CPUS {
+        CPU_LAST_CPUID_COMMAND[active_cpu].load(Relaxed) as u8
+    } else {
+        0
+    };
+
+    let mut cksum = CMOS_L3_MAGIC_V2;
+    cksum ^= seq as u8;
+    cksum ^= (seq >> 8) as u8;
     cksum ^= port80;
     for i in 0..8 {
         cksum ^= layer3_bitmap_byte(bitmap, i);
     }
     cksum ^= last_exit;
-    cksum ^= count;
+    cksum ^= phase;
+    cksum ^= command;
 
-    // Magic first is safe under torn-write since the *other* slot stays valid.
-    ext_cmos_write(base, CMOS_L3_MAGIC);
-    ext_cmos_write(base + 1, seq_lo);
-    ext_cmos_write(base + 2, seq_hi);
+    ext_cmos_write(base, CMOS_L3_MAGIC_V2);
+    ext_cmos_write(base + 1, seq as u8);
+    ext_cmos_write(base + 2, (seq >> 8) as u8);
     ext_cmos_write(base + 3, port80);
     for i in 0..8 {
         ext_cmos_write(base + 4 + i as u8, layer3_bitmap_byte(bitmap, i));
     }
     ext_cmos_write(base + 12, last_exit);
-    ext_cmos_write(base + 13, count);
-    ext_cmos_write(base + 14, cksum);
+    ext_cmos_write(base + 13, phase);
+    ext_cmos_write(base + 14, command);
+    ext_cmos_write(base + 15, cksum);
 }
 
 struct Layer3Slot {
@@ -613,6 +963,9 @@ struct Layer3Slot {
     port80: u8,
     bitmap: u64,
     last_exit: u8,
+    phase: u8,
+    client_read_phase: u8,
+    command: u8,
     count: u8,
     valid: bool,
 }
@@ -627,10 +980,36 @@ fn layer3_read_slot(base: u8) -> Layer3Slot {
         bitmap |= (ext_cmos_read(base + 4 + i as u8) as u64) << (i * 8);
     }
     let last_exit = ext_cmos_read(base + 12);
-    let count = ext_cmos_read(base + 13);
-    let stored_cksum = ext_cmos_read(base + 14);
 
-    let mut expected = magic;
+    if magic == CMOS_L3_MAGIC_V1 {
+        let count = ext_cmos_read(base + 13);
+        let stored_cksum = ext_cmos_read(base + 14);
+        let mut expected = CMOS_L3_MAGIC_V1;
+        expected ^= seq_lo;
+        expected ^= seq_hi;
+        expected ^= port80;
+        for i in 0..8 {
+            expected ^= layer3_bitmap_byte(bitmap, i);
+        }
+        expected ^= last_exit;
+        expected ^= count;
+        return Layer3Slot {
+            seq: (seq_lo as u16) | ((seq_hi as u16) << 8),
+            port80,
+            bitmap,
+            last_exit,
+            phase: 0,
+            client_read_phase: 0,
+            command: 0,
+            count,
+            valid: stored_cksum == expected,
+        };
+    }
+
+    let packed_phase = ext_cmos_read(base + 13);
+    let command = ext_cmos_read(base + 14);
+    let stored_cksum = ext_cmos_read(base + 15);
+    let mut expected = CMOS_L3_MAGIC_V2;
     expected ^= seq_lo;
     expected ^= seq_hi;
     expected ^= port80;
@@ -638,18 +1017,21 @@ fn layer3_read_slot(base: u8) -> Layer3Slot {
         expected ^= layer3_bitmap_byte(bitmap, i);
     }
     expected ^= last_exit;
-    expected ^= count;
+    expected ^= packed_phase;
+    expected ^= command;
 
     Layer3Slot {
         seq: (seq_lo as u16) | ((seq_hi as u16) << 8),
         port80,
         bitmap,
         last_exit,
-        count,
-        valid: magic == CMOS_L3_MAGIC && stored_cksum == expected,
+        phase: packed_phase & 0xF0,
+        client_read_phase: packed_phase & 0x0F,
+        command,
+        count: bitmap.count_ones() as u8,
+        valid: magic == CMOS_L3_MAGIC_V2 && stored_cksum == expected,
     }
 }
-
 // Cache for the last layer3_refresh_cache() call so cpuid_ping can query
 // multiple fields without re-reading CMOS 30 bytes each time (and without
 // tearing across a mid-read HV flush).
@@ -659,24 +1041,82 @@ static LAYER3_CACHE_PORT80: AtomicU8 = AtomicU8::new(0);
 static LAYER3_CACHE_BITMAP: AtomicU64 = AtomicU64::new(0);
 static LAYER3_CACHE_LAST_EXIT: AtomicU8 = AtomicU8::new(0);
 static LAYER3_CACHE_COUNT: AtomicU8 = AtomicU8::new(0);
+static LAYER3_CACHE_PHASE: AtomicU8 = AtomicU8::new(0);
+static LAYER3_CACHE_CLIENT_READ_PHASE: AtomicU8 = AtomicU8::new(0);
+static LAYER3_CACHE_COMMAND: AtomicU8 = AtomicU8::new(0);
 static LAYER3_CACHE_VALID: AtomicU8 = AtomicU8::new(0);
 
 /// Read both slots from CMOS, pick the newer valid one, snapshot to cache,
-/// return the slot id (0=none, 1=A, 2=B). Subsequent CTL 111-116 read cache.
+/// return the slot id (0=none, 1=A, 2=B). Subsequent Layer 3 controls read it.
 fn layer3_refresh_cache() -> u8 {
     let a = layer3_read_slot(CMOS_L3_SLOT_A_BASE);
     let b = layer3_read_slot(CMOS_L3_SLOT_B_BASE);
-    let (slot_id, seq, port80, bitmap, last_exit, count, valid) = match (a.valid, b.valid) {
+    let (
+        slot_id,
+        seq,
+        port80,
+        bitmap,
+        last_exit,
+        phase,
+        client_read_phase,
+        command,
+        count,
+        valid,
+    ) = match (a.valid, b.valid) {
         (true, true) => {
             if (a.seq.wrapping_sub(b.seq) as i16) >= 0 {
-                (1u8, a.seq, a.port80, a.bitmap, a.last_exit, a.count, true)
+                (
+                    1u8,
+                    a.seq,
+                    a.port80,
+                    a.bitmap,
+                    a.last_exit,
+                    a.phase,
+                    a.client_read_phase,
+                    a.command,
+                    a.count,
+                    true,
+                )
             } else {
-                (2u8, b.seq, b.port80, b.bitmap, b.last_exit, b.count, true)
+                (
+                    2u8,
+                    b.seq,
+                    b.port80,
+                    b.bitmap,
+                    b.last_exit,
+                    b.phase,
+                    b.client_read_phase,
+                    b.command,
+                    b.count,
+                    true,
+                )
             }
         }
-        (true, false) => (1u8, a.seq, a.port80, a.bitmap, a.last_exit, a.count, true),
-        (false, true) => (2u8, b.seq, b.port80, b.bitmap, b.last_exit, b.count, true),
-        (false, false) => (0u8, 0, 0, 0, 0, 0, false),
+        (true, false) => (
+            1u8,
+            a.seq,
+            a.port80,
+            a.bitmap,
+            a.last_exit,
+            a.phase,
+            a.client_read_phase,
+            a.command,
+            a.count,
+            true,
+        ),
+        (false, true) => (
+            2u8,
+            b.seq,
+            b.port80,
+            b.bitmap,
+            b.last_exit,
+            b.phase,
+            b.client_read_phase,
+            b.command,
+            b.count,
+            true,
+        ),
+        (false, false) => (0u8, 0, 0, 0, 0, 0, 0, 0, 0, false),
     };
     LAYER3_CACHE_SLOT_ID.store(slot_id, Relaxed);
     LAYER3_CACHE_SEQ.store(seq as u64, Relaxed);
@@ -684,11 +1124,23 @@ fn layer3_refresh_cache() -> u8 {
     LAYER3_CACHE_BITMAP.store(bitmap, Relaxed);
     LAYER3_CACHE_LAST_EXIT.store(last_exit, Relaxed);
     LAYER3_CACHE_COUNT.store(count, Relaxed);
+    LAYER3_CACHE_PHASE.store(phase, Relaxed);
+    LAYER3_CACHE_CLIENT_READ_PHASE.store(client_read_phase, Relaxed);
+    LAYER3_CACHE_COMMAND.store(command, Relaxed);
     LAYER3_CACHE_VALID.store(if valid { 1 } else { 0 }, Relaxed);
     slot_id
 }
 
 // ---------------------------------------------------------------------------
+pub fn layer3_prepare_session() -> u8 {
+    let slot = layer3_refresh_cache();
+    if slot != 0 {
+        // Continue the durable sequence across a reboot so a stale slot from
+        // the other format cannot outrank the first v1 write of this session.
+        LAYER3_SEQUENCE.store(LAYER3_CACHE_SEQ.load(Relaxed) & 0xFFFF, Relaxed);
+    }
+    slot
+}
 // CMOS persistence for freeze-critical Step 1-4 fields (2026-07-09).
 //
 // The 2026-07-09 EAC scenario test proved KEBUGCHECKEX / first-fault / total
@@ -759,6 +1211,9 @@ pub fn cmos_load_step4_baseline() {
 /// actually changed, so normal port-I/O cost stays negligible.
 #[inline]
 pub fn cmos_sync_step4_state() {
+    if super::terminal_capture::enabled() {
+        return;
+    }
     // Ensure the CMOS_LAST_* shadows reflect the actual on-disk CMOS bytes
     // before the first change-detect fires. Without this, a driver load
     // would clobber last session's freeze data on the first VM-exit.
@@ -986,15 +1441,17 @@ pub fn watchdog_field(cpu: u64, field: u64) -> u64 {
 
 #[inline]
 pub fn cpu_enter_phase(phase: u64) {
+    super::terminal_capture::handler_phase(phase);
     let cpu = rdtscp_aux() as usize & 0x3F;
     CPU_PHASE[cpu].store(phase, Relaxed);
     CPU_HEARTBEAT[cpu].fetch_add(1, Relaxed);
 }
 
 #[inline]
-pub fn cpu_set_cpuid_leaf(leaf: u64) {
+pub fn cpu_set_cpuid_context(leaf: u64, command: u64) {
     let cpu = rdtscp_aux() as usize & 0x3F;
     CPU_LAST_CPUID_LEAF[cpu].store(leaf, Relaxed);
+    CPU_LAST_CPUID_COMMAND[cpu].store(command, Relaxed);
 }
 
 /// Called from the preemption timer handler to record where the guest was executing.
@@ -1118,7 +1575,7 @@ pub const SNAP_MAX_CPUS: usize = 24;
 /// suggesting CMOS I/O throughput (~20μs per flush) added enough handler
 /// latency to worsen the freeze race. 64 reduces CMOS traffic while
 /// still tight enough to capture pre-freeze state at typical rates.
-const SNAP_FLUSH_INTERVAL: u64 = 64;
+const SNAP_FLUSH_INTERVAL: u64 = if LOCAL_DIAG_BUILD { 1024 } else { 64 };
 
 /// Global monotonic sequence — bumped on every snap_flush attempt.
 static SNAP_GLOBAL_SEQ: AtomicU64 = AtomicU64::new(0);
@@ -1163,10 +1620,10 @@ static SNAP_PREV_CPU_REASON: [AtomicU64; SNAP_MAX_CPUS] =
 //    VMCALL/INIT across freeze+RST). 2 slots × 6 bytes + 4-byte header.
 //
 // Layout:
-//   0x00: magic 0xD6 = valid ring present
+//   0x00: magic 0xD6 (legacy) / 0xD7 (committed context record)
 //   0x01: head (0..1, next write slot)
 //   0x02: count (saturating u8, total rare exits observed)
-//   0x03: reserved
+//   0x03: format (1 for D7)
 //   0x04-0x0F: 2 slots × 6 bytes each
 //     slot i base = 0x04 + i * 6
 //       +0: CPU index
@@ -1175,9 +1632,12 @@ static SNAP_PREV_CPU_REASON: [AtomicU64; SNAP_MAX_CPUS] =
 // ---------------------------------------------------------------------------
 
 const RARE_RING_MAGIC_OFF: u8 = 0x00;
-const RARE_RING_MAGIC: u8 = 0xD6;
+const RARE_RING_MAGIC_LEGACY: u8 = 0xD6;
+const RARE_RING_MAGIC: u8 = 0xD7;
 const RARE_RING_HEAD_OFF: u8 = 0x01;
 const RARE_RING_COUNT_OFF: u8 = 0x02;
+const RARE_RING_FORMAT_OFF: u8 = 0x03;
+const RARE_RING_FORMAT_CONTEXT: u8 = 1;
 const RARE_RING_SLOT_BASE: u8 = 0x04;
 const RARE_RING_SLOT_SIZE: u8 = 6;
 pub const RARE_RING_SLOTS: usize = 2;
@@ -1198,6 +1658,14 @@ pub const RARE_RING_SLOTS: usize = 2;
 //   otherwise = the exception/interrupt vector
 const RARE_RING_VEC_BASE: u8 = 0x1A;
 const RARE_RING_VEC_VMREAD_FAIL: u8 = 0xFE;
+// Per-slot packed VM-exit context (Ext CMOS 0x1C-0x1D):
+//   bit 7     VMEXIT_INTERRUPTION_INFO.valid
+//   bits 6:4  interruption type
+//   bit 3     interruption error-code valid
+//   bit 2     NMI unblocking due to IRET
+//   bit 1     IDT_VECTORING_INFO.valid at handler entry
+//   bit 0     raw EXIT_REASON.VM-entry-failure flag
+const RARE_RING_META_BASE: u8 = 0x1C;
 
 /// Count of rare exits this boot — sanity check "did any rare exit happen at
 /// all". Zero = no rare event was observed → freeze isn't triggered by any
@@ -1221,17 +1689,44 @@ static RARE_RING_PREV_SEQ_LO: [AtomicU64; RARE_RING_SLOTS] =
     [ZERO_U64; RARE_RING_SLOTS];
 static RARE_RING_PREV_VEC: [AtomicU64; RARE_RING_SLOTS] =
     [ZERO_U64; RARE_RING_SLOTS];
+static RARE_RING_PREV_META: [AtomicU64; RARE_RING_SLOTS] =
+    [ZERO_U64; RARE_RING_SLOTS];
+
+#[inline]
+fn pack_rare_interruption_meta(exit_reason: u64, interruption_info: u64, idt_info: u64) -> u8 {
+    let valid = ((interruption_info >> 31) & 1) as u8;
+    let interruption_type = ((interruption_info >> 8) & 0x7) as u8;
+    let error_valid = ((interruption_info >> 11) & 1) as u8;
+    let nmi_unblocking = ((interruption_info >> 12) & 1) as u8;
+    let idt_valid = ((idt_info >> 31) & 1) as u8;
+    let entry_failure = ((exit_reason >> 31) & 1) as u8;
+
+    (valid << 7)
+        | (interruption_type << 4)
+        | (error_valid << 3)
+        | (nmi_unblocking << 2)
+        | (idt_valid << 1)
+        | entry_failure
+}
 
 /// Called from snap_flush after common-exit early return. Decides whether
 /// this exit is "rare" (worth persisting separately) and if so writes the
 /// details into the ring at CMOS 0x30-0x4F. Reuses SNAP_FLUSH_LOCK.
 #[inline]
 fn is_common_exit(reason: u64) -> bool {
+    // Bit 31 means VM-entry failure and must always be persisted as rare.
+    // Other architectural status flags above bit 15 do not change the basic
+    // exit reason and must not turn CPUID/MSR into high-rate CMOS writes.
+    if reason & (1u64 << 31) != 0 {
+        return false;
+    }
+
     matches!(
-        reason,
+        reason & 0xffff,
         10  // CPUID — extremely common with EAC probing
         | 12 // HLT — idle CPUs
         | 16 // RDTSC
+        | 28 // CR access — MOV-from-CR3 is intentionally intercepted
         | 31 // RDMSR
         | 32 // WRMSR
         | 36 // MWAIT
@@ -1249,47 +1744,73 @@ fn snap_flush_rare(exit_reason: u64, cpu: usize, _seq: u64) {
     RARE_TOTAL_COUNT.fetch_add(1, Relaxed);
     let rip = super::support::vmread_checked(x86::vmx::vmcs::guest::RIP).unwrap_or(0);
 
+    // Acquire the indexed CMOS device once for the complete record. A losing
+    // CPU drops the whole best-effort record instead of leaving a bytewise mix
+    // from two writers. Magic is invalidated first and committed last.
+    let Some(_cmos_guard) = try_ext_cmos_io_lock() else {
+        return;
+    };
+
     // Advance write head (mod RARE_RING_SLOTS). Lock is held by caller.
     let head = (RARE_RING_HEAD.load(Relaxed) as usize) % RARE_RING_SLOTS;
     let next = (head + 1) % RARE_RING_SLOTS;
     RARE_RING_HEAD.store(next as u64, Relaxed);
 
-    // Std CMOS 0x70/0x71 write path (Ext CMOS 0x30-0x4F collides with
-    // Layer 3 double-buffer — first attempt captured zero due to interleave).
+    // Ext CMOS 0x30-0x4F collides with Layer 3, so the ring remains in
+    // 0x00-0x0F with vector/meta sidecars at 0x1A-0x1D.
     let base = RARE_RING_SLOT_BASE + (head as u8) * RARE_RING_SLOT_SIZE;
-    ext_cmos_write(base, cpu as u8);
-    ext_cmos_write(base + 1, (exit_reason & 0xFF) as u8);
+    unsafe {
+        ext_cmos_write_unlocked(RARE_RING_MAGIC_OFF, 0);
+        ext_cmos_write_unlocked(base, cpu as u8);
+        ext_cmos_write_unlocked(base + 1, (exit_reason & 0xFF) as u8);
+    }
     for b in 0..4u8 {
-        ext_cmos_write(base + 2 + b, ((rip >> (b * 8)) & 0xFF) as u8);
+        unsafe {
+            ext_cmos_write_unlocked(base + 2 + b, ((rip >> (b * 8)) & 0xFF) as u8);
+        }
     }
 
-    // Per-slot vector byte at Ext CMOS 0x1A + head. Only Exception/NMI (basic
-    // reason 0) carries a meaningful vector — for other rare exits (INIT,
-    // VMCALL, VMX-instruction, etc.) we write 0 so the reader can distinguish
-    // "no vector applicable" from a real 0 vector (which is #DE).
-    let vec_byte: u8 = if exit_reason == 0 {
-        match super::support::vmread_checked(x86::vmx::vmcs::ro::VMEXIT_INTERRUPTION_INFO) {
-            Ok(info) => (info & 0xFF) as u8,
-            Err(_) => RARE_RING_VEC_VMREAD_FAIL,
-        }
+    let exception_or_nmi = (exit_reason & 0xffff) == 0;
+    let interruption_info = if exception_or_nmi {
+        super::support::vmread_checked(x86::vmx::vmcs::ro::VMEXIT_INTERRUPTION_INFO).ok()
     } else {
-        0
+        None
     };
-    ext_cmos_write(RARE_RING_VEC_BASE + head as u8, vec_byte);
+    let vec_byte = interruption_info
+        .map(|info| (info & 0xff) as u8)
+        .unwrap_or(if exception_or_nmi {
+            RARE_RING_VEC_VMREAD_FAIL
+        } else {
+            0
+        });
+    let idt_info =
+        super::support::vmread_checked(x86::vmx::vmcs::ro::IDT_VECTORING_INFO).unwrap_or(0);
+    let meta = pack_rare_interruption_meta(
+        exit_reason,
+        interruption_info.unwrap_or(0),
+        idt_info,
+    );
+    unsafe {
+        ext_cmos_write_unlocked(RARE_RING_VEC_BASE + head as u8, vec_byte);
+        ext_cmos_write_unlocked(RARE_RING_META_BASE + head as u8, meta);
+    }
 
     // Update header: head advances, count saturates at 0xFF, magic (re)set.
-    ext_cmos_write(RARE_RING_HEAD_OFF, next as u8);
     let total = RARE_TOTAL_COUNT.load(Relaxed);
     let count_stored = if total > 0xFF { 0xFF } else { total as u8 };
-    ext_cmos_write(RARE_RING_COUNT_OFF, count_stored);
-    ext_cmos_write(RARE_RING_MAGIC_OFF, RARE_RING_MAGIC);
+    unsafe {
+        ext_cmos_write_unlocked(RARE_RING_HEAD_OFF, next as u8);
+        ext_cmos_write_unlocked(RARE_RING_COUNT_OFF, count_stored);
+        ext_cmos_write_unlocked(RARE_RING_FORMAT_OFF, RARE_RING_FORMAT_CONTEXT);
+        ext_cmos_write_unlocked(RARE_RING_MAGIC_OFF, RARE_RING_MAGIC);
+    }
 }
 
 /// Capture prev-boot rare-exit ring from Ext CMOS 0x00-0x0F. Called from
 /// snap_capture_prev_boot after the per-CPU capture.
 fn snap_capture_prev_rare() {
     let magic = ext_cmos_read(RARE_RING_MAGIC_OFF);
-    if magic != RARE_RING_MAGIC {
+    if !matches!(magic, RARE_RING_MAGIC_LEGACY | RARE_RING_MAGIC) {
         RARE_RING_PREV_MAGIC_OK.store(0, Relaxed);
         return;
     }
@@ -1310,6 +1831,14 @@ fn snap_capture_prev_rare() {
         RARE_RING_PREV_SEQ_LO[slot].store(0, Relaxed);
         RARE_RING_PREV_VEC[slot]
             .store(ext_cmos_read(RARE_RING_VEC_BASE + slot as u8) as u64, Relaxed);
+        let meta = if magic == RARE_RING_MAGIC
+            && ext_cmos_read(RARE_RING_FORMAT_OFF) == RARE_RING_FORMAT_CONTEXT
+        {
+            ext_cmos_read(RARE_RING_META_BASE + slot as u8) as u64
+        } else {
+            0
+        };
+        RARE_RING_PREV_META[slot].store(meta, Relaxed);
     }
 }
 
@@ -1319,6 +1848,11 @@ fn snap_capture_prev_rare() {
 /// overwrite CMOS. Idempotent — safe if magic is absent (just marks prev
 /// as invalid).
 pub fn snap_capture_prev_boot() {
+    // The rare-exit ring has its own magic and remains useful even when the
+    // periodic per-CPU snapshot is absent or torn. Capture it independently
+    // so an invalid SNAP header cannot hide a valid fatal/rare record.
+    snap_capture_prev_rare();
+
     let magic = ext_cmos_read(SNAP_CMOS_MAGIC_OFF);
     if magic != SNAP_CMOS_MAGIC {
         SNAP_PREV_VALID.store(0, Relaxed);
@@ -1338,15 +1872,15 @@ pub fn snap_capture_prev_boot() {
         );
     }
     SNAP_PREV_VALID.store(1, Relaxed);
-
-    // Also capture the rare-exit tracker from CMOS 0x00-0x08.
-    snap_capture_prev_rare();
 }
 
 /// Layer 6: periodic / rare-exit CMOS snapshot. Invoked from
 /// `handler_entry_persist` so pre-freeze state survives hard reset.
 #[inline]
 pub fn snap_flush(exit_reason: u64) {
+    if super::terminal_capture::enabled() {
+        return;
+    }
     let cpu = super::host_idt::current_cpu_index();
     if cpu >= SNAP_MAX_CPUS {
         return;
@@ -1503,8 +2037,52 @@ fn cmos_write_rip(cpu: u8, rip: u64) {
     ext_cmos_write(0x0B, (count >> 8) as u8);
 }
 
+// Extended CMOS is an indexed device shared by every logical processor. The
+// index OUT to 0x72 and data OUT/IN to 0x73 must stay paired; otherwise two
+// CPUs can cross their operations and access the wrong register. Never wait
+// in VMX-root: a contender drops this best-effort diagnostic byte instead.
+static EXT_CMOS_IO_LOCK: AtomicBool = AtomicBool::new(false);
+static EXT_CMOS_IO_CONTENTION: AtomicU64 = AtomicU64::new(0);
+
+struct ExtCmosIoGuard;
+
+impl Drop for ExtCmosIoGuard {
+    fn drop(&mut self) {
+        EXT_CMOS_IO_LOCK.store(false, Release);
+    }
+}
+
+#[inline(always)]
+fn try_ext_cmos_io_lock() -> Option<ExtCmosIoGuard> {
+    if EXT_CMOS_IO_LOCK
+        .compare_exchange(false, true, Acquire, Relaxed)
+        .is_ok()
+    {
+        Some(ExtCmosIoGuard)
+    } else {
+        EXT_CMOS_IO_CONTENTION.fetch_add(1, Relaxed);
+        None
+    }
+}
+
+pub fn ext_cmos_io_contention_count() -> u64 {
+    EXT_CMOS_IO_CONTENTION.load(Relaxed)
+}
+
 #[inline]
 fn ext_cmos_write(offset: u8, value: u8) {
+    if super::terminal_capture::enabled() {
+        return;
+    }
+    let Some(_guard) = try_ext_cmos_io_lock() else {
+        return;
+    };
+    unsafe { ext_cmos_write_unlocked(offset, value) }
+}
+
+/// Caller must hold `ExtCmosIoGuard`.
+#[inline(always)]
+unsafe fn ext_cmos_write_unlocked(offset: u8, value: u8) {
     unsafe {
         core::arch::asm!(
             "out dx, al",
@@ -1523,6 +2101,9 @@ fn ext_cmos_write(offset: u8, value: u8) {
 
 #[inline]
 fn ext_cmos_read(offset: u8) -> u8 {
+    let Some(_guard) = try_ext_cmos_io_lock() else {
+        return 0;
+    };
     unsafe {
         let val: u8;
         core::arch::asm!(
@@ -1684,6 +2265,7 @@ pub fn cpu_diag(cpu: u64, field: u64) -> u64 {
         2 => CPU_LAST_CPUID_LEAF[c].load(Relaxed),
         3 => CPU_TIMER_RIP[c].load(Relaxed),
         4 => CPU_TIMER_RIP_COUNT[c].load(Relaxed),
+        5 => CPU_LAST_CPUID_COMMAND[c].load(Relaxed),
         _ => u64::MAX,
     }
 }
@@ -1794,6 +2376,130 @@ pub static DIAGNOSTICS_SEALED: AtomicBool = AtomicBool::new(false);
 pub static CLIENT_READS_ARMED: AtomicBool = AtomicBool::new(false);
 const BOOT_STOP_STAGE: u64 = parse_boot_stop_stage(option_env!("HV_BOOT_STOP_STAGE"));
 
+// ---------------------------------------------------------------------------
+// Launch I/O quiesce (CLOCK_WATCHDOG / 0x101 guard).
+//
+// local_diag calls ZwFlushBuffersFile while SMP virtualize is in progress.
+// That path does CcFlushCache → KeFlushMultipleRangeTb → IPI every logical
+// processor. A CPU mid-VMXON / contiguous alloc / VMLAUNCH cannot service the
+// TLB shootdown or clock interrupt → CLOCK_WATCHDOG_TIMEOUT (0x101).
+//
+// Minidump 080326-6343-01.dmp: hung CPU0, witness CPU in NtFlushBuffersFile
+// returning into the kdmapper-resident local_diag image. Same failure class
+// as the old concurrent MmAllocateContiguousMemory SMP launch bug; 6867a21
+// serialized allocations but left the flush race open.
+//
+// Fix: suppress diagnostic *disk* I/O from *after* the START record through
+// the end of virtualize_core (EPT alloc + builder + preflight + SMP VMLAUNCH).
+// Quiesce only inside virtualize_core is too late: the worker still flushes
+// during stage 200–240 (identity EPT / Hypervisor::build) and has caused
+// 0x101 with last log stuck at boot_stage=200 (minidump 080326-6328-01.dmp).
+//
+// Nested guards use a depth counter so DriverEntry can hold an outer scope
+// while virtualize_core keeps an inner one. Isolation of a critical section,
+// not a diagnostic downgrade — post-launch telemetry is unchanged.
+// ---------------------------------------------------------------------------
+static LAUNCH_IO_QUIESCE: AtomicBool = AtomicBool::new(false);
+static LAUNCH_IO_QUIESCE_DEPTH: AtomicU32 = AtomicU32::new(0);
+static DIAG_DISK_IO_ACTIVE: AtomicBool = AtomicBool::new(false);
+static LAUNCH_IO_SUPPRESSED_WRITES: AtomicU64 = AtomicU64::new(0);
+// Drain window for an in-flight ZwFlushBuffersFile before bring-up continues.
+// Bounded spin only; do not use huge counts (unit tests share these statics).
+const LAUNCH_IO_QUIESCE_WAIT_SPINS: u32 = 4_000_000;
+
+/// RAII: suppress local_diag disk I/O for the duration of VMX bring-up.
+pub struct LaunchIoQuiesceGuard {
+    _private: (),
+}
+
+impl LaunchIoQuiesceGuard {
+    pub fn enter() -> Self {
+        begin_launch_io_quiesce();
+        Self { _private: () }
+    }
+}
+
+impl Drop for LaunchIoQuiesceGuard {
+    fn drop(&mut self) {
+        end_launch_io_quiesce();
+    }
+}
+
+pub fn begin_launch_io_quiesce() {
+    let prev = LAUNCH_IO_QUIESCE_DEPTH.fetch_add(1, AcqRel);
+    if prev > 0 {
+        return;
+    }
+    LAUNCH_IO_QUIESCE.store(true, Release);
+    // Drain any in-flight ZwFlushBuffersFile before the first processor
+    // affinity switch / heavy contiguous alloc. Worker checks the gate before
+    // raising ACTIVE; this waits if a flush already crossed the gate.
+    for _ in 0..LAUNCH_IO_QUIESCE_WAIT_SPINS {
+        if !DIAG_DISK_IO_ACTIVE.load(Acquire) {
+            return;
+        }
+        core::hint::spin_loop();
+    }
+    // Timed out: still proceed. ACTIVE may be stuck if the flusher itself is
+    // deadlocked; continuing cannot make that worse and preserves the prior
+    // failure mode for diagnosis.
+}
+
+pub fn end_launch_io_quiesce() {
+    loop {
+        let cur = LAUNCH_IO_QUIESCE_DEPTH.load(Acquire);
+        if cur == 0 {
+            LAUNCH_IO_QUIESCE.store(false, Release);
+            return;
+        }
+        match LAUNCH_IO_QUIESCE_DEPTH.compare_exchange(cur, cur - 1, AcqRel, Acquire) {
+            Ok(_) => {
+                if cur == 1 {
+                    LAUNCH_IO_QUIESCE.store(false, Release);
+                }
+                return;
+            }
+            Err(_) => continue,
+        }
+    }
+}
+
+/// Test / recovery helper: force depth to zero and clear the gate.
+pub fn reset_launch_io_quiesce_for_test() {
+    LAUNCH_IO_QUIESCE_DEPTH.store(0, Release);
+    LAUNCH_IO_QUIESCE.store(false, Release);
+    DIAG_DISK_IO_ACTIVE.store(false, Release);
+}
+
+pub fn launch_io_quiesced() -> bool {
+    LAUNCH_IO_QUIESCE.load(Acquire)
+}
+
+pub fn launch_io_suppressed_writes() -> u64 {
+    LAUNCH_IO_SUPPRESSED_WRITES.load(Relaxed)
+}
+
+/// Try to enter a diagnostic disk write/flush. Returns false when launch
+/// quiesce is active (caller must skip I/O).
+pub fn diag_disk_io_enter() -> bool {
+    if LAUNCH_IO_QUIESCE.load(Acquire) {
+        LAUNCH_IO_SUPPRESSED_WRITES.fetch_add(1, Relaxed);
+        return false;
+    }
+    DIAG_DISK_IO_ACTIVE.store(true, Release);
+    // Gate may have flipped after we set ACTIVE — drop and skip.
+    if LAUNCH_IO_QUIESCE.load(Acquire) {
+        DIAG_DISK_IO_ACTIVE.store(false, Release);
+        LAUNCH_IO_SUPPRESSED_WRITES.fetch_add(1, Relaxed);
+        return false;
+    }
+    true
+}
+
+pub fn diag_disk_io_leave() {
+    DIAG_DISK_IO_ACTIVE.store(false, Release);
+}
+
 // Freeze detection: global CPUID stall monitor
 // Arms only after seeing EAC-level CPUID activity, then triggers when
 // CPUIDs stop entirely (guest code frozen).
@@ -1899,9 +2605,121 @@ pub const fn parse_boot_stop_stage(value: Option<&str>) -> u64 {
     parsed
 }
 
+// Ext CMOS boot-stage breadcrumb (ports 0x72/0x73). Survives hard reset when
+// local_diag never flushes to disk (0x101 during bring-up left no log file).
+// Layout: 0x58 magic 0xB7 | 0x59 stage_lo | 0x5A stage_hi | 0x5B cpu_or_ff
+const CMOS_BOOT_MAGIC_OFF: u8 = 0x58;
+const CMOS_BOOT_STAGE_LO: u8 = 0x59;
+const CMOS_BOOT_STAGE_HI: u8 = 0x5A;
+const CMOS_BOOT_CPU: u8 = 0x5B;
+const CMOS_BOOT_MAGIC: u8 = 0xB7;
+
+/// Last boot's CMOS stage, captured at DriverEntry before we overwrite it.
+pub static PREV_BOOT_STAGE: AtomicU64 = AtomicU64::new(u64::MAX);
+/// Optional CPU index byte from last boot (0xFF = unknown).
+pub static PREV_BOOT_STAGE_CPU: AtomicU64 = AtomicU64::new(u64::MAX);
+
+/// Read Ext CMOS boot-stage left by a previous load that died mid-bring-up.
+/// Call once at DriverEntry **before** any set_boot_stage.
+pub fn capture_prev_boot_stage() {
+    let magic = ext_cmos_read(CMOS_BOOT_MAGIC_OFF);
+    if magic != CMOS_BOOT_MAGIC {
+        PREV_BOOT_STAGE.store(u64::MAX, Relaxed);
+        PREV_BOOT_STAGE_CPU.store(u64::MAX, Relaxed);
+        return;
+    }
+    let lo = ext_cmos_read(CMOS_BOOT_STAGE_LO) as u64;
+    let hi = ext_cmos_read(CMOS_BOOT_STAGE_HI) as u64;
+    let cpu = ext_cmos_read(CMOS_BOOT_CPU) as u64;
+    PREV_BOOT_STAGE.store(lo | (hi << 8), Relaxed);
+    PREV_BOOT_STAGE_CPU.store(cpu, Relaxed);
+}
+
+pub fn prev_boot_stage() -> Option<u64> {
+    let s = PREV_BOOT_STAGE.load(Relaxed);
+    if s == u64::MAX {
+        None
+    } else {
+        Some(s)
+    }
+}
+
+/// Peak stage written to Ext CMOS this boot (monotonic). Cleanup codes like
+/// 131 must not erase a higher 700+ from a prior 0x101 path.
+static CMOS_BOOT_STAGE_PEAK: AtomicU64 = AtomicU64::new(0);
+
+/// Per-CPU launch progress in the 700..799 CMOS peak band (fits ≤33 LPs).
+///
+/// Old scheme used `700+cpu` / `750+cpu` / `770+cpu`. After CPU0 parked at 770,
+/// later CPUs' VMLAUNCH stages (701, …) were **below** the peak and invisible
+/// on freeze postmortem (`prev_boot_stage=770` for allcpu 0x101).
+///
+/// Band of 3 per LP (monotonic across CPUs):
+/// - phase 0 VMLAUNCH:     `700 + 3*cpu`
+/// - phase 1 guest return: `700 + 3*cpu + 1`
+/// - phase 2 park:         `700 + 3*cpu + 2`
+///
+/// CPU0 → 700/701/702, CPU1 → 703/704/705, … CPU23 → 769/770/771.
+pub const LAUNCH_PHASE_VMLAUNCH: u64 = 0;
+pub const LAUNCH_PHASE_GUEST_RETURN: u64 = 1;
+pub const LAUNCH_PHASE_PARK: u64 = 2;
+
+#[inline]
+pub fn launch_stage_band(cpu: u32, phase: u64) -> u64 {
+    700 + (cpu as u64) * 3 + (phase % 3)
+}
+
 pub fn set_boot_stage(stage: u64) {
     BOOT_STAGE.store(stage, Relaxed);
     super::diag_trace::trace_stage(stage);
+    // Cheap port I/O only — no disk, no TLB shootdown.
+    // CMOS keeps the **peak progress** stage this boot:
+    //   - ignore cleanup markers >= 800 (devirtualize 8xx) so they cannot
+    //     hide a 0x101 stuck at 700/VMLAUNCH
+    //   - ignore regressions below the peak (failure 131/241)
+    // Progress band: 100..799 (bring-up through guest-return 75x).
+    let s = stage.min(0xFFFF);
+    if s >= 800 {
+        return;
+    }
+    let mut peak = CMOS_BOOT_STAGE_PEAK.load(Relaxed);
+    while s > peak {
+        match CMOS_BOOT_STAGE_PEAK.compare_exchange(peak, s, Relaxed, Relaxed) {
+            Ok(_) => {
+                ext_cmos_write(CMOS_BOOT_MAGIC_OFF, CMOS_BOOT_MAGIC);
+                ext_cmos_write(CMOS_BOOT_STAGE_LO, s as u8);
+                ext_cmos_write(CMOS_BOOT_STAGE_HI, (s >> 8) as u8);
+                let cpu = (rdtscp_aux() & 0xFF) as u8;
+                ext_cmos_write(CMOS_BOOT_CPU, cpu);
+                return;
+            }
+            Err(cur) => peak = cur,
+        }
+    }
+    // Refresh cpu id when re-hitting the same peak stage.
+    if s == peak && peak != 0 {
+        ext_cmos_write(CMOS_BOOT_MAGIC_OFF, CMOS_BOOT_MAGIC);
+        let cpu = (rdtscp_aux() & 0xFF) as u8;
+        ext_cmos_write(CMOS_BOOT_CPU, cpu);
+    }
+}
+
+// EPT identity map leaf stats (postmortem / cpuid_ping).
+static EPT_ID_RWX_2MB: AtomicU64 = AtomicU64::new(0);
+static EPT_ID_RW_2MB: AtomicU64 = AtomicU64::new(0);
+static EPT_ID_SPLIT_2MB: AtomicU64 = AtomicU64::new(0);
+static EPT_ID_RAM_KNOWN: AtomicU64 = AtomicU64::new(0);
+
+pub fn set_ept_identity_stats(
+    rwx_2mb: u64,
+    rw_only_2mb: u64,
+    split_2mb: u64,
+    ram_known: bool,
+) {
+    EPT_ID_RWX_2MB.store(rwx_2mb, Relaxed);
+    EPT_ID_RW_2MB.store(rw_only_2mb, Relaxed);
+    EPT_ID_SPLIT_2MB.store(split_2mb, Relaxed);
+    EPT_ID_RAM_KNOWN.store(ram_known as u64, Relaxed);
 }
 
 pub fn boot_stage(stage: u64) -> Result<(), HypervisorError> {
@@ -2095,6 +2913,47 @@ mod tests {
     }
 
     #[test]
+    fn layer3_phase_byte_preserves_both_phase_nibbles() {
+        let packed = layer3_phase_byte(PHASE_FAST_CPUID, 7);
+        assert_eq!(packed, 0x47);
+        assert_eq!(packed & 0xF0, PHASE_FAST_CPUID as u8);
+        assert_eq!(packed & 0x0F, 7);
+    }
+
+    #[test]
+    fn rare_metadata_distinguishes_valid_vector_zero_from_invalid_info() {
+        let invalid = pack_rare_interruption_meta(0, 0, 0);
+        let valid_divide_error = pack_rare_interruption_meta(0, 1u64 << 31, 0);
+
+        assert_eq!(invalid & 0x80, 0);
+        assert_eq!(valid_divide_error & 0x80, 0x80);
+    }
+
+    #[test]
+    fn rare_metadata_packs_entry_failure_and_vectoring_context() {
+        let interruption_info = (1u64 << 31) | (2u64 << 8) | (1u64 << 11) | (1u64 << 12);
+        let idt_info = 1u64 << 31;
+        let packed = pack_rare_interruption_meta(1u64 << 31, interruption_info, idt_info);
+
+        assert_eq!(packed, 0xAF);
+    }
+
+    #[test]
+    fn rare_filter_ignores_nonfatal_exit_reason_status_flags() {
+        assert!(is_common_exit(10));
+        assert!(is_common_exit(28));
+        assert!(is_common_exit((1u64 << 28) | 10));
+        assert!(!is_common_exit((1u64 << 31) | 10));
+        assert!(!is_common_exit(0));
+    }
+
+    #[test]
+    fn removed_rare_slots_are_rejected_by_control_surface() {
+        assert_eq!(control(251), u64::MAX);
+        assert_eq!(control(258), u64::MAX);
+    }
+
+    #[test]
     fn client_read_request_waits_for_worker_completion() {
         let _guard = crate::intel::client_read::test_lock();
         crate::intel::client_read::reset_for_test();
@@ -2111,6 +2970,75 @@ mod tests {
             crate::intel::client_read::poll_physical_read(seq),
             0x1122_3344_5566_7788
         );
+    }
+
+    #[cfg(test)]
+    fn with_launch_io_test_lock<R>(f: impl FnOnce() -> R) -> R {
+        // Global quiesce statics — serialize these tests (no_std: spin lock).
+        static LOCK: AtomicBool = AtomicBool::new(false);
+        while LOCK
+            .compare_exchange(false, true, AcqRel, Acquire)
+            .is_err()
+        {
+            core::hint::spin_loop();
+        }
+        reset_launch_io_quiesce_for_test();
+        let out = f();
+        reset_launch_io_quiesce_for_test();
+        LOCK.store(false, Release);
+        out
+    }
+
+    #[test]
+    fn launch_io_quiesce_blocks_disk_enter_and_counts_suppressed() {
+        with_launch_io_test_lock(|| {
+            let before = launch_io_suppressed_writes();
+
+            assert!(diag_disk_io_enter());
+            diag_disk_io_leave();
+
+            let _guard = LaunchIoQuiesceGuard::enter();
+            assert!(launch_io_quiesced());
+            assert!(!diag_disk_io_enter());
+            assert!(!diag_disk_io_enter());
+            assert_eq!(launch_io_suppressed_writes(), before + 2);
+            drop(_guard);
+
+            assert!(!launch_io_quiesced());
+            assert!(diag_disk_io_enter());
+            diag_disk_io_leave();
+        });
+    }
+
+    #[test]
+    fn launch_io_quiesce_nested_depth_holds_until_outer_drops() {
+        with_launch_io_test_lock(|| {
+            let outer = LaunchIoQuiesceGuard::enter();
+            assert!(launch_io_quiesced());
+            {
+                let inner = LaunchIoQuiesceGuard::enter();
+                assert!(launch_io_quiesced());
+                drop(inner);
+                // Outer still holds the critical section.
+                assert!(launch_io_quiesced());
+            }
+            drop(outer);
+            assert!(!launch_io_quiesced());
+        });
+    }
+
+    #[test]
+    fn launch_io_quiesce_second_check_drops_active_when_gate_races() {
+        with_launch_io_test_lock(|| {
+            let before = launch_io_suppressed_writes();
+            // Race path: ACTIVE is set, then gate flips before the second check.
+            DIAG_DISK_IO_ACTIVE.store(true, Release);
+            LAUNCH_IO_QUIESCE.store(true, Release);
+            LAUNCH_IO_QUIESCE_DEPTH.store(1, Release);
+            assert!(!diag_disk_io_enter());
+            assert!(launch_io_suppressed_writes() > before);
+            DIAG_DISK_IO_ACTIVE.store(false, Release);
+        });
     }
 
     #[test]
@@ -2435,6 +3363,12 @@ pub fn control(id: u64) -> u64 {
         // bits[2:0]: 000=no limit, 001=C1, 010=C2, 011=C3, 110=C6, 111=C7/C8.
         84 => unsafe { x86::msr::rdmsr(0xE2) },
         85 => super::vmexit::idle::HLT_EXITS.load(Relaxed),
+        // Launch I/O quiesce (local_diag ↔ SMP bring-up, 0x101 guard).
+        86 => LAUNCH_IO_QUIESCE.load(Acquire) as u64,
+        87 => LAUNCH_IO_SUPPRESSED_WRITES.load(Relaxed),
+        // Prev-boot Ext CMOS stage (capture_prev_boot_stage); u64::MAX = none.
+        88 => PREV_BOOT_STAGE.load(Relaxed),
+        89 => PREV_BOOT_STAGE_CPU.load(Relaxed),
         // CMOS retention experiment (Phase 0, 2026-07-12).
         90 => CMOS_RET_PREV_MAGIC.load(Relaxed),
         91 => CMOS_RET_PREV_COUNTER.load(Relaxed),
@@ -2445,6 +3379,11 @@ pub fn control(id: u64) -> u64 {
         96 => CMOS_RET_NEW_COUNTER.load(Relaxed),
         97 => CMOS_RET_NEW_THIS_SESSION.load(Relaxed),
         98 => CMOS_RET_EXPERIMENT_RAN.load(Relaxed),
+        // EPT identity leaf stats (set by identity_2mb).
+        99 => EPT_ID_RWX_2MB.load(Relaxed),
+        104 => EPT_ID_RW_2MB.load(Relaxed),
+        105 => EPT_ID_RAM_KNOWN.load(Relaxed),
+        106 => EPT_ID_SPLIT_2MB.load(Relaxed),
         // Port 0x80 breadcrumb (2026-07-15).
         100 => PORT80_LAST.load(Relaxed) as u64,
         101 => PORT80_WRITE_COUNT.load(Relaxed),
@@ -2462,7 +3401,10 @@ pub fn control(id: u64) -> u64 {
         115 => LAYER3_CACHE_COUNT.load(Relaxed) as u64,
         116 => LAYER3_CACHE_VALID.load(Relaxed) as u64,
         117 => LAYER3_FLUSH_COUNT.load(Relaxed),   // total vmexits (not flushes)
+        118 => LAYER3_CACHE_PHASE.load(Relaxed) as u64,
+        119 => LAYER3_CACHE_COMMAND.load(Relaxed) as u64,
         120 => LAYER3_SEQUENCE.load(Relaxed),      // actual flushes done — used by cpuid_ping origin judgment
+        121 => LAYER3_CACHE_CLIENT_READ_PHASE.load(Relaxed) as u64,
         // Smart freeze detector diagnostics (2026-07-16). Non-zero fired
         // means the detector triggered NMI-inject-BSOD path since HV load;
         // stuck_cpus is a live snapshot of how many CPUs are currently
@@ -2515,14 +3457,14 @@ pub fn control(id: u64) -> u64 {
         // 241 — PREV BOOT ring head (next-write index, so newest slot =
         //       (head - 1) mod RARE_RING_SLOTS).
         // 242 — PREV BOOT ring count (saturating u8, total rare exits seen).
-        // 243..=258 — PREV slot i (0..=3) fields (cpu, reason, rip, seq_lo):
+        // 243..=250 — PREV slot i (0..=1) fields (cpu, reason, rip, seq_lo):
         //   ID = 243 + slot*4 + field
         //     field 0 = CPU, 1 = reason, 2 = RIP low 32, 3 = global seq low 8.
         // 259 — THIS BOOT total rare-exit count (RAM, monotonic).
         240 => RARE_RING_PREV_MAGIC_OK.load(Relaxed),
         241 => RARE_RING_PREV_HEAD.load(Relaxed),
         242 => RARE_RING_PREV_COUNT.load(Relaxed),
-        243..=258 => {
+        243..=250 => {
             let idx = (id - 243) as usize;
             let slot = idx / 4;
             let field = idx % 4;
@@ -2550,6 +3492,33 @@ pub fn control(id: u64) -> u64 {
         }
         // 278-279 — live Ext CMOS 0x1A-0x1B (vector array debug readback).
         278..=279 => ext_cmos_read(RARE_RING_VEC_BASE + (id - 278) as u8) as u64,
+        // INIT/SIPI state-machine telemetry (read-only, live RAM values).
+        280 => INIT_COUNT.load(Relaxed),
+        281 => SIPI_COUNT.load(Relaxed),
+        282 => INIT_AWAITING_BITMAP.load(Relaxed),
+        283 => INIT_STAGE.load(Relaxed),
+        284 => INIT_STAGE_COUNT.load(Relaxed),
+        285 => INIT_LAST_CPU.load(Relaxed),
+        286 => INIT_LAST_SIPI_VECTOR.load(Relaxed),
+        // 287-288 — PREV BOOT per-slot packed interruption metadata.
+        287..=288 => {
+            let slot = (id - 287) as usize;
+            RARE_RING_PREV_META[slot].load(Relaxed)
+        }
+        // 289-290 — live Ext CMOS 0x1C-0x1D metadata readback.
+        289..=290 => ext_cmos_read(RARE_RING_META_BASE + (id - 289) as u8) as u64,
+        // 291 — live rare-ring format byte (1 = committed D7 context format).
+        291 => ext_cmos_read(RARE_RING_FORMAT_OFF) as u64,
+        // 292-299 — RAM-only exception/vectoring context for local_diag.
+        292 => LAST_EXCEPTION_CPU.load(Relaxed),
+        293 => LAST_EXIT_INTERRUPTION_INFO.load(Relaxed),
+        294 => LAST_EXIT_INTERRUPTION_ERROR.load(Relaxed),
+        295 => LAST_IDT_VECTORING_INFO.load(Relaxed),
+        296 => LAST_IDT_VECTORING_ERROR.load(Relaxed),
+        297 => LAST_ENTRY_INTERRUPTION_INFO.load(Relaxed),
+        298 => IDT_VECTORING_EVENT_COUNT.load(Relaxed),
+        299 => ENTRY_EVENT_CONFLICT_COUNT.load(Relaxed),
+        300 => EVENT_CONTEXT_DROPPED_COUNT.load(Relaxed),
         _ => u64::MAX,
     }
 }

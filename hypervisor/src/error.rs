@@ -42,6 +42,9 @@ pub enum HypervisorError {
     #[error("Failed to execute VMLAUNCH")]
     VMLAUNCHFailed,
 
+    #[error("VMX launch requires PASSIVE_LEVEL with interrupts enabled")]
+    UnsafeLaunchContext,
+
     #[error("Failed to execute VMRESUME")]
     VMRESUMEFailed,
 

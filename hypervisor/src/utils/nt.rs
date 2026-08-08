@@ -77,9 +77,45 @@ pub fn lower_irql_to_old_level(old_irql: KIRQL) {
 /// of the system process for use in virtual-to-physical address translation.
 pub static mut NTOSKRNL_CR3: u64 = 0;
 
-/// Physical address of the identity-mapped PML4, for temporary CR3 switching
-/// in VMX root mode when accessing arbitrary physical memory.
+/// Physical address of the HV-owned identity-mapped PML4 used as **VMCS HOST_CR3**.
+///
+/// Built in `HypervisorBuilder::build` before any VMLAUNCH. Must not be confused
+/// with `NTOSKRNL_CR3` (System process DTB): EAC CR3-trashing overwrites System
+/// tables and then forces a VMEXIT; if HOST_CR3 still points at those pages the
+/// host freezes (UC 593430). See `docs/eac-isolation-audit.md`.
 pub static IDENTITY_CR3: AtomicU64 = AtomicU64::new(0);
+
+/// CR3 value for `VMCS.HOST_CR3`: private identity map only.
+///
+/// Fail-closed if `IDENTITY_CR3` is still zero (build order bug). Never falls
+/// back to `NTOSKRNL_CR3`.
+pub fn host_cr3_for_vmcs() -> Result<u64, crate::error::HypervisorError> {
+    let host_cr3 = IDENTITY_CR3.load(core::sync::atomic::Ordering::Acquire);
+    if host_cr3 == 0 {
+        return Err(crate::error::HypervisorError::InvalidCr3BaseAddress);
+    }
+    Ok(host_cr3)
+}
+
+#[cfg(test)]
+mod host_cr3_tests {
+    use super::*;
+    use core::sync::atomic::Ordering;
+
+    #[test]
+    fn host_cr3_for_vmcs_rejects_zero_and_returns_identity() {
+        let prev = IDENTITY_CR3.swap(0, Ordering::AcqRel);
+        assert!(matches!(
+            host_cr3_for_vmcs(),
+            Err(crate::error::HypervisorError::InvalidCr3BaseAddress)
+        ));
+        // Any non-zero PA is accepted; alignment is enforced when the map is built.
+        const SAMPLE_PA: u64 = 0x1_0000;
+        IDENTITY_CR3.store(SAMPLE_PA, Ordering::Release);
+        assert_eq!(host_cr3_for_vmcs().expect("identity set"), SAMPLE_PA);
+        IDENTITY_CR3.store(prev, Ordering::Release);
+    }
+}
 
 /// Updates the `NTOSKRNL_CR3` static with the CR3 of the system process.
 ///

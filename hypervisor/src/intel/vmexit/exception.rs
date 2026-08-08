@@ -5,6 +5,7 @@
 use {
     crate::{
         intel::{
+            diag,
             ept::hooks::HookType,
             events::EventInjection,
             support::{vmread_checked, vmwrite_checked},
@@ -44,14 +45,24 @@ pub fn handle_exception(guest_registers: &mut GuestRegisters, vmx: &mut Vmx) -> 
         }
     };
 
-    let interruption_error_code_value = match vmread_checked(vmcs::ro::VMEXIT_INTERRUPTION_ERR_CODE) {
-        Ok(value) => value as u32,
-        Err(error) => {
-            log::error!("Failed to read VM-exit interruption error code: {:?}", error);
-            EventInjection::vmentry_inject_ud();
-            return ExitType::Continue;
+    let interruption_error_code_value = if interruption_info_value & (1 << 11) != 0 {
+        match vmread_checked(vmcs::ro::VMEXIT_INTERRUPTION_ERR_CODE) {
+            Ok(value) => value as u32,
+            Err(error) => {
+                // Preserve the raw field even when the dependent VMREAD fails.
+                diag::note_exception_exit(interruption_info_value as u64, u64::MAX);
+                log::error!("Failed to read VM-exit interruption error code: {:?}", error);
+                EventInjection::vmentry_inject_ud();
+                return ExitType::Continue;
+            }
         }
+    } else {
+        0
     };
+    diag::note_exception_exit(
+        interruption_info_value as u64,
+        interruption_error_code_value as u64,
+    );
 
     let Some(interruption_info) = VmExitInterruptionInformation::from_u32(interruption_info_value) else {
         EventInjection::vmentry_reinject(interruption_info_value, interruption_error_code_value);

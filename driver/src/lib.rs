@@ -25,6 +25,7 @@ use {
                 hooks::HookManager,
                 paging::{AccessType, Ept},
             },
+            terminal_capture,
             vmm::Hypervisor,
         },
         utils::{
@@ -37,8 +38,9 @@ use {
     },
     log::LevelFilter,
     wdk_sys::{
-        DRIVER_UNLOAD, NTSTATUS, PCUNICODE_STRING, PDRIVER_OBJECT, PVOID, STATUS_SUCCESS,
-        UNICODE_STRING,
+        ntddk::KeDelayExecutionThread,
+        DRIVER_UNLOAD, LARGE_INTEGER, NTSTATUS, PCUNICODE_STRING, PDRIVER_OBJECT, PVOID,
+        STATUS_SUCCESS, UNICODE_STRING, _MODE,
     },
 };
 
@@ -47,14 +49,76 @@ mod local_diag;
 
 static HYPERVISOR: AtomicPtr<Hypervisor> = AtomicPtr::new(null_mut());
 const STAGE_STOP_STATUS_BASE: u32 = 0xE0F0_0000;
+// Internal-only outcome: DriverEntry must return success to keep the image
+// resident, but the HV is not confirmed fully active. Never start I/O workers.
+const RETAINED_UNSAFE_STATUS: NTSTATUS = 0xE0FE_0001u32 as NTSTATUS;
+const CMOS_CAPTURE_READ_STATUS: NTSTATUS = 0xE0C0_0001u32 as NTSTATUS;
+const CMOS_CAPTURE_WRITE_STATUS: NTSTATUS = 0xE0C0_0002u32 as NTSTATUS;
+const TERMINAL_CAPTURE_INIT_STATUS: NTSTATUS = 0xE0C0_0003u32 as NTSTATUS;
 const BOOT_STOP_STAGE: u64 = parse_boot_stop_stage(option_env!("HV_BOOT_STOP_STAGE"));
+
+const fn build_flag_is_one(value: Option<&str>) -> bool {
+    let Some(value) = value else {
+        return false;
+    };
+    let bytes = value.as_bytes();
+    bytes.len() == 1 && bytes[0] == b'1'
+}
+
+const fn cmos_capture_only_build() -> bool {
+    build_flag_is_one(option_env!("HV_CMOS_CAPTURE_ONLY"))
+}
+
+const fn terminal_capture_build() -> bool {
+    build_flag_is_one(option_env!("HV_TERMINAL_CAPTURE"))
+}
+
+/// Collector-only DriverEntry path. It is intentionally before logger setup,
+/// legacy CMOS handling, worker creation, and all hypervisor bring-up.
+unsafe fn capture_previous_cmos_only() -> NTSTATUS {
+    if !terminal_capture::capture_previous_cmos() {
+        return CMOS_CAPTURE_READ_STATUS;
+    }
+
+    let mut bytes = [0u8; terminal_capture::CMOS_BYTES];
+    if !terminal_capture::copy_previous_cmos(&mut bytes) {
+        return CMOS_CAPTURE_READ_STATUS;
+    }
+    if !local_diag::write_cmos_capture(&bytes) {
+        return CMOS_CAPTURE_WRITE_STATUS;
+    }
+    STATUS_SUCCESS
+}
 
 fn hypervisor_initializing() -> *mut Hypervisor {
     usize::MAX as *mut Hypervisor
 }
 
-fn failed_entry_may_clear_hypervisor(current: *mut Hypervisor) -> bool {
-    current == hypervisor_initializing()
+fn failed_entry_may_clear_hypervisor(status: NTSTATUS, current: *mut Hypervisor) -> bool {
+    status != STATUS_SUCCESS
+        && status != RETAINED_UNSAFE_STATUS
+        && current == hypervisor_initializing()
+}
+
+fn retained_hypervisor_state(current: *mut Hypervisor) -> *mut Hypervisor {
+    if current.is_null() {
+        hypervisor_initializing()
+    } else {
+        current
+    }
+}
+
+fn poison_hypervisor_state_if_empty() {
+    let current = HYPERVISOR.load(Ordering::Acquire);
+    let retained = retained_hypervisor_state(current);
+    if retained != current {
+        let _ = HYPERVISOR.compare_exchange(
+            current,
+            retained,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
+    }
 }
 
 fn failure_status_after_cleanup(
@@ -63,7 +127,7 @@ fn failure_status_after_cleanup(
     failure_status: NTSTATUS,
 ) -> NTSTATUS {
     if cleanup_failed || !callback_cleanup_succeeded {
-        STATUS_SUCCESS
+        RETAINED_UNSAFE_STATUS
     } else {
         failure_status
     }
@@ -132,6 +196,18 @@ unsafe fn register_driver_unload(driver_object: PDRIVER_OBJECT) {
     (*driver).driver_unload = Some(driver_unload);
 }
 
+unsafe fn disable_standard_driver_unload(driver_object: PDRIVER_OBJECT) {
+    if driver_object.is_null() {
+        return;
+    }
+
+    // DriverUnload cannot reject an unload after VMX or worker teardown fails.
+    // Once DriverEntry must keep this image resident, reboot is the only safe
+    // way to release it.
+    let driver = driver_object as *mut DriverObjectLayout;
+    (*driver).driver_unload = None;
+}
+
 unsafe extern "C" fn driver_unload(_driver_object: PDRIVER_OBJECT) {
     // Deregister the bug-check callback before releasing driver memory —
     // a stale entry in the kernel callback list would fire into freed pages.
@@ -143,6 +219,9 @@ unsafe extern "C" fn driver_unload(_driver_object: PDRIVER_OBJECT) {
     }
     if !hypervisor::intel::client_read::stop_worker() {
         log::error!("Client-read worker cleanup did not complete successfully");
+    }
+    if !local_diag::stop_terminal_worker() {
+        log::error!("Terminal CMOS worker cleanup did not complete successfully");
     }
     if !local_diag::stop_worker() {
         log::error!("Local diagnostic worker cleanup did not complete successfully");
@@ -170,6 +249,7 @@ unsafe extern "C" fn driver_unload(_driver_object: PDRIVER_OBJECT) {
 //   0xE005xx00 = virtualize_core failed, xx = sub-error:
 //     01=ProcessorSwitch 02=VMXONFailed 03=VMCLEARFailed
 //     04=VMPTRLDFailed 05=VMWRITEFailed 06=VMLAUNCHFailed
+//     35=unsafe launch context (IRQL/IF)
 //     FF=other
 //   0x00000000 = OK
 
@@ -188,6 +268,7 @@ fn hv_err_to_code(base: u32, e: HypervisorError) -> NTSTATUS {
         HypervisorError::VMREADFailed => 0x0B,
         HypervisorError::VMWRITEFailed => 0x0C,
         HypervisorError::VMLAUNCHFailed => 0x0D,
+        HypervisorError::UnsafeLaunchContext => 0x35,
         HypervisorError::VMRESUMEFailed => 0x0E,
         HypervisorError::ProcessorSwitchFailed => 0x0F,
         HypervisorError::VcpuIsNone => 0x10,
@@ -236,20 +317,36 @@ pub unsafe extern "system" fn driver_entry(
     driver_object: PDRIVER_OBJECT,
     _registry_path: PCUNICODE_STRING,
 ) -> NTSTATUS {
-    com_logger::builder()
-        .base(0x2f8)
-        .filter(LevelFilter::Info)
-        .setup();
-    // Layer 6: capture prev-boot per-CPU snapshot from CMOS into RAM BEFORE
-    // anything else can write to CMOS. This is what preserves freeze-boot
-    // data across the RST/reboot cycle even after this-boot flushes start
-    // overwriting CMOS. Cheap: ~50 CMOS reads.
-    diag::snap_capture_prev_boot();
+    // Collector-only builds must not initialize logging or any legacy CMOS
+    // path. They read the complete previous image, flush it to a separate
+    // file, and return without starting HV or a worker.
+    if cmos_capture_only_build() {
+        return capture_previous_cmos_only();
+    }
 
-    // Phase 0-2 CMOS retention experiment. Runs once, before HV starts, before
-    // any boot_stage stop check — we want experiment data written even when
-    // HV_BOOT_STOP_STAGE aborts the load early.
-    diag::cmos_retention_experiment();
+    // Terminal mode snapshots the previous image before the new session can
+    // clear or overwrite any byte. Legacy CMOS layouts are skipped below.
+    if terminal_capture_build()
+        && (!terminal_capture::capture_previous_cmos()
+            || !terminal_capture::initialize_session())
+    {
+        return TERMINAL_CAPTURE_INIT_STATUS;
+    }
+
+    if !terminal_capture_build() {
+        com_logger::builder()
+            .base(0x2f8)
+            .filter(LevelFilter::Info)
+            .setup();
+    }
+
+    if !terminal_capture_build() {
+        // Legacy local_diag path: capture its historical CMOS layouts before
+        // any existing writer changes them.
+        diag::snap_capture_prev_boot();
+        diag::capture_prev_boot_stage();
+        diag::cmos_retention_experiment();
+    }
     if let Some(status) = boot_stage(100) {
         return status;
     }
@@ -261,20 +358,78 @@ pub unsafe extern "system" fn driver_entry(
         }
     }
 
-    // Create and flush the local log before any per-CPU VMX allocation or
-    // launch. Startup failures must leave a boot-stage record instead of an
-    // absent log file.
-    if !local_diag::start_worker_if_enabled() {
-        log::error!("Failed to start local diagnostic worker before virtualization");
-        return 0xE0013700u32 as NTSTATUS;
+    if !terminal_capture_build() {
+        // Write HVL1 START before bring-up (no ZwFlush), do **not** start the
+        // 100 ms worker yet. Flush + multi-CPU SMP launch both caused 0x101.
+        if !local_diag::prepare_log_if_enabled() {
+            log::error!("Failed to prepare local diagnostic log before virtualization");
+            return 0xE0013700u32 as NTSTATUS;
+        }
     }
 
+    // Outer launch-I/O quiesce: nested with virtualize_core's guard.
+    let launch_io = diag::LaunchIoQuiesceGuard::enter();
     let status = with_expanded_stack(|| virtualize_system());
-    if status != STATUS_SUCCESS && !local_diag::stop_worker() {
-        // The image must remain resident if its diagnostic thread cannot be
-        // joined; returning failure would let the mapper unload live code.
-        log::error!("Local diagnostic worker cleanup did not complete successfully");
+
+    if status == STATUS_SUCCESS {
+        drop(launch_io);
+        disable_standard_driver_unload(driver_object);
+        diag::set_boot_stage(255);
+        // Let the machine settle after sequential VMLAUNCH before any diag
+        // ZwFlushBuffersFile (still a 0x101 witness when fired too early).
+        // 1s: hybrid single-LP needs more clock/IPI settle than all-LP.
+        {
+            let mut interval = LARGE_INTEGER {
+                QuadPart: -10_000_000, // 1000 ms
+            };
+            unsafe {
+                let _ = KeDelayExecutionThread(_MODE::KernelMode as _, 0, &mut interval);
+            }
+        }
+        diag::set_boot_stage(256);
+        // Periodic telemetry only after every CPU has entered non-root.
+        // Terminal mode starts a worker whose only action is a once-per-second
+        // CMOS checkpoint. The worker performs no runtime file or serial I/O.
+        if terminal_capture_build() {
+            if !local_diag::start_terminal_worker_if_enabled() {
+                log::error!("Failed to start terminal CMOS checkpoint worker");
+            }
+        } else if !local_diag::start_worker_if_enabled() {
+            log::error!("Failed to start local diagnostic worker after virtualization");
+            // HV is live; keep the image. Missing post-launch log is non-fatal.
+        }
+        diag::set_boot_stage(257);
         return STATUS_SUCCESS;
+    }
+
+    if status == RETAINED_UNSAFE_STATUS {
+        // VMX teardown or callback cleanup did not complete. The backing image
+        // and launch-I/O quiesce must remain live until reboot, and periodic
+        // filesystem I/O must never start for an indeterminate HV state.
+        poison_hypervisor_state_if_empty();
+        disable_standard_driver_unload(driver_object);
+        core::mem::forget(launch_io);
+        return STATUS_SUCCESS;
+    }
+
+    drop(launch_io);
+    if terminal_capture_build() {
+        // Terminal fatal paths are captured directly in CMOS; do not add the
+        // legacy launch-failure file write to this low-interference profile.
+        let _ = local_diag::stop_terminal_worker();
+    } else {
+        if !local_diag::write_failure_record(status) {
+            log::error!("Failed to persist local launch-failure diagnostics");
+        }
+
+        if !local_diag::stop_worker() {
+            // prepare may have opened the file without a worker — stop_worker
+            // still closes the handle. If a worker was somehow running, join it.
+            log::error!("Local diagnostic worker cleanup did not complete successfully");
+            poison_hypervisor_state_if_empty();
+            disable_standard_driver_unload(driver_object);
+            return STATUS_SUCCESS;
+        }
     }
     status
 }
@@ -293,7 +448,7 @@ fn virtualize_system() -> NTSTATUS {
         .is_err()
     {
         let _ = boot_stage(121);
-        return STATUS_SUCCESS;
+        return RETAINED_UNSAFE_STATUS;
     }
 
     if let Some(status) = boot_stage(130) {
@@ -303,7 +458,7 @@ fn virtualize_system() -> NTSTATUS {
     let status = virtualize_system_claimed();
     if status != STATUS_SUCCESS {
         let _ = boot_stage(131);
-        if failed_entry_may_clear_hypervisor(HYPERVISOR.load(Ordering::Acquire)) {
+        if failed_entry_may_clear_hypervisor(status, HYPERVISOR.load(Ordering::Acquire)) {
             let _ = HYPERVISOR.compare_exchange(
                 hypervisor_initializing(),
                 null_mut(),
@@ -352,7 +507,7 @@ fn virtualize_system_claimed() -> NTSTATUS {
     // so the system CR3 must be available before construction.
     update_ntoskrnl_cr3();
     let hook_manager = HookManager::new(vec![]);
-    let mut hv = match Hypervisor::builder()
+    let hv = match Hypervisor::builder()
         .primary_ept(primary_ept)
         .hook_manager(hook_manager)
         .build()
@@ -361,6 +516,16 @@ fn virtualize_system_claimed() -> NTSTATUS {
         Err(e) => {
             let _ = boot_stage(221);
             return hv_err_to_code(0xE0040000, e);
+        }
+    };
+    // Allocate the persistent owner while every CPU is still native. A
+    // partial launch cleanup can fail with one or more CPUs still in VMX; that
+    // path may retain this existing Box, but must never allocate a new one.
+    let mut hv = match Box::try_new(hv) {
+        Ok(hv) => hv,
+        Err(_) => {
+            let _ = boot_stage(222);
+            return hv_err_to_code(0xE0040000, HypervisorError::OutOfMemory);
         }
     };
 
@@ -385,7 +550,6 @@ fn virtualize_system_claimed() -> NTSTATUS {
                     "Failed to cleanup after partial virtualization failure: {}",
                     error
                 );
-                let hv = Box::new(hv);
                 HYPERVISOR.store(Box::into_raw(hv), Ordering::Release);
                 true
             } else {
@@ -403,14 +567,15 @@ fn virtualize_system_claimed() -> NTSTATUS {
         }
     }
 
-    if !hypervisor::intel::client_read::start_worker_if_enabled() {
+    if !terminal_capture_build()
+        && !hypervisor::intel::client_read::start_worker_if_enabled()
+    {
         log::error!("Failed to start client read worker");
         let cleanup_failed = if let Err(error) = hv.devirtualize_system() {
             log::error!(
                 "Failed to cleanup after client read worker failure: {}",
                 error
             );
-            let hv = Box::new(hv);
             HYPERVISOR.store(Box::into_raw(hv), Ordering::Release);
             true
         } else {
@@ -424,7 +589,6 @@ fn virtualize_system_claimed() -> NTSTATUS {
         );
     }
 
-    let hv = Box::new(hv);
     HYPERVISOR.store(Box::into_raw(hv), Ordering::Release);
     let _ = boot_stage(260);
     STATUS_SUCCESS
@@ -436,19 +600,52 @@ mod tests {
 
     #[test]
     fn failed_entry_only_clears_initializing_sentinel() {
-        assert!(failed_entry_may_clear_hypervisor(hypervisor_initializing()));
-        assert!(!failed_entry_may_clear_hypervisor(null_mut()));
+        let failure = 0xE0053600u32 as NTSTATUS;
+        assert!(failed_entry_may_clear_hypervisor(
+            failure,
+            hypervisor_initializing()
+        ));
+        assert!(!failed_entry_may_clear_hypervisor(failure, null_mut()));
         assert!(!failed_entry_may_clear_hypervisor(
+            failure,
             0x1000usize as *mut Hypervisor
         ));
+        assert!(!failed_entry_may_clear_hypervisor(
+            RETAINED_UNSAFE_STATUS,
+            hypervisor_initializing()
+        ));
+        assert!(!failed_entry_may_clear_hypervisor(
+            STATUS_SUCCESS,
+            hypervisor_initializing()
+        ));
+    }
+
+    #[test]
+    fn retained_entry_poison_preserves_existing_owner_state() {
+        assert_eq!(
+            retained_hypervisor_state(null_mut()),
+            hypervisor_initializing()
+        );
+        assert_eq!(
+            retained_hypervisor_state(hypervisor_initializing()),
+            hypervisor_initializing()
+        );
+        let owner = 0x1000usize as *mut Hypervisor;
+        assert_eq!(retained_hypervisor_state(owner), owner);
     }
 
     #[test]
     fn cleanup_failure_keeps_driver_resident() {
         let failure = 0xE0053600u32 as NTSTATUS;
         assert_eq!(failure_status_after_cleanup(false, true, failure), failure);
-        assert_eq!(failure_status_after_cleanup(true, true, failure), STATUS_SUCCESS);
-        assert_eq!(failure_status_after_cleanup(false, false, failure), STATUS_SUCCESS);
+        assert_eq!(
+            failure_status_after_cleanup(true, true, failure),
+            RETAINED_UNSAFE_STATUS
+        );
+        assert_eq!(
+            failure_status_after_cleanup(false, false, failure),
+            RETAINED_UNSAFE_STATUS
+        );
     }
 
     #[test]

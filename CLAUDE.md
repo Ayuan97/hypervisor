@@ -6,7 +6,7 @@
 |---|---|
 | **本文件** | 本仓目录、构建加载、VMCALL、freeze 诊断 |
 | `D:\cheat\DEV.md` | 工作区流程（含本地诊断入口） |
-| `docs/hv-local-monitor.md` | `hv_diag_live.log` 格式 |
+| `docs/hv-local-monitor.md` | terminal capture 流程 / `hv_diag_live.log` 旧格式 |
 | `AGENTS.md` | 指向本文件 |
 
 ---
@@ -20,6 +20,7 @@ hypervisor/
 │       ├── ept/             EPT / cloak
 │       ├── vmexit/          各 exit handler
 │       ├── diag.rs          诊断 / ring / watchdog
+│       ├── terminal_capture.rs  跨重启终点双槽
 │       ├── vmcs.rs vcpu.rs vmlaunch.rs …
 │       ├── client_read.rs   物理读快路径
 │       └── host_idt.rs      host IDT
@@ -27,7 +28,7 @@ hypervisor/
 ├── scripts/                 构建与加载（见下表）
 ├── tools/                   用户态探针 .rs（.exe 不入库）
 └── docs/
-    └── hv-local-monitor.md  现行诊断格式
+    └── hv-local-monitor.md  terminal capture + legacy HVL1 格式
 ```
 
 | 规则 | |
@@ -57,7 +58,7 @@ hypervisor/
 | `cpuid_ping` | 存活 / seal / status（`start_hv` 调用） |
 | `probe_test` | 加载后自检 |
 | `hv_breadcrumb` | 每 CPU 最后 VM-exit |
-| `read_cmos_freeze` | 冻死后硬重启读 CMOS |
+| `read_cmos_freeze` | **旧布局，terminal 流程严禁使用** |
 | `phys_test` / `hv_mem_diag` | 物理读诊断 |
 | `freeze_watchdog` | 通道卡死监视 |
 | 其它 `*_bench` / `eac_sim` / `*_monitor` | 专项，非日常 |
@@ -97,6 +98,7 @@ scripts\start_hv_client.bat
 | `HV_BOOT_STOP_STAGE=N` | **构建** | 启动阶段隔离 |
 | `HV_USER_CLIENT_READS=1` | **构建** | 用户态 client 读（svcmon / local_diag） |
 | `HV_LOCAL_DIAG=1` | **构建** | 写 `D:\cheat\hv_diag_live.log` |
+| `HV_TERMINAL_CAPTURE=1` | **构建** | 跨硬重启终点双槽；默认 freeze 测试模式 |
 | `HV_TRANSPARENT=1` | **构建** | 测试用 CPUID 透传 |
 | `HV_PT_CONCEAL_MASK` | **构建** | 隐蔽掩码（local_diag 脚本会设） |
 
@@ -104,8 +106,8 @@ scripts\start_hv_client.bat
 
 | 通道 | 说明 |
 |---|---|
-| 本地文件 | `HV_LOCAL_DIAG` → `hv_diag_live.log`（见 hv-local-monitor.md） |
-| CMOS | freeze 快照；`tools\read_cmos_freeze.exe` |
+| 本地文件 | legacy `HV_LOCAL_DIAG` → `hv_diag_live.log`（默认 freeze 测试禁用） |
+| CMOS | terminal 双槽；重启后 collector-first，严禁旧 reader |
 | COM2 | `0x2f8` 串口 |
 | CPUID/VMCALL diag | seal 前；`cpuid_ping` / breadcrumb |
 
@@ -138,9 +140,10 @@ scripts\start_hv_client.bat
 
 实测 signature：整机死锁式卡死（键鼠/电源短按/网络均无响应，无蓝屏、无自动重启）。细节与字段表：
 
-- 常用：`HOST_FAULT_*`、`KEBUGCHECKEX_*`、`GET_WATCHDOG`、per-CPU ring（`GET_CTL` / VMCALL）  
-- 本地文件：`HVL1 R` / `HVL1 C`（`docs/hv-local-monitor.md`）  
-- 硬重启后：`read_cmos_freeze.exe`  
+- 常用：`HOST_FAULT_*`、`KEBUGCHECKEX_*`、`GET_WATCHDOG`、per-CPU ring（`GET_CTL` / VMCALL）
+- terminal：双槽 / 24 CPU checkpoint / emergency capsule（`docs/hv-local-monitor.md`）
+- 本地文件：仅历史 `HVL1 R` / `HVL1 C` 归档
+- 硬重启后：先 collector 固化上一启动 128-byte Ext CMOS；**不运行** `read_cmos_freeze.exe`
 
 观测原则：数据须在卡死前写入持久层；handler entry 写优先于 finish。CMOS 布局以源码 `diag.rs` 为准。
 

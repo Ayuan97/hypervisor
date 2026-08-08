@@ -43,6 +43,17 @@ use {
     x86_64::registers::control::{Cr0, Cr4},
 };
 
+// Intel's VM-entry checks require DR7[63:32] and DR7[15:11] to be zero,
+// while bit 10 is the architectural fixed-one bit. RtlCaptureContext does
+// not guarantee Dr0..Dr7 in a kernel CONTEXT, and this VMCS has no DR0..DR3
+// fields to pair with a nonzero enable mask. Start the guest with the
+// architectural reset value instead of importing untrusted stack bytes.
+const GUEST_DR7_FIXED_ONE: u64 = 1 << 10;
+
+const fn guest_dr7_for_entry() -> u64 {
+    GUEST_DR7_FIXED_ONE
+}
+
 /// Represents the VMCS region in memory.
 ///
 /// The VMCS region is essential for VMX operations on the CPU.
@@ -114,11 +125,27 @@ impl Vmcs {
         vmwrite_checked(vmcs::guest::CR3, cr3())?;
         vmwrite_checked(vmcs::guest::CR4, Cr4::read_raw())?;
 
-        vmwrite_checked(vmcs::guest::DR7, context.Dr7)?;
+        vmwrite_checked(vmcs::guest::DR7, guest_dr7_for_entry())?;
 
         vmwrite_checked(vmcs::guest::RSP, context.Rsp)?;
         vmwrite_checked(vmcs::guest::RIP, context.Rip)?;
         vmwrite_checked(vmcs::guest::RFLAGS, context.EFlags)?;
+
+        // These fields are not architectural register snapshots. Initialize
+        // them explicitly instead of depending on implementation-specific
+        // VMCS contents after VMCLEAR. The launch site is an active kernel
+        // thread at a normal call boundary, so no STI/MOV-SS/NMI blocking or
+        // pending debug exception needs to be carried into the first entry.
+        vmwrite_checked(vmcs::guest::INTERRUPTIBILITY_STATE, 0u64)?;
+        vmwrite_checked(vmcs::guest::ACTIVITY_STATE, 0u64)?;
+        vmwrite_checked(vmcs::guest::PENDING_DBG_EXCEPTIONS, 0u64)?;
+
+        // A new VMCS must start with no queued event. Otherwise a stale valid
+        // bit or dependent length/error field can make the first VM entry fail
+        // with exit reason 0x21 before the guest continuation is reached.
+        vmwrite_checked(vmcs::control::VMENTRY_INTERRUPTION_INFO_FIELD, 0u64)?;
+        vmwrite_checked(vmcs::control::VMENTRY_EXCEPTION_ERR_CODE, 0u64)?;
+        vmwrite_checked(vmcs::control::VMENTRY_INSTRUCTION_LEN, 0u64)?;
 
         vmwrite_checked(vmcs::guest::CS_SELECTOR, context.SegCs)?;
         vmwrite_checked(vmcs::guest::SS_SELECTOR, context.SegSs)?;
@@ -164,6 +191,7 @@ impl Vmcs {
 
         unsafe {
             vmwrite_checked(vmcs::guest::IA32_DEBUGCTL_FULL, msr::rdmsr(msr::IA32_DEBUGCTL))?;
+            vmwrite_checked(vmcs::guest::IA32_EFER_FULL, msr::rdmsr(msr::IA32_EFER))?;
             vmwrite_checked(vmcs::guest::IA32_SYSENTER_CS, msr::rdmsr(msr::IA32_SYSENTER_CS))?;
             vmwrite_checked(vmcs::guest::IA32_SYSENTER_ESP, msr::rdmsr(msr::IA32_SYSENTER_ESP))?;
             vmwrite_checked(vmcs::guest::IA32_SYSENTER_EIP, msr::rdmsr(msr::IA32_SYSENTER_EIP))?;
@@ -228,7 +256,12 @@ impl Vmcs {
         log::debug!("Setting up Host Registers State");
 
         unsafe { vmwrite_checked(vmcs::host::CR0, controlregs::cr0().bits() as u64)? };
-        vmwrite_checked(vmcs::host::CR3, unsafe { crate::utils::nt::NTOSKRNL_CR3 })?;
+        // HOST_CR3 must be the HV-owned identity map (IDENTITY_CR3), never the
+        // System process DTB (NTOSKRNL_CR3). EAC CR3-trashing zeros/trashes
+        // System tables then forces VMEXIT; HOST walking those pages freezes
+        // the machine (docs/eac-isolation-audit.md, UC 593430).
+        let host_cr3 = crate::utils::nt::host_cr3_for_vmcs()?;
+        vmwrite_checked(vmcs::host::CR3, host_cr3)?;
         vmwrite_checked(vmcs::host::CR4, Cr4::read_raw())?;
 
         // The RIP/RSP registers are set within `launch_vm`.
@@ -253,6 +286,7 @@ impl Vmcs {
             vmwrite_checked(vmcs::host::IA32_SYSENTER_CS, msr::rdmsr(msr::IA32_SYSENTER_CS))?;
             vmwrite_checked(vmcs::host::IA32_SYSENTER_ESP, msr::rdmsr(msr::IA32_SYSENTER_ESP))?;
             vmwrite_checked(vmcs::host::IA32_SYSENTER_EIP, msr::rdmsr(msr::IA32_SYSENTER_EIP))?;
+            vmwrite_checked(vmcs::host::IA32_EFER_FULL, msr::rdmsr(msr::IA32_EFER))?;
         }
 
         log::debug!("Host Registers State setup successfully!");
@@ -411,13 +445,20 @@ impl Vmcs {
                 ctl_pin, ctl_pri, ctl_sec, ctl_ent, ctl_ext);
         }
 
-        unsafe {
-            vmwrite_checked(vmcs::control::CR0_READ_SHADOW, controlregs::cr0().bits() as u64)?;
-        };
+        const CR0_PE: u64 = 1 << 0;
+        const CR0_PG: u64 = 1 << 31;
+        let architectural_cr0 = unsafe { controlregs::cr0().bits() as u64 };
+        let cr0_fixed0 = unsafe { msr::rdmsr(msr::IA32_VMX_CR0_FIXED0) };
+        let cr0_forced = cr0_fixed0 & !(CR0_PE | CR0_PG);
+        vmwrite_checked(vmcs::guest::CR0, architectural_cr0 | cr0_forced)?;
+        vmwrite_checked(vmcs::control::CR0_GUEST_HOST_MASK, cr0_forced)?;
+        vmwrite_checked(vmcs::control::CR0_READ_SHADOW, architectural_cr0)?;
 
-        const CR4_VMXE: u64 = 1 << 13;
-        vmwrite_checked(vmcs::control::CR4_GUEST_HOST_MASK, CR4_VMXE)?;
-        vmwrite_checked(vmcs::control::CR4_READ_SHADOW, Cr4::read_raw() & !CR4_VMXE)?;
+        let architectural_cr4 = Cr4::read_raw();
+        let cr4_fixed0 = unsafe { msr::rdmsr(msr::IA32_VMX_CR4_FIXED0) };
+        vmwrite_checked(vmcs::guest::CR4, architectural_cr4 | cr4_fixed0)?;
+        vmwrite_checked(vmcs::control::CR4_GUEST_HOST_MASK, cr4_fixed0)?;
+        vmwrite_checked(vmcs::control::CR4_READ_SHADOW, architectural_cr4 & !cr4_fixed0)?;
 
         vmwrite_checked(vmcs::control::MSR_BITMAPS_ADDR_FULL, PhysicalAddress::pa_from_va(shared_data.msr_bitmap.as_ref() as *const _ as _))?;
         vmwrite_checked(vmcs::control::EXCEPTION_BITMAP, 0u64)?;
@@ -487,14 +528,19 @@ impl Vmcs {
 }
 
 fn required_primary_controls() -> u64 {
+    // EAC initialization can hard-freeze Intel guests when both CR3-exit
+    // directions are disabled. Intercept MOV-from-CR3 only: it supplies the
+    // required exit without trapping every scheduler MOV-to-CR3.
     (vmcs::control::PrimaryControls::SECONDARY_CONTROLS.bits()
         | vmcs::control::PrimaryControls::USE_MSR_BITMAPS.bits()
-        | vmcs::control::PrimaryControls::USE_TSC_OFFSETTING.bits()) as u64
+        | vmcs::control::PrimaryControls::USE_TSC_OFFSETTING.bits()
+        | vmcs::control::PrimaryControls::CR3_STORE_EXITING.bits()) as u64
 }
 
 fn requested_pinbased_controls() -> u64 {
     // Always NMI passthrough; never request external-interrupt exiting or
-    // the preemption timer from this surface.
+    // the preemption timer from this surface. (local_diag 0x101 root cause
+    // was EPT RWX over MMIO — fixed in ept::identity_2mb, not pin-based.)
     0
 }
 
@@ -519,7 +565,8 @@ fn required_secondary_controls() -> u64 {
         | vmcs::control::SecondaryControls::ENABLE_INVPCID.bits()
         | vmcs::control::SecondaryControls::ENABLE_VPID.bits()) as u64;
     if !ept_disabled() {
-        bits |= vmcs::control::SecondaryControls::ENABLE_EPT.bits() as u64;
+        bits |= (vmcs::control::SecondaryControls::ENABLE_EPT.bits()
+            | vmcs::control::SecondaryControls::UNRESTRICTED_GUEST.bits()) as u64;
     }
     bits
 }
@@ -550,7 +597,8 @@ fn requested_secondary_controls() -> u64 {
 
 fn required_entry_controls() -> u64 {
     (vmcs::control::EntryControls::IA32E_MODE_GUEST.bits()
-        | vmcs::control::EntryControls::LOAD_DEBUG_CONTROLS.bits()) as u64
+        | vmcs::control::EntryControls::LOAD_DEBUG_CONTROLS.bits()
+        | vmcs::control::EntryControls::LOAD_IA32_EFER.bits()) as u64
 }
 
 fn optional_entry_controls() -> u64 {
@@ -571,7 +619,9 @@ fn requested_entry_controls() -> u64 {
 
 fn required_exit_controls() -> u64 {
     (vmcs::control::ExitControls::HOST_ADDRESS_SPACE_SIZE.bits()
-        | vmcs::control::ExitControls::SAVE_DEBUG_CONTROLS.bits()) as u64
+        | vmcs::control::ExitControls::SAVE_DEBUG_CONTROLS.bits()
+        | vmcs::control::ExitControls::SAVE_IA32_EFER.bits()
+        | vmcs::control::ExitControls::LOAD_IA32_EFER.bits()) as u64
 }
 
 fn optional_exit_controls() -> u64 {
@@ -626,7 +676,6 @@ fn unsupported_primary_exit_controls(effective_primary: u64) -> u64 {
         | vmcs::control::PrimaryControls::INVLPG_EXITING.bits()
         | vmcs::control::PrimaryControls::RDPMC_EXITING.bits()
         | vmcs::control::PrimaryControls::CR3_LOAD_EXITING.bits()
-        | vmcs::control::PrimaryControls::CR3_STORE_EXITING.bits()
         | vmcs::control::PrimaryControls::CR8_LOAD_EXITING.bits()
         | vmcs::control::PrimaryControls::CR8_STORE_EXITING.bits()
         | vmcs::control::PrimaryControls::USE_TPR_SHADOW.bits()
@@ -643,7 +692,6 @@ fn unsupported_secondary_controls(effective_secondary: u64) -> u64 {
     let unsupported = (vmcs::control::SecondaryControls::VIRTUALIZE_APIC.bits()
         | vmcs::control::SecondaryControls::DTABLE_EXITING.bits()
         | vmcs::control::SecondaryControls::VIRTUALIZE_X2APIC.bits()
-        | vmcs::control::SecondaryControls::UNRESTRICTED_GUEST.bits()
         | vmcs::control::SecondaryControls::VIRTUALIZE_APIC_REGISTER.bits()
         | vmcs::control::SecondaryControls::VIRTUAL_INTERRUPT_DELIVERY.bits()
         | vmcs::control::SecondaryControls::PAUSE_LOOP_EXITING.bits()
@@ -668,7 +716,6 @@ fn unsupported_entry_controls(effective_entry: u64) -> u64 {
         | vmcs::control::EntryControls::DEACTIVATE_DUAL_MONITOR.bits()
         | vmcs::control::EntryControls::LOAD_IA32_PERF_GLOBAL_CTRL.bits()
         | vmcs::control::EntryControls::LOAD_IA32_PAT.bits()
-        | vmcs::control::EntryControls::LOAD_IA32_EFER.bits()
         | vmcs::control::EntryControls::LOAD_IA32_BNDCFGS.bits()
         | vmcs::control::EntryControls::LOAD_IA32_RTIT_CTL.bits()) as u64;
 
@@ -680,8 +727,6 @@ fn unsupported_exit_controls(effective_exit: u64) -> u64 {
         | vmcs::control::ExitControls::ACK_INTERRUPT_ON_EXIT.bits()
         | vmcs::control::ExitControls::SAVE_IA32_PAT.bits()
         | vmcs::control::ExitControls::LOAD_IA32_PAT.bits()
-        | vmcs::control::ExitControls::SAVE_IA32_EFER.bits()
-        | vmcs::control::ExitControls::LOAD_IA32_EFER.bits()
         | vmcs::control::ExitControls::CLEAR_IA32_BNDCFGS.bits()
         | vmcs::control::ExitControls::CLEAR_IA32_RTIT_CTL.bits()) as u64;
 
@@ -871,6 +916,11 @@ mod tests {
     use super::*;
 
     #[test]
+    fn guest_dr7_entry_uses_architectural_reset_value() {
+        assert_eq!(guest_dr7_for_entry(), GUEST_DR7_FIXED_ONE);
+    }
+
+    #[test]
     fn required_controls_must_all_be_present() {
         assert!(required_controls_present(0b1010, 0b1110));
         assert!(!required_controls_present(0b1010, 0b0010));
@@ -882,6 +932,16 @@ mod tests {
         let tsc_offsetting = vmcs::control::PrimaryControls::USE_TSC_OFFSETTING.bits() as u64;
 
         assert_ne!(required & tsc_offsetting, 0);
+    }
+
+    #[test]
+    fn primary_controls_request_only_cr3_store_exiting() {
+        let required = required_primary_controls();
+        let cr3_load = vmcs::control::PrimaryControls::CR3_LOAD_EXITING.bits() as u64;
+        let cr3_store = vmcs::control::PrimaryControls::CR3_STORE_EXITING.bits() as u64;
+
+        assert_eq!(required & cr3_load, 0);
+        assert_eq!(required & cr3_store, cr3_store);
     }
 
     #[test]
@@ -996,11 +1056,13 @@ mod tests {
         let baseline = required_primary_controls();
         let hlt = vmcs::control::PrimaryControls::HLT_EXITING.bits() as u64;
         let rdpmc = vmcs::control::PrimaryControls::RDPMC_EXITING.bits() as u64;
+        let cr3_load = vmcs::control::PrimaryControls::CR3_LOAD_EXITING.bits() as u64;
         let io = vmcs::control::PrimaryControls::UNCOND_IO_EXITING.bits() as u64;
 
         assert_eq!(unsupported_primary_exit_controls(baseline), 0);
         assert_ne!(unsupported_primary_exit_controls(baseline | hlt), 0);
         assert_ne!(unsupported_primary_exit_controls(baseline | rdpmc), 0);
+        assert_ne!(unsupported_primary_exit_controls(baseline | cr3_load), 0);
         assert_ne!(unsupported_primary_exit_controls(baseline | io), 0);
     }
 
@@ -1025,12 +1087,14 @@ mod tests {
         let exit = requested_exit_controls();
         let entry_efer = vmcs::control::EntryControls::LOAD_IA32_EFER.bits() as u64;
         let exit_efer = vmcs::control::ExitControls::LOAD_IA32_EFER.bits() as u64;
+        let entry_pat = vmcs::control::EntryControls::LOAD_IA32_PAT.bits() as u64;
         let exit_ack = vmcs::control::ExitControls::ACK_INTERRUPT_ON_EXIT.bits() as u64;
 
         assert_eq!(unsupported_entry_controls(entry), 0);
         assert_eq!(unsupported_exit_controls(exit), 0);
-        assert_ne!(unsupported_entry_controls(entry | entry_efer), 0);
-        assert_ne!(unsupported_exit_controls(exit | exit_efer), 0);
+        assert_eq!(unsupported_entry_controls(entry | entry_efer), 0);
+        assert_eq!(unsupported_exit_controls(exit | exit_efer), 0);
+        assert_ne!(unsupported_entry_controls(entry | entry_pat), 0);
         assert_ne!(unsupported_exit_controls(exit | exit_ack), 0);
     }
 

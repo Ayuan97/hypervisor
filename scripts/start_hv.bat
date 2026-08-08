@@ -56,16 +56,20 @@ if not exist "%PROBE%" (
     exit /b 6
 )
 
-"%PING%" --status > "%TEMP%\hv_status.log" 2>&1
-if not errorlevel 1 (
-    type "%TEMP%\hv_status.log"
+if /I "%HV_SKIP_STATUS_PROBE%"=="1" (
+    echo [!] Active HV status probe skipped by caller; caller must enforce one map per boot.
+) else (
+    "%PING%" --status > "%TEMP%\hv_status.log" 2>&1
+    if not errorlevel 1 (
+        type "%TEMP%\hv_status.log"
+        del /F /Q "%TEMP%\hv_status.log" >nul 2>&1
+        echo [-] Hypervisor is already active.
+        echo     Do not map again over a running instance. Reboot before loading a new build.
+        pause
+        exit /b 7
+    )
     del /F /Q "%TEMP%\hv_status.log" >nul 2>&1
-    echo [-] Hypervisor is already active.
-    echo     Do not map again over a running instance. Reboot before loading a new build.
-    pause
-    exit /b 7
 )
-del /F /Q "%TEMP%\hv_status.log" >nul 2>&1
 
 :: Clean old diag log
 del /F /Q C:\hv_diag.log >nul 2>&1
@@ -87,6 +91,7 @@ echo [3/7] Driver mapped.
 echo     Kernel debug output is on COM2 / I/O base 0x2f8.
 if /I "%HV_MAP_ONLY%"=="1" (
     echo [!] HV_MAP_ONLY=1, stopping before CPUID/probe/seal checks.
+    if defined HV_AUTOMATION exit /b 0
     pause
     exit /b 0
 )

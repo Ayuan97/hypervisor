@@ -74,6 +74,7 @@ static RESULT_STATUS: AtomicU64 = AtomicU64::new(STATUS_FAILED);
 static WORKER_STARTED: AtomicBool = AtomicBool::new(false);
 static WORKER_SHUTDOWN: AtomicBool = AtomicBool::new(false);
 static WORKER_HANDLE: AtomicU64 = AtomicU64::new(0);
+static WORKER_PHASE: AtomicU64 = AtomicU64::new(0);
 static mut RESULT_BYTES: [u8; MAX_READ_SIZE] = [0; MAX_READ_SIZE];
 static BATCH_REG_STATE: AtomicU64 = AtomicU64::new(BATCH_REG_UNREGISTERED);
 static BATCH_REG_PID: AtomicU64 = AtomicU64::new(0);
@@ -89,6 +90,19 @@ static BATCH_PROCESSING: AtomicBool = AtomicBool::new(false);
 
 const REQUEST_KIND_PHYSICAL: u64 = 0;
 const REQUEST_KIND_VIRTUAL: u64 = 1;
+
+const WORKER_PHASE_START: u64 = 1;
+const WORKER_PHASE_UNARMED_DELAY: u64 = 2;
+const WORKER_PHASE_REGISTER_BATCH: u64 = 3;
+const WORKER_PHASE_UNREGISTER_BATCH: u64 = 4;
+const WORKER_PHASE_PROCESS_BATCH: u64 = 5;
+const WORKER_PHASE_READ_PHYSICAL: u64 = 6;
+const WORKER_PHASE_READ_VIRTUAL: u64 = 7;
+const WORKER_PHASE_COMPLETE_READ: u64 = 8;
+const WORKER_PHASE_IDLE: u64 = 9;
+const WORKER_PHASE_ARMED_DELAY: u64 = 10;
+const WORKER_PHASE_EXIT_CLEANUP: u64 = 11;
+const WORKER_PHASE_EXITED: u64 = 12;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PhysicalReadRequest {
@@ -165,6 +179,11 @@ pub fn mark_worker_started(started: bool) {
 
 pub fn worker_started() -> bool {
     WORKER_STARTED.load(Ordering::Acquire)
+}
+
+#[inline]
+fn set_worker_phase(phase: u64) {
+    WORKER_PHASE.store(phase, Ordering::Release);
 }
 
 const fn worker_enabled_by_build_flag(value: Option<&str>) -> bool {
@@ -788,6 +807,8 @@ pub fn debug_state(id: u64) -> u64 {
         14 => BATCH_REG_GENERATION.load(Ordering::Acquire),
         15 => BATCH_REG_PROCESSED.load(Ordering::Acquire),
         16 => BATCH_REG_FAILURES.load(Ordering::Acquire),
+        17 => WORKER_PHASE.load(Ordering::Acquire),
+        18 => BATCH_PROCESSING.load(Ordering::Acquire) as u64,
         _ => u64::MAX,
     }
 }
@@ -859,8 +880,10 @@ pub fn stop_worker() -> bool {
 
 unsafe extern "C" fn worker_main(_start_context: PVOID) {
     let mut idle_spins = 0u32;
+    set_worker_phase(WORKER_PHASE_START);
     while !WORKER_SHUTDOWN.load(Ordering::Acquire) {
         if !crate::intel::diag::client_reads_armed() {
+            set_worker_phase(WORKER_PHASE_UNARMED_DELAY);
             delay_worker(false);
             idle_spins = 0;
             continue;
@@ -868,17 +891,20 @@ unsafe extern "C" fn worker_main(_start_context: PVOID) {
 
         match BATCH_REG_STATE.load(Ordering::Acquire) {
             BATCH_REG_REGISTERING => {
+                set_worker_phase(WORKER_PHASE_REGISTER_BATCH);
                 register_batch_buffer_from_worker();
                 idle_spins = 0;
                 continue;
             }
             BATCH_REG_UNREGISTERING => {
+                set_worker_phase(WORKER_PHASE_UNREGISTER_BATCH);
                 cleanup_batch_registration();
                 BATCH_REG_STATE.store(BATCH_REG_UNREGISTERED, Ordering::Release);
                 idle_spins = 0;
                 continue;
             }
             BATCH_REG_READY => {
+                set_worker_phase(WORKER_PHASE_PROCESS_BATCH);
                 let _ = process_batch_buffer();
             }
             _ => {}
@@ -886,11 +912,16 @@ unsafe extern "C" fn worker_main(_start_context: PVOID) {
 
         if let Some(request) = pending_request() {
             let result = match request.kind {
-                ReadRequestKind::Physical => read_phys_into_result(request.pa, request.size),
+                ReadRequestKind::Physical => {
+                    set_worker_phase(WORKER_PHASE_READ_PHYSICAL);
+                    read_phys_into_result(request.pa, request.size)
+                }
                 ReadRequestKind::Virtual => {
+                    set_worker_phase(WORKER_PHASE_READ_VIRTUAL);
                     read_virtual_into_result(request.cr3, request.va, request.size)
                 }
             };
+            set_worker_phase(WORKER_PHASE_COMPLETE_READ);
             match result {
                 Some(size) => complete_read(request.seq, size, true),
                 None => complete_read(request.seq, 0, false),
@@ -901,16 +932,20 @@ unsafe extern "C" fn worker_main(_start_context: PVOID) {
 
         idle_spins = idle_spins.wrapping_add(1);
         if idle_spins < 1_024 {
+            set_worker_phase(WORKER_PHASE_IDLE);
             core::hint::spin_loop();
         } else {
+            set_worker_phase(WORKER_PHASE_ARMED_DELAY);
             delay_worker(true);
             idle_spins = 0;
         }
     }
 
+    set_worker_phase(WORKER_PHASE_EXIT_CLEANUP);
     cleanup_batch_registration();
     BATCH_REG_STATE.store(BATCH_REG_UNREGISTERED, Ordering::Release);
     mark_worker_started(false);
+    set_worker_phase(WORKER_PHASE_EXITED);
     let _ = PsTerminateSystemThread(STATUS_SUCCESS);
 }
 
@@ -1311,6 +1346,7 @@ pub fn reset_for_test() {
     RESULT_STATUS.store(STATUS_FAILED, Ordering::Relaxed);
     WORKER_SHUTDOWN.store(false, Ordering::Relaxed);
     WORKER_HANDLE.store(0, Ordering::Relaxed);
+    WORKER_PHASE.store(0, Ordering::Relaxed);
     BATCH_REG_STATE.store(BATCH_REG_UNREGISTERED, Ordering::Relaxed);
     BATCH_REG_PID.store(0, Ordering::Relaxed);
     BATCH_REG_USER_VA.store(0, Ordering::Relaxed);

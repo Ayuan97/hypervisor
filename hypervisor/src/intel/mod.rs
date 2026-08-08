@@ -15,6 +15,7 @@ pub mod paging;
 pub mod segmentation;
 pub mod shared_data;
 pub mod support;
+pub mod terminal_capture;
 pub mod vcpu;
 pub mod vmcs;
 pub mod vmerror;

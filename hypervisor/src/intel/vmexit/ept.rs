@@ -2,6 +2,7 @@ use {
     crate::{
         intel::{
             bugcheck_hook,
+            ept::paging::AccessType,
             events::EventInjection,
             invept::invept_all_contexts,
             support::{vmread_checked, vmwrite_checked},
@@ -61,6 +62,29 @@ pub fn handle_ept_violation(_guest_registers: &mut GuestRegisters, _vmx: &mut Vm
         log::error!("EPT violation: unmapped PA {:#x} (no RWX)", guest_physical_address);
         EventInjection::vmentry_inject_gp(0);
         return ExitType::Continue;
+    }
+
+    // Execute against a present RW-only page (identity marked non-RAM / mixed).
+    // Promoting to RWX is safer than #GP: firmware/legacy holes can still hold
+    // executable code, and #GP here previously led to SYSTEM_SERVICE_EXCEPTION
+    // 0x3B (c0000005) after single-LP local_diag came up (CMOS 0xEE10).
+    if eq.instruction_fetch && !eq.executable {
+        crate::intel::diag::set_boot_stage(0xEE10 | ((guest_physical_address >> 21) & 0xFF));
+        // A 4KB address still updates the whole PDE when it is large, but it
+        // selects the actual PTE when a RAM/MMIO boundary was pre-split.
+        let page = guest_physical_address & !0xFFFu64;
+        let promoted = _vmx.shared_data_ref().with_primary_ept_mut(|ept| {
+            ept.change_page_flags(page, AccessType::READ_WRITE_EXECUTE)
+        });
+        match promoted {
+            Some(Ok(())) => {
+                invept_all_contexts();
+                return ExitType::Continue;
+            }
+            Some(Err(_)) | None => {
+                // Fall through: try other handlers / default path below.
+            }
+        }
     }
 
     // KeBugCheckEx entry-hook: cloak page (RW only) triggers instruction-
@@ -234,8 +258,12 @@ pub fn handle_ept_misconfiguration() -> ExitType {
         }
     };
     log::error!("EPT Misconfiguration at PA {:#x}", guest_physical_address);
-    EventInjection::vmentry_inject_gp(0);
-    ExitType::Continue
+    // Persist breadcrumb for hard-reset postmortem (stage 0xEE00 family).
+    crate::intel::diag::set_boot_stage(0xEE00 | ((guest_physical_address >> 21) & 0xFF));
+    // Do NOT inject #GP + Continue: that re-executes the same fetch against a
+    // still-broken EPT and becomes an infinite VM-exit storm → 0x101.
+    // Tear down VMX and return to host; load fails cleanly instead of freezing.
+    ExitType::ExitHypervisor
 }
 
 #[cfg(test)]

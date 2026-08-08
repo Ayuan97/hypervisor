@@ -48,6 +48,13 @@ pub const _2MB: usize = 2 * 1024 * 1024;
 pub const _4KB: usize = 4 * 1024;
 const MAX_SPLIT_PTS: usize = 128;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IdentityLeafKind {
+    FullRam,
+    NonRam,
+    Mixed,
+}
+
 /// Represents the entire Extended Page Table structure.
 ///
 /// EPT is a set of nested page tables similar to the standard x86-64 paging mechanism.
@@ -83,11 +90,122 @@ impl Ept {
 
         let mut mtrr = Mtrr::new();
 
-        for pa in (0.._512GB).step_by(_2MB) {
-            self.map_2mb(pa, pa, access_type, &mut mtrr)?;
+        let ram_known = mtrr.ram_ranges_known();
+        if !ram_known {
+            crate::intel::diag::set_ept_identity_stats(0, 0, 0, false);
+            log::error!("Cannot build EPT identity map without physical RAM ranges");
+            return Err(HypervisorError::MemoryTypeResolutionError);
         }
 
+        let mut rwx_pages = 0u64;
+        let mut rw_pages = 0u64;
+        let mut split_pages = 0u64;
+        for pa in (0.._512GB).step_by(_2MB) {
+            match self.map_identity_2mb_leaf(pa, access_type, &mut mtrr)? {
+                IdentityLeafKind::FullRam => rwx_pages += 1,
+                IdentityLeafKind::NonRam => rw_pages += 1,
+                IdentityLeafKind::Mixed => split_pages += 1,
+            }
+        }
+
+        // Persist counts for postmortem (cpuid_ping CTL / future log).
+        crate::intel::diag::set_ept_identity_stats(rwx_pages, rw_pages, split_pages, ram_known);
+        crate::intel::diag::set_boot_stage(212);
+        log::info!(
+            "EPT identity: ram_2mb={} non_ram_2mb={} split_2mb={} ram_ranges_known={}",
+            rwx_pages,
+            rw_pages,
+            split_pages,
+            ram_known
+        );
         crate::intel::diag_trace::trace("ept: identity_2mb done");
+        Ok(())
+    }
+
+    fn map_identity_2mb_leaf(
+        &mut self,
+        pa: u64,
+        access_type: AccessType,
+        mtrr: &mut Mtrr,
+    ) -> Result<IdentityLeafKind, HypervisorError> {
+        if !mtrr.ram_ranges_known() {
+            return Err(HypervisorError::MemoryTypeResolutionError);
+        }
+
+        let range = pa..pa.saturating_add(_2MB as u64);
+        if mtrr.range_is_backed_by_ram(range.clone()) {
+            if mtrr.uniform_memory_type(range).is_some() {
+                self.map_2mb(pa, pa, access_type, mtrr)?;
+                return Ok(IdentityLeafKind::FullRam);
+            }
+            self.map_mixed_identity_2mb(pa, access_type, mtrr)?;
+            return Ok(IdentityLeafKind::Mixed);
+        }
+
+        let non_executable = access_type & !AccessType::EXECUTE;
+        if !mtrr.range_overlaps_ram(range) {
+            self.map_2mb(pa, pa, non_executable, mtrr)?;
+            return Ok(IdentityLeafKind::NonRam);
+        }
+
+        self.map_mixed_identity_2mb(pa, access_type, mtrr)?;
+        Ok(IdentityLeafKind::Mixed)
+    }
+
+    /// Maps a RAM/MMIO or MTRR-type boundary at 4KB granularity. The PT is
+    /// fully initialized before the PDE pointer is published, so no EPT walk
+    /// can observe a partially populated table.
+    fn map_mixed_identity_2mb(
+        &mut self,
+        pa: u64,
+        access_type: AccessType,
+        mtrr: &Mtrr,
+    ) -> Result<(), HypervisorError> {
+        self.map_pml4(pa, access_type)?;
+        self.map_pdpt(pa, access_type)?;
+
+        let address = VAddr::from(pa);
+        let pdpt_index = pdpt_index(address);
+        let pd_index = pd_index(address);
+        if self.pd[pdpt_index].0.entries[pd_index].readable()
+            || self.find_split_pt(pdpt_index, pd_index).is_some()
+        {
+            return Err(HypervisorError::AlreadySplitError);
+        }
+
+        let pt = allocate_pt()?;
+        for index in 0..PAGE_SIZE_ENTRIES {
+            let page_pa = pa + (index * BASE_PAGE_SIZE) as u64;
+            let page_range = page_pa..page_pa + BASE_PAGE_SIZE as u64;
+            let page_access = if mtrr.range_is_backed_by_ram(page_range.clone()) {
+                access_type
+            } else {
+                access_type & !AccessType::EXECUTE
+            };
+            let memory_type = mtrr.find(page_range).unwrap_or(MemoryType::Uncacheable);
+            let entry = unsafe { &mut (*pt).0.entries[index] };
+            entry.0 = page_access.bits() as u64
+                | ((memory_type as u64) << 3)
+                | ((page_pa >> BASE_PAGE_SHIFT) << 12);
+        }
+
+        let pt_pa = table_pa_from_va(pt as u64);
+        if pt_pa == 0 {
+            unsafe {
+                free_pt(pt);
+            }
+            return Err(HypervisorError::VirtualToPhysicalAddressFailed);
+        }
+        if self.record_split_pt(pdpt_index, pd_index, pt).is_err() {
+            unsafe {
+                free_pt(pt);
+            }
+            return Err(HypervisorError::OutOfMemory);
+        }
+
+        let pd_entry = &mut self.pd[pdpt_index].0.entries[pd_index];
+        pd_entry.0 =
+            AccessType::READ_WRITE_EXECUTE.bits() as u64 | ((pt_pa >> BASE_PAGE_SHIFT) << 12);
         Ok(())
     }
 
@@ -169,15 +287,23 @@ impl Ept {
     /// # Returns
     ///
     /// A `Result<(), HypervisorError>` indicating if the operation was successful.
-    fn map_pml4(&mut self, guest_pa: u64, access_type: AccessType) -> Result<(), HypervisorError> {
+    fn map_pml4(&mut self, guest_pa: u64, _access_type: AccessType) -> Result<(), HypervisorError> {
         let pml4_index = pml4_index(VAddr::from(guest_pa));
         let pml4_entry = &mut self.pml4.0.entries[pml4_index];
 
+        // Intermediate EPT pointers must always be R/W/X. Leaf PDE/PT entries
+        // enforce the real policy (e.g. MMIO = RW-only). If we stamped a parent
+        // from the *first* child access_type and that child was MMIO (no X),
+        // later RAM under the same PML4/PDPT would fail instruction fetch →
+        // exit storm / 0x101 after VMLAUNCH (boot_stage stuck at 700).
         if !pml4_entry.readable() {
-            pml4_entry.set_readable(access_type.contains(AccessType::READ));
-            pml4_entry.set_writable(access_type.contains(AccessType::WRITE));
-            pml4_entry.set_executable(access_type.contains(AccessType::EXECUTE));
+            pml4_entry.set_readable(true);
+            pml4_entry.set_writable(true);
+            pml4_entry.set_executable(true);
             pml4_entry.set_pfn(table_pa_from_va(addr_of!(self.pdpt) as u64) >> BASE_PAGE_SHIFT);
+        } else {
+            pml4_entry.set_writable(true);
+            pml4_entry.set_executable(true);
         }
 
         Ok(())
@@ -187,21 +313,25 @@ impl Ept {
     ///
     /// # Arguments
     /// * `guest_pa`: The guest physical address whose corresponding PDPT entry will be updated.
-    /// * `access_type`: The type of access allowed for the region covered by this PDPT entry.
+    /// * `access_type`: Unused for intermediate entries; leaf policy is on the PDE.
     ///
     /// # Returns
     ///
     /// A `Result<(), HypervisorError>` indicating if the operation was successful.
-    fn map_pdpt(&mut self, guest_pa: u64, access_type: AccessType) -> Result<(), HypervisorError> {
+    fn map_pdpt(&mut self, guest_pa: u64, _access_type: AccessType) -> Result<(), HypervisorError> {
         let pdpt_index = pdpt_index(VAddr::from(guest_pa));
         let pdpt_entry = &mut self.pdpt.0.entries[pdpt_index];
 
+        // Same rule as map_pml4: parent walks stay fully privileged.
         if !pdpt_entry.readable() {
-            pdpt_entry.set_readable(access_type.contains(AccessType::READ));
-            pdpt_entry.set_writable(access_type.contains(AccessType::WRITE));
-            pdpt_entry.set_executable(access_type.contains(AccessType::EXECUTE));
+            pdpt_entry.set_readable(true);
+            pdpt_entry.set_writable(true);
+            pdpt_entry.set_executable(true);
             pdpt_entry
                 .set_pfn(table_pa_from_va(addr_of!(self.pd[pdpt_index]) as u64) >> BASE_PAGE_SHIFT);
+        } else {
+            pdpt_entry.set_writable(true);
+            pdpt_entry.set_executable(true);
         }
 
         Ok(())
@@ -217,7 +347,7 @@ impl Ept {
     /// # Returns
     ///
     /// A `Result<(), HypervisorError>` indicating if the operation was successful.
-    fn map_pdt(&mut self, guest_pa: u64, access_type: AccessType) -> Result<(), HypervisorError> {
+    fn map_pdt(&mut self, guest_pa: u64, _access_type: AccessType) -> Result<(), HypervisorError> {
         let pdpt_index = pdpt_index(VAddr::from(guest_pa));
         let pd_index = pd_index(VAddr::from(guest_pa));
 
@@ -239,7 +369,9 @@ impl Ept {
 
         let pt_pfn = table_pa_from_va(pt as u64) >> BASE_PAGE_SHIFT;
         let pd_entry = &mut self.pd[pdpt_index].0.entries[pd_index];
-        pd_entry.0 = access_type.bits() as u64 | (pt_pfn << 12);
+        // This is a non-leaf entry. Permissions belong to the PTEs; restricting
+        // this pointer from its first child would also restrict every sibling.
+        pd_entry.0 = AccessType::READ_WRITE_EXECUTE.bits() as u64 | (pt_pfn << 12);
 
         Ok(())
     }
@@ -267,12 +399,14 @@ impl Ept {
         let pd_entry = &mut self.pd[pdpt_index].0.entries[pd_index];
 
         if !pd_entry.readable() {
-            pd_entry.set_readable(access_type.contains(AccessType::READ));
-            pd_entry.set_writable(access_type.contains(AccessType::WRITE));
-            pd_entry.set_executable(access_type.contains(AccessType::EXECUTE));
-            pd_entry.set_memory_type(mtrr_memory_type_for_2mb(host_pa, mtrr) as u64);
-            pd_entry.set_large(true);
-            pd_entry.set_pfn(host_pa >> BASE_PAGE_SHIFT);
+            // Single store: multi-step bitfield writes leave reserved/transient
+            // patterns visible if another CPU walks EPT mid-update.
+            let mem_type = mtrr_memory_type_for_2mb(host_pa, mtrr) as u64;
+            let pfn = host_pa >> BASE_PAGE_SHIFT;
+            pd_entry.0 = (access_type.bits() as u64)
+                | ((mem_type & 0x7) << 3)
+                | (1u64 << 7) // large page
+                | (pfn << 12);
         } else {
             log::warn!(
                 "Attempted to map an already-mapped 2MB page: {:x}",
@@ -498,9 +632,10 @@ impl Ept {
         // Represents the memory type setting for Write-Back (WB) in the EPTP.
         const EPT_MEMORY_TYPE_WB: u64 = MemoryType::WriteBack as u64;
 
-        // Check if the base address is 4KB aligned (the lower 12 bits should be zero).
-        if ept_pml4_base_addr.trailing_zeros() >= 12 {
-            // Construct the EPTP with the page walk length and memory type for WB.
+        // Reject null / unaligned PML4 PA. Note: u64::trailing_zeros(0) == 64,
+        // so a zero address would otherwise pass the alignment check and yield
+        // EPTP = walk_len|WB with a null table → instant EPT misconfig storm.
+        if ept_pml4_base_addr != 0 && ept_pml4_base_addr.trailing_zeros() >= 12 {
             Ok(ept_pml4_base_addr | EPT_PAGE_WALK_LENGTH_4 | EPT_MEMORY_TYPE_WB)
         } else {
             Err(HypervisorError::InvalidEptPml4BaseAddress)
@@ -718,12 +853,19 @@ unsafe fn free_pt(pt: *mut Pt) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::intel::ept::mtrr::{MemoryType, MtrrRangeDescriptor};
-    use alloc::boxed::Box;
+    use crate::intel::ept::mtrr::{MemoryType, MtrrRangeDescriptor, PhysicalMemoryRange};
+    use alloc::{boxed::Box, vec::Vec};
 
     fn large_mapped_ept(guest_pa: u64, host_pa: u64) -> Box<Ept> {
         let mut ept = unsafe { Box::<Ept>::new_zeroed().assume_init() };
-        let mut mtrr = Mtrr::for_test(MemoryType::WriteBack, &[]);
+        let mut mtrr = Mtrr::for_test_with_ram_ranges(
+            MemoryType::WriteBack,
+            &[],
+            &[PhysicalMemoryRange {
+                base_address: host_pa,
+                end_address: host_pa + _2MB as u64,
+            }],
+        );
         ept.map_pde(guest_pa, host_pa, AccessType::READ_WRITE_EXECUTE, &mut mtrr)
             .unwrap();
         ept
@@ -738,12 +880,16 @@ mod tests {
 
     #[test]
     fn memory_type_comes_from_matching_mtrr_range() {
-        let mtrr = Mtrr::for_test(
+        let mtrr = Mtrr::for_test_with_ram_ranges(
             MemoryType::WriteBack,
             &[MtrrRangeDescriptor {
                 base_address: 0x1000_0000,
                 end_address: 0x101F_FFFF,
                 memory_type: MemoryType::Uncacheable,
+            }],
+            &[PhysicalMemoryRange {
+                base_address: 0x1000_0000,
+                end_address: 0x1020_0000,
             }],
         );
 
@@ -755,7 +901,14 @@ mod tests {
 
     #[test]
     fn memory_type_falls_back_to_default_mtrr_type() {
-        let mtrr = Mtrr::for_test(MemoryType::WriteCombining, &[]);
+        let mtrr = Mtrr::for_test_with_ram_ranges(
+            MemoryType::WriteCombining,
+            &[],
+            &[PhysicalMemoryRange {
+                base_address: 0x2000_0000,
+                end_address: 0x2020_0000,
+            }],
+        );
 
         assert_eq!(
             mtrr_memory_type_for_2mb(0x2000_0000, &mtrr),
@@ -824,11 +977,216 @@ mod tests {
         assert!(neighbor.writable());
         assert!(neighbor.executable());
     }
+
+    #[test]
+    fn identity_leaf_keeps_full_ram_as_large_rwx() {
+        let mut ept = unsafe { Box::<Ept>::new_zeroed().assume_init() };
+        let mut mtrr = Mtrr::for_test_with_ram_ranges(
+            MemoryType::WriteBack,
+            &[],
+            &[PhysicalMemoryRange {
+                base_address: 0,
+                end_address: _2MB as u64,
+            }],
+        );
+
+        assert_eq!(
+            ept.map_identity_2mb_leaf(0, AccessType::READ_WRITE_EXECUTE, &mut mtrr)
+                .unwrap(),
+            IdentityLeafKind::FullRam
+        );
+        let entry = ept.pd[0].0.entries[0];
+        assert!(entry.large());
+        assert!(entry.readable() && entry.writable() && entry.executable());
+        assert_eq!(entry.memory_type(), MemoryType::WriteBack as u64);
+    }
+
+    #[test]
+    fn identity_leaf_keeps_non_ram_as_large_rw_uc() {
+        let mut ept = unsafe { Box::<Ept>::new_zeroed().assume_init() };
+        let mut mtrr = Mtrr::for_test_with_ram_ranges(MemoryType::WriteBack, &[], &[]);
+
+        assert_eq!(
+            ept.map_identity_2mb_leaf(0, AccessType::READ_WRITE_EXECUTE, &mut mtrr)
+                .unwrap(),
+            IdentityLeafKind::NonRam
+        );
+        let entry = ept.pd[0].0.entries[0];
+        assert!(entry.large());
+        assert!(entry.readable() && entry.writable() && !entry.executable());
+        assert_eq!(entry.memory_type(), MemoryType::Uncacheable as u64);
+    }
+
+    #[test]
+    fn identity_leaf_splits_ram_head_from_hole_tail() {
+        let mut ept = unsafe { Box::<Ept>::new_zeroed().assume_init() };
+        let mut mtrr = Mtrr::for_test_with_ram_ranges(
+            MemoryType::WriteBack,
+            &[],
+            &[PhysicalMemoryRange {
+                base_address: 0,
+                end_address: BASE_PAGE_SIZE as u64,
+            }],
+        );
+
+        assert_eq!(
+            ept.map_identity_2mb_leaf(0, AccessType::READ_WRITE_EXECUTE, &mut mtrr)
+                .unwrap(),
+            IdentityLeafKind::Mixed
+        );
+        let parent = ept.pd[0].0.entries[0];
+        assert!(!parent.large());
+        assert!(parent.readable() && parent.writable() && parent.executable());
+        let pt = split_pt_for_test(&ept, 0, 0);
+        let ram = pt.0.entries[0];
+        let hole = pt.0.entries[1];
+        assert!(ram.executable());
+        assert_eq!(ram.memory_type(), MemoryType::WriteBack as u64);
+        assert!(!hole.executable());
+        assert_eq!(hole.memory_type(), MemoryType::Uncacheable as u64);
+    }
+
+    #[test]
+    fn identity_leaf_splits_hole_head_from_ram_tail() {
+        let mut ept = unsafe { Box::<Ept>::new_zeroed().assume_init() };
+        let last_page = (_2MB - _4KB) as u64;
+        let mut mtrr = Mtrr::for_test_with_ram_ranges(
+            MemoryType::WriteBack,
+            &[],
+            &[PhysicalMemoryRange {
+                base_address: last_page,
+                end_address: _2MB as u64,
+            }],
+        );
+
+        assert_eq!(
+            ept.map_identity_2mb_leaf(0, AccessType::READ_WRITE_EXECUTE, &mut mtrr)
+                .unwrap(),
+            IdentityLeafKind::Mixed
+        );
+        let parent = ept.pd[0].0.entries[0];
+        assert!(!parent.large());
+        assert!(parent.executable());
+        let pt = split_pt_for_test(&ept, 0, 0);
+        assert!(!pt.0.entries[0].executable());
+        assert!(pt.0.entries[511].executable());
+        assert_eq!(pt.0.entries[511].pfn(), last_page >> BASE_PAGE_SHIFT);
+    }
+
+    #[test]
+    fn mixed_ram_page_preserves_explicit_uc_type() {
+        let mut ept = unsafe { Box::<Ept>::new_zeroed().assume_init() };
+        let mut mtrr = Mtrr::for_test_with_ram_ranges(
+            MemoryType::WriteBack,
+            &[MtrrRangeDescriptor {
+                base_address: 0,
+                end_address: (BASE_PAGE_SIZE - 1) as u64,
+                memory_type: MemoryType::Uncacheable,
+            }],
+            &[PhysicalMemoryRange {
+                base_address: 0,
+                end_address: BASE_PAGE_SIZE as u64,
+            }],
+        );
+
+        ept.map_identity_2mb_leaf(0, AccessType::READ_WRITE_EXECUTE, &mut mtrr)
+            .unwrap();
+        let pt = split_pt_for_test(&ept, 0, 0);
+        assert!(pt.0.entries[0].executable());
+        assert_eq!(
+            pt.0.entries[0].memory_type(),
+            MemoryType::Uncacheable as u64
+        );
+    }
+
+    #[test]
+    fn full_ram_leaf_with_internal_mtrr_boundary_is_split() {
+        let mut ept = unsafe { Box::<Ept>::new_zeroed().assume_init() };
+        let mut mtrr = Mtrr::for_test_with_ram_ranges(
+            MemoryType::WriteBack,
+            &[MtrrRangeDescriptor {
+                base_address: BASE_PAGE_SIZE as u64,
+                end_address: (2 * BASE_PAGE_SIZE - 1) as u64,
+                memory_type: MemoryType::WriteCombining,
+            }],
+            &[PhysicalMemoryRange {
+                base_address: 0,
+                end_address: _2MB as u64,
+            }],
+        );
+
+        assert_eq!(
+            ept.map_identity_2mb_leaf(0, AccessType::READ_WRITE_EXECUTE, &mut mtrr)
+                .unwrap(),
+            IdentityLeafKind::Mixed
+        );
+        let parent = ept.pd[0].0.entries[0];
+        assert!(!parent.large());
+        assert!(parent.readable() && parent.writable() && parent.executable());
+
+        let pt = split_pt_for_test(&ept, 0, 0);
+        assert_eq!(pt.0.entries[0].memory_type(), MemoryType::WriteBack as u64);
+        assert_eq!(
+            pt.0.entries[1].memory_type(),
+            MemoryType::WriteCombining as u64
+        );
+        assert_eq!(pt.0.entries[2].memory_type(), MemoryType::WriteBack as u64);
+        assert!(pt.0.entries[0].executable());
+        assert!(pt.0.entries[1].executable());
+        assert!(pt.0.entries[2].executable());
+    }
+
+    #[test]
+    fn identity_leaf_129th_split_slot_does_not_publish_pde() {
+        let mut ept = unsafe { Box::<Ept>::new_zeroed().assume_init() };
+        let ram_ranges: Vec<PhysicalMemoryRange> = (0..=MAX_SPLIT_PTS)
+            .map(|index| {
+                let base = index as u64 * _2MB as u64;
+                PhysicalMemoryRange {
+                    base_address: base,
+                    end_address: base + BASE_PAGE_SIZE as u64,
+                }
+            })
+            .collect();
+        let mut mtrr = Mtrr::for_test_with_ram_ranges(MemoryType::WriteBack, &[], &ram_ranges);
+
+        for index in 0..MAX_SPLIT_PTS {
+            let pa = index as u64 * _2MB as u64;
+            assert_eq!(
+                ept.map_identity_2mb_leaf(pa, AccessType::READ_WRITE_EXECUTE, &mut mtrr)
+                    .unwrap(),
+                IdentityLeafKind::Mixed
+            );
+        }
+
+        let rejected_pa = MAX_SPLIT_PTS as u64 * _2MB as u64;
+        assert!(matches!(
+            ept.map_identity_2mb_leaf(rejected_pa, AccessType::READ_WRITE_EXECUTE, &mut mtrr),
+            Err(HypervisorError::OutOfMemory)
+        ));
+        let rejected_address = VAddr::from(rejected_pa);
+        let rejected_pdpt = pdpt_index(rejected_address);
+        let rejected_pd = pd_index(rejected_address);
+        assert_eq!(ept.pd[rejected_pdpt].0.entries[rejected_pd].0, 0);
+        assert!(ept.find_split_pt(rejected_pdpt, rejected_pd).is_none());
+    }
+
+    #[test]
+    fn identity_leaf_rejects_unknown_ram_map_without_publishing_entry() {
+        let mut ept = unsafe { Box::<Ept>::new_zeroed().assume_init() };
+        let mut mtrr = Mtrr::for_test(MemoryType::WriteBack, &[]);
+
+        assert!(matches!(
+            ept.map_identity_2mb_leaf(0, AccessType::READ_WRITE_EXECUTE, &mut mtrr),
+            Err(HypervisorError::MemoryTypeResolutionError)
+        ));
+        assert_eq!(ept.pd[0].0.entries[0].0, 0);
+    }
 }
 
 fn mtrr_memory_type_for_2mb(host_pa: u64, mtrr: &Mtrr) -> MemoryType {
     let end = host_pa.saturating_add(_2MB as u64);
-    mtrr.find(host_pa..end).unwrap_or(MemoryType::WriteBack)
+    mtrr.find(host_pa..end).unwrap_or(MemoryType::Uncacheable)
 }
 
 #[cfg(not(test))]
