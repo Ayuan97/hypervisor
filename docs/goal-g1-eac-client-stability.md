@@ -3,7 +3,7 @@
 | Field | Value |
 |-------|--------|
 | **ID** | G1 |
-| **Status** | **SHIPPED M1/M2** (code+PE 2026-08-07); runtime M3–M5 still human |
+| **Status** | **M1/M2 shipped; M5 FAIL** (2026-08-08 r2 ~81m EAC freeze) → **G2** |
 | **Owner** | agent + user (user: 进 EAC / 冻后硬重启；agent: 改/编/归档/观察) |
 | **Basis** | UC 调研 `eac-hv-community-research.md` §9.6；隔离审计 `eac-isolation-audit.md`；HOST_CR3 实验 `exp-host-cr3-identity.md` |
 
@@ -72,9 +72,9 @@
 |----|------|------|
 | M1 | NMI-window 动态 arm + handler + 单测 | **done** |
 | M2 | `build_client` → `output\hv\matrix_client.sys` + baseline | **done** |
-| M3 | 冷启动 map client；`--status` active | pending（人工） |
-| M4 | 白昼 EAC 计时跑；观察 | pending（人工） |
-| M5 | PASS / PARTIAL / FAIL 落盘；必要时开 G2 | pending |
+| M3 | 冷启动 map client；`--status` active | **done** (2026-08-08 r2) |
+| M4 | 白昼 EAC 计时跑；观察 | **done** (EAC path; freeze archived) |
+| M5 | PASS / PARTIAL / FAIL 落盘；必要时开 G2 | **FAIL** ~81m silent → **G2** `docs/goal-g2-eac-timing.md` |
 
 ## 关联路径
 

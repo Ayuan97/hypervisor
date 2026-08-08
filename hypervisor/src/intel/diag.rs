@@ -835,9 +835,11 @@ const fn build_flag_enabled(value: Option<&str>) -> bool {
 const LAYER3_EXTENDED_CONTEXT: bool = false;
 const CMOS_L3_SLOT_A_BASE: u8 = 0x30;
 const CMOS_L3_SLOT_B_BASE: u8 = 0x40;
-// Local diagnostics still retain the rare-exit ring and one-second disk
-// snapshots, but avoid making every CPUID storm pay frequent CMOS I/O.
-const LAYER3_FLUSH_INTERVAL: u64 = if LOCAL_DIAG_BUILD { 1024 } else { 64 };
+// G2 (EAC timing): production used to flush *more often* than local_diag
+// (64 vs 1024). Under multi-core CPUID/CR storms that is host time in
+// VMX-root + Ext CMOS port I/O — the freeze review's primary tax.
+// Product client: rare periodic only. Local_diag: denser for forensics.
+const LAYER3_FLUSH_INTERVAL: u64 = if LOCAL_DIAG_BUILD { 512 } else { 8192 };
 
 static LAYER3_FLUSH_COUNT: AtomicU64 = AtomicU64::new(0);
 static LAYER3_SEQUENCE: AtomicU64 = AtomicU64::new(0);
@@ -856,6 +858,11 @@ fn layer3_phase_byte(handler_phase: u64, client_read_phase: u64) -> u8 {
 #[inline(always)]
 pub fn layer3_maybe_flush() {
     if super::terminal_capture::enabled() {
+        return;
+    }
+    // After seal, product path must not burn every Nth exit on CMOS.
+    // force_flush / fatal paths still write explicitly.
+    if diagnostics_sealed() {
         return;
     }
     let n = LAYER3_FLUSH_COUNT.fetch_add(1, Relaxed).wrapping_add(1);
@@ -1570,12 +1577,11 @@ const SNAP_CMOS_CPU_REASON_BASE: u8 = 0x68;
 /// per CPU. Untracked CPUs still bump global sequence and RAM shadow but
 /// don't flush to CMOS.
 pub const SNAP_MAX_CPUS: usize = 24;
-/// Flush every N-th vmexit per CPU. A cadence of 64 keeps a sub-millisecond
-/// 2026-07-16 after boot-freeze happened faster with Layer 6 than without,
-/// suggesting CMOS I/O throughput (~20μs per flush) added enough handler
-/// latency to worsen the freeze race. 64 reduces CMOS traffic while
-/// still tight enough to capture pre-freeze state at typical rates.
-const SNAP_FLUSH_INTERVAL: u64 = if LOCAL_DIAG_BUILD { 1024 } else { 64 };
+/// Layer 6 periodic CMOS: same G2 policy as Layer 3 — product client must
+/// not CMOS-storm under EAC. 2026-07-16: denser Layer 6 worsened freeze
+/// races (~20μs per flush). 2026-08-08 G1 r2: matrix_client still froze
+/// ~81m with multi-CPU HANDLER_ACTIVE; prod interval was 64 (too hot).
+const SNAP_FLUSH_INTERVAL: u64 = if LOCAL_DIAG_BUILD { 512 } else { 8192 };
 
 /// Global monotonic sequence — bumped on every snap_flush attempt.
 static SNAP_GLOBAL_SEQ: AtomicU64 = AtomicU64::new(0);
@@ -1889,7 +1895,9 @@ pub fn snap_flush(exit_reason: u64) {
     let per_cpu_count = SNAP_CPU_VMEXIT_COUNT[cpu]
         .fetch_add(1, Relaxed)
         .wrapping_add(1);
-    let is_periodic = per_cpu_count % SNAP_FLUSH_INTERVAL == 0;
+    // Sealed product: periodic Layer 6 off; rare (NMI/exception/…) still on.
+    let is_periodic = !diagnostics_sealed()
+        && per_cpu_count % SNAP_FLUSH_INTERVAL == 0;
     let is_rare = !is_common_exit(exit_reason);
 
     // Early-out only if BOTH gates fail — rare exits always attempt a flush
